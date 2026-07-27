@@ -38,6 +38,9 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, 
     // 首次运行:播种内置默认团队到 .teamfly/teams/default(已存在则不动)
     crate::builtin::seed_default(&teamfly_dir)?;
 
+    // 加载 agent 环境变量(.teamfly/env.toml,可选)
+    let agent_env = crate::env::load(&teamfly_dir)?;
+
     // 团队来源优先级:--team > 唯一/default 团队
     let team_dir = resolve_team_dir(team_arg, &teamfly_dir)?;
     let team = team::load_team(&team_dir)?;
@@ -53,6 +56,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, 
         team_name: team.name,
         work_dir,
         teamfly_dir,
+        agent_env,
         members: team.members,
         issues,
         current_issue: 0,
