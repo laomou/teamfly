@@ -298,6 +298,7 @@ fn dispatch(m: &mut Model, name: &str, assignment: String, chain_depth: u32) -> 
         backend: mem.backend,
         model: mem.model.clone(),
         mcp_config: mem.mcp_config.clone(),
+        env: m.agent_env.clone(),
         system_prompt: mem.system_prompt.clone(),
         user_input,
     })
@@ -355,6 +356,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             backend,
             model: mdl,
             mcp_config,
+            env,
             system_prompt,
             user_input,
         } => {
@@ -363,6 +365,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                 backend,
                 model: mdl,
                 mcp_config,
+                env,
                 system_prompt,
                 user_input,
                 work_dir: model.work_dir.clone(),
@@ -502,6 +505,7 @@ mod e2e {
             team_name: "T".into(),
             work_dir: std::env::temp_dir(),
             teamfly_dir: std::env::temp_dir().join(".af_x"),
+            agent_env: std::collections::HashMap::new(),
             members: vec![
                 member("老K", BackendKind::Mock, "架构"),
                 member("阿码", BackendKind::Mock, "实现"),
@@ -587,6 +591,7 @@ mod e2e {
             team_name: "演示队".into(),
             work_dir: dir.to_path_buf(),
             teamfly_dir: dir.join(".teamfly"),
+            agent_env: std::collections::HashMap::new(),
             members: vec![
                 member("老K", BackendKind::Mock, "架构"),
                 member("阿码", BackendKind::Mock, "实现"),

@@ -113,6 +113,8 @@ pub struct Model {
     pub team_name: String,
     pub work_dir: std::path::PathBuf,
     pub teamfly_dir: std::path::PathBuf,
+    /// 全队共享的环境变量,注入到每个 agent 子进程(来自 .teamfly/env.toml)
+    pub agent_env: std::collections::HashMap<String, String>,
     pub members: Vec<Member>,
     pub issues: Vec<Issue>,
     pub current_issue: usize,
@@ -179,6 +181,7 @@ pub enum Command {
         backend: BackendKind,
         model: Option<String>,
         mcp_config: Option<String>,
+        env: std::collections::HashMap<String, String>,
         system_prompt: String,
         user_input: String, // 增量前情 + 本次指派
     },

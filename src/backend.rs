@@ -14,6 +14,8 @@ pub struct RunSpec {
     pub model: Option<String>,
     /// per-agent MCP 配置文件路径(仅 claude backend 使用)
     pub mcp_config: Option<String>,
+    /// 注入到子进程的环境变量(来自 .teamfly/env.toml,全队共享)
+    pub env: std::collections::HashMap<String, String>,
     pub system_prompt: String,
     pub user_input: String,
     pub work_dir: PathBuf,
@@ -127,6 +129,7 @@ async fn run_process(
     let mut child = tokio::process::Command::new(&proc.bin)
         .args(&proc.args)
         .current_dir(&spec.work_dir)
+        .envs(&spec.env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -331,14 +334,16 @@ fn push_tail(tail: &mut Vec<String>, line: &str) {
 }
 
 /// api backend:Anthropic 原生 messages API(非流式,MVP 一次拿回)。
-/// base_url / key 走环境变量(ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN)。
+/// base_url / key 优先看 spec.env(.teamfly/env.toml),再看进程环境变量。
 async fn run_api(spec: &RunSpec, tx: &UnboundedSender<Msg>) -> anyhow::Result<String> {
-    let base = std::env::var("ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
-    let key = std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok())
-        .ok_or_else(|| anyhow::anyhow!("api backend 缺 API key(设 ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN)"))?;
+    let lookup = |k: &str| -> Option<String> {
+        spec.env.get(k).cloned().or_else(|| std::env::var(k).ok())
+    };
+    let base = lookup("ANTHROPIC_BASE_URL")
+        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+    let key = lookup("ANTHROPIC_API_KEY")
+        .or_else(|| lookup("ANTHROPIC_AUTH_TOKEN"))
+        .ok_or_else(|| anyhow::anyhow!("api backend 缺 API key(在 .teamfly/env.toml 或环境变量里设 ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN)"))?;
     let model = spec
         .model
         .clone()
