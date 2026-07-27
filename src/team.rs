@@ -17,7 +17,7 @@ struct AgentFront {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
-    provider: Option<String>,
+    mcp_config: Option<String>,
 }
 
 /// team.md 的 frontmatter。
@@ -141,7 +141,7 @@ pub fn load_team(dir: &Path) -> Result<Team> {
             emoji,
             backend,
             model: af.model,
-            provider: af.provider,
+            mcp_config: af.mcp_config,
             system_prompt: sp,
             state: AgentState::Idle,
             inbox: VecDeque::new(),
@@ -190,6 +190,12 @@ pub fn preflight(team: &Team) -> Vec<String> {
                 }
             }
             BackendKind::Mock => {}
+        }
+        // MCP 配置文件存在性校验(claude/codex 才用)
+        if let Some(mcp) = &m.mcp_config {
+            if !std::path::Path::new(mcp).exists() {
+                warns.push(format!("{} 的 mcp_config 文件不存在: {mcp}", m.name));
+            }
         }
     }
     if need_claude && which("claude").is_none() {

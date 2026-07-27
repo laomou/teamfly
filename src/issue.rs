@@ -105,7 +105,7 @@ mod tests {
             emoji: "🛡".into(),
             backend: BackendKind::Mock,
             model: None,
-            provider: None,
+            mcp_config: None,
             system_prompt: String::new(),
             state: AgentState::Idle,
             inbox: VecDeque::new(),

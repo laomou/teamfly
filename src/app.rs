@@ -4,7 +4,6 @@
 use crate::backend::{self, RunSpec};
 use crate::issue;
 use crate::model::*;
-use crate::provider::Providers;
 use crate::tui;
 use anyhow::Result;
 use crossterm::event::{
@@ -23,16 +22,15 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 /// 执行副作用的运行时环境(不含 Model,便于在借用 Model 的同时调用)。
 pub struct Runtime {
-    providers: Providers,
     tx: UnboundedSender<Msg>,
 }
 
 impl Runtime {
-    pub fn new(providers: Providers, tx: UnboundedSender<Msg>) -> Self {
-        Runtime { providers, tx }
+    pub fn new(tx: UnboundedSender<Msg>) -> Self {
+        Runtime { tx }
     }
     pub fn exec(&self, model: &Model, cmd: Command) {
-        execute(&self.providers, &self.tx, model, cmd);
+        execute(&self.tx, model, cmd);
     }
 }
 
@@ -299,7 +297,7 @@ fn dispatch(m: &mut Model, name: &str, assignment: String, chain_depth: u32) -> 
         name: mem.name.clone(),
         backend: mem.backend,
         model: mem.model.clone(),
-        provider: mem.provider.clone(),
+        mcp_config: mem.mcp_config.clone(),
         system_prompt: mem.system_prompt.clone(),
         user_input,
     })
@@ -346,7 +344,7 @@ pub fn at_suggestions(input: &str, roster: &[String]) -> Vec<String> {
 
 // ---- runtime:执行 Command ----
 
-fn execute(providers: &Providers, tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
+fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
     match cmd {
         Command::PersistChat { issue, msg } => {
             let dir = model.teamfly_dir.clone();
@@ -356,24 +354,18 @@ fn execute(providers: &Providers, tx: &UnboundedSender<Msg>, model: &Model, cmd:
             name,
             backend,
             model: mdl,
-            provider,
+            mcp_config,
             system_prompt,
             user_input,
         } => {
-            let (base_url, api_key) = provider
-                .as_ref()
-                .and_then(|p| providers.resolve(p))
-                .unwrap_or((None, None));
             let spec = RunSpec {
                 name,
                 backend,
                 model: mdl,
-                provider,
+                mcp_config,
                 system_prompt,
                 user_input,
                 work_dir: model.work_dir.clone(),
-                base_url,
-                api_key,
             };
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -385,7 +377,7 @@ fn execute(providers: &Providers, tx: &UnboundedSender<Msg>, model: &Model, cmd:
 
 // ---- 主循环 ----
 
-pub async fn run(model: Model, providers: Providers) -> Result<()> {
+pub async fn run(model: Model) -> Result<()> {
     // 终端初始化
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -394,7 +386,7 @@ pub async fn run(model: Model, providers: Providers) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, rx) = unbounded_channel::<Msg>();
-    let rt = Runtime::new(providers, tx.clone());
+    let rt = Runtime::new(tx.clone());
 
     let res = run_loop(&mut terminal, model, rt, tx, rx).await;
 
@@ -581,7 +573,7 @@ mod e2e {
             emoji: "👤".into(),
             backend,
             model: None,
-            provider: None,
+            mcp_config: None,
             system_prompt: if role == "架构" { "架构".into() } else { String::new() },
             state: AgentState::Idle,
             inbox: VecDeque::new(),
@@ -613,10 +605,10 @@ mod e2e {
     }
 
     /// 驱动整个 TEA 循环直到全体空闲。返回最终 Model。
-    async fn drive(mut m: Model, providers: Providers, first_input: &str) -> Model {
+    async fn drive(mut m: Model, first_input: &str) -> Model {
         let (tx, mut rx) = unbounded_channel::<Msg>();
         std::fs::create_dir_all(&m.teamfly_dir).unwrap();
-        let rt = Runtime::new(providers, tx.clone());
+        let rt = Runtime::new(tx.clone());
 
         // 我输入
         m.input = first_input.to_string();
@@ -646,9 +638,8 @@ mod e2e {
         std::fs::create_dir_all(&tmp).unwrap();
 
         let m = model(&tmp);
-        let providers = Providers::default();
         // 我 @老K → 老K(mock,架构)会 @阿码 → 阿码 @阿测
-        let m = drive(m, providers, "@老K 重构一下登录模块").await;
+        let m = drive(m, "@老K 重构一下登录模块").await;
 
         let tl = &m.issues[0].timeline;
         let authors: Vec<&str> = tl.iter().map(|x| x.author.as_str()).collect();
@@ -679,7 +670,7 @@ mod e2e {
         std::fs::create_dir_all(&tmp).unwrap();
 
         let m = model(&tmp);
-        let m = drive(m, Providers::default(), "只是记个备注,不@任何人").await;
+        let m = drive(m, "只是记个备注,不@任何人").await;
         // 只有我一条,无 agent 被唤醒
         assert_eq!(m.issues[0].timeline.len(), 1);
         assert!(m.members.iter().all(|x| x.state == AgentState::Idle));

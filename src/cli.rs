@@ -1,7 +1,6 @@
 //! CLI:teamfly work [工作目录] [--team <团队文件夹>]
 
 use crate::model::{Issue, Model, Selection};
-use crate::provider::Providers;
 use crate::team;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -26,8 +25,8 @@ pub enum Cmd {
     },
 }
 
-/// 组装初始 Model + Providers。
-pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, Providers, Vec<String>)> {
+/// 组装初始 Model。
+pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, Vec<String>)> {
     let work_dir = dir
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .canonicalize()
@@ -43,8 +42,6 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, 
     let team_dir = resolve_team_dir(team_arg, &teamfly_dir)?;
     let team = team::load_team(&team_dir)?;
     let warns = team::preflight(&team);
-
-    let providers = Providers::load(&teamfly_dir)?;
 
     // 恢复落盘的议题;没有则建一个默认议题
     let mut issues = crate::issue::load_all_issues(&teamfly_dir)?;
@@ -68,7 +65,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, 
         status_hint: None,
     };
 
-    Ok((model, providers, warns))
+    Ok((model, warns))
 }
 
 fn resolve_team_dir(team_arg: Option<PathBuf>, teamfly_dir: &std::path::Path) -> Result<PathBuf> {

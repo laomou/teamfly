@@ -4,7 +4,6 @@ mod builtin;
 mod cli;
 mod issue;
 mod model;
-mod provider;
 mod router;
 mod team;
 mod tui;
@@ -16,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
     let args = cli::Cli::parse();
     match args.cmd {
         cli::Cmd::Work { dir, team } => {
-            let (mut model, providers, warns) = cli::build(dir, team)?;
+            let (mut model, warns) = cli::build(dir, team)?;
             // 预检警告作为系统消息写进第一个议题的时间线
             for w in warns {
                 model.issues[0].timeline.push(model::ChatMsg {
@@ -26,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
                     is_system: true,
                 });
             }
-            app::run(model, providers).await?;
+            app::run(model).await?;
         }
     }
     Ok(())
