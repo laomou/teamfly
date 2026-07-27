@@ -12,14 +12,11 @@ pub struct RunSpec {
     pub name: String,
     pub backend: BackendKind,
     pub model: Option<String>,
-    #[allow(dead_code)] // provider 已在派发时解析成 base_url/api_key
-    pub provider: Option<String>,
+    /// per-agent MCP 配置文件路径(仅 claude backend 使用)
+    pub mcp_config: Option<String>,
     pub system_prompt: String,
     pub user_input: String,
     pub work_dir: PathBuf,
-    /// api backend 的 base_url / key(由 provider 解析后传入)
-    pub base_url: Option<String>,
-    pub api_key: Option<String>,
 }
 
 /// 起一个 agent 干一轮活。流式把每行 raw 通过 tx 回投,结束回投 AgentDone。
@@ -31,8 +28,8 @@ pub async fn run(spec: RunSpec, tx: UnboundedSender<Msg>) {
 
     for attempt in 1..=MAX_ATTEMPTS {
         let result = match spec.backend {
-            BackendKind::Claude => run_process(&spec, &tx, claude_cmd(&spec)).await,
-            BackendKind::Codex => run_process(&spec, &tx, codex_cmd(&spec)).await,
+            BackendKind::Claude => run_process(&spec, &tx, claude_cmd(&spec), true).await,
+            BackendKind::Codex => run_process(&spec, &tx, codex_cmd(&spec), false).await,
             BackendKind::Api => run_api(&spec, &tx).await,
             BackendKind::Mock => run_mock(&spec, &tx).await,
         };
@@ -70,17 +67,28 @@ pub async fn run(spec: RunSpec, tx: UnboundedSender<Msg>) {
     });
 }
 
-/// 构造 claude CLI 命令(headless print + bypass 权限 + 追加系统 prompt)。
+/// 构造 claude CLI 命令(headless stream-json + bypass 权限 + 禁反问 + 追加系统 prompt)。
 fn claude_cmd(spec: &RunSpec) -> ProcSpec {
     let mut args = vec![
         "--print".to_string(),
-        "--dangerously-skip-permissions".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(), // stream-json 必需
+        "--permission-mode".to_string(),
+        "bypassPermissions".to_string(),
+        "--disallowedTools".to_string(),
+        "AskUserQuestion".to_string(), // 无拍板:禁 agent 反问
         "--append-system-prompt".to_string(),
         spec.system_prompt.clone(),
     ];
     if let Some(m) = &spec.model {
         args.push("--model".into());
         args.push(m.clone());
+    }
+    if let Some(mcp) = &spec.mcp_config {
+        args.push("--mcp-config".into());
+        args.push(mcp.clone());
+        args.push("--strict-mcp-config".into());
     }
     args.push(spec.user_input.clone());
     ProcSpec {
@@ -114,6 +122,7 @@ async fn run_process(
     spec: &RunSpec,
     tx: &UnboundedSender<Msg>,
     proc: ProcSpec,
+    stream_json: bool,
 ) -> anyhow::Result<String> {
     let mut child = tokio::process::Command::new(&proc.bin)
         .args(&proc.args)
@@ -127,7 +136,9 @@ async fn run_process(
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
-    let mut full = String::new();
+    let mut full = String::new();       // 纯文本 backend:全部输出;stream-json:累积 assistant 文本
+    let mut result_text: Option<String> = None; // stream-json 的 result 事件最终文本
+    let mut stream_err: Option<String> = None;  // stream-json result.is_error 的内容
     let mut err_tail: Vec<String> = Vec::new(); // 保留最后几行 stderr 供报错
     let mut out_reader = BufReader::new(stdout).lines();
     let mut err_reader = BufReader::new(stderr).lines();
@@ -138,9 +149,13 @@ async fn run_process(
                 match line? {
                     Some(l) => {
                         let clean = strip_ansi(&l);
-                        full.push_str(&clean);
-                        full.push('\n');
-                        let _ = tx.send(Msg::AgentStdout { name: spec.name.clone(), line: clean });
+                        if stream_json {
+                            handle_stream_line(&clean, spec, tx, &mut full, &mut result_text, &mut stream_err);
+                        } else {
+                            full.push_str(&clean);
+                            full.push('\n');
+                            let _ = tx.send(Msg::AgentStdout { name: spec.name.clone(), line: clean });
+                        }
                     }
                     None => break,
                 }
@@ -165,6 +180,12 @@ async fn run_process(
     }
 
     let status = child.wait().await?;
+
+    // stream-json 里 result.is_error 视为失败(即便退出码 0)
+    if let Some(e) = stream_err {
+        anyhow::bail!("{} 报错:{e}", proc.bin);
+    }
+
     if !status.success() {
         let code = status
             .code()
@@ -182,7 +203,123 @@ async fn run_process(
             anyhow::bail!("{} 退出码 {code}:{detail}", proc.bin);
         }
     }
-    Ok(full)
+    // stream-json:优先用 result 事件的最终文本;否则回退到累积的 assistant 文本
+    Ok(result_text.unwrap_or(full))
+}
+
+/// 解析一行 stream-json 事件:更新累积文本 / result / error,并把人类可读的活动行发给 UI。
+fn handle_stream_line(
+    line: &str,
+    spec: &RunSpec,
+    tx: &UnboundedSender<Msg>,
+    full: &mut String,
+    result_text: &mut Option<String>,
+    stream_err: &mut Option<String>,
+) {
+    let outcome = classify_stream_line(line);
+    for disp in outcome.display {
+        let _ = tx.send(Msg::AgentStdout {
+            name: spec.name.clone(),
+            line: disp,
+        });
+    }
+    if let Some(t) = outcome.text_delta {
+        full.push_str(&t);
+        full.push('\n');
+    }
+    if let Some(e) = outcome.error {
+        *stream_err = Some(e);
+    } else if let Some(r) = outcome.result {
+        *result_text = Some(r);
+    }
+}
+
+/// 一行 stream-json 解析结果(纯数据,便于单测)。
+#[derive(Debug, Default, PartialEq)]
+struct StreamOutcome {
+    display: Vec<String>,       // 发给 UI 的人类可读行
+    text_delta: Option<String>, // assistant 文本(累积进 full)
+    result: Option<String>,     // result 事件最终文本
+    error: Option<String>,      // result.is_error 内容
+}
+
+/// 纯函数:把一行 stream-json 分类成 StreamOutcome。非 JSON 行原样透出。
+fn classify_stream_line(line: &str) -> StreamOutcome {
+    let mut out = StreamOutcome::default();
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return out;
+    }
+    let v: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => {
+            out.display.push(line.to_string());
+            return out;
+        }
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("system") => {
+            let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("?");
+            let ntools = v.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
+            out.display.push(format!("⟨init⟩ model={model} tools={ntools}"));
+        }
+        Some("assistant") => {
+            if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) {
+                let mut delta = String::new();
+                for blk in content {
+                    match blk.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = blk.get("text").and_then(|t| t.as_str()) {
+                                delta.push_str(t);
+                                delta.push('\n');
+                                for ln in t.lines() {
+                                    out.display.push(ln.to_string());
+                                }
+                            }
+                        }
+                        Some("tool_use") => {
+                            let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                            let hint = tool_input_hint(blk.get("input"));
+                            out.display.push(format!("🔧 {name}({hint})"));
+                        }
+                        _ => {}
+                    }
+                }
+                if !delta.is_empty() {
+                    out.text_delta = Some(delta.trim_end().to_string());
+                }
+            }
+        }
+        Some("result") => {
+            let is_err = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+            let text = v.get("result").and_then(|r| r.as_str()).unwrap_or("").to_string();
+            if is_err {
+                out.error = Some(if text.is_empty() { "(无 result 文本)".into() } else { text });
+            } else if !text.is_empty() {
+                out.result = Some(text);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// 从 tool_use 的 input 里取一个简短提示(文件路径 / 命令 / query)。
+fn tool_input_hint(input: Option<&serde_json::Value>) -> String {
+    let Some(obj) = input.and_then(|i| i.as_object()) else {
+        return String::new();
+    };
+    for key in ["file_path", "path", "command", "pattern", "query", "url"] {
+        if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+            let s = s.trim();
+            return if s.chars().count() > 60 {
+                format!("{}…", s.chars().take(60).collect::<String>())
+            } else {
+                s.to_string()
+            };
+        }
+    }
+    String::new()
 }
 
 /// 只保留最后 8 行 stderr。
@@ -194,18 +331,14 @@ fn push_tail(tail: &mut Vec<String>, line: &str) {
 }
 
 /// api backend:Anthropic 原生 messages API(非流式,MVP 一次拿回)。
+/// base_url / key 走环境变量(ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN)。
 async fn run_api(spec: &RunSpec, tx: &UnboundedSender<Msg>) -> anyhow::Result<String> {
-    let base = spec
-        .base_url
-        .clone()
-        .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok())
-        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-    let key = spec
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+    let base = std::env::var("ANTHROPIC_BASE_URL")
+        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    let key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
         .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok())
-        .ok_or_else(|| anyhow::anyhow!("api backend 缺 API key"))?;
+        .ok_or_else(|| anyhow::anyhow!("api backend 缺 API key(设 ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN)"))?;
     let model = spec
         .model
         .clone()
@@ -289,4 +422,55 @@ async fn run_mock(spec: &RunSpec, tx: &UnboundedSender<Msg>) -> anyhow::Result<S
         });
     }
     Ok(steps.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_system_init() {
+        let line = r#"{"type":"system","subtype":"init","model":"claude-opus","tools":["Read","Bash","Edit"]}"#;
+        let o = classify_stream_line(line);
+        assert_eq!(o.display, vec!["⟨init⟩ model=claude-opus tools=3"]);
+        assert!(o.result.is_none() && o.error.is_none());
+    }
+
+    #[test]
+    fn stream_assistant_text_and_tool() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"看一下代码"},{"type":"tool_use","name":"Read","input":{"file_path":"auth.py"}}]}}"#;
+        let o = classify_stream_line(line);
+        assert_eq!(o.text_delta.as_deref(), Some("看一下代码"));
+        assert_eq!(o.display, vec!["看一下代码".to_string(), "🔧 Read(auth.py)".to_string()]);
+    }
+
+    #[test]
+    fn stream_result_success() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"【群聊】干完了 @QE 补测试"}"#;
+        let o = classify_stream_line(line);
+        assert_eq!(o.result.as_deref(), Some("【群聊】干完了 @QE 补测试"));
+        assert!(o.error.is_none());
+    }
+
+    #[test]
+    fn stream_result_error() {
+        let line = r#"{"type":"result","subtype":"error","is_error":true,"result":"overloaded"}"#;
+        let o = classify_stream_line(line);
+        assert_eq!(o.error.as_deref(), Some("overloaded"));
+        assert!(o.result.is_none());
+    }
+
+    #[test]
+    fn stream_non_json_passthrough() {
+        let o = classify_stream_line("not json at all");
+        assert_eq!(o.display, vec!["not json at all"]);
+    }
+
+    #[test]
+    fn tool_hint_prefers_path() {
+        let v = serde_json::json!({"file_path":"src/main.rs","other":"x"});
+        assert_eq!(tool_input_hint(Some(&v)), "src/main.rs");
+        let v2 = serde_json::json!({"command":"cargo test"});
+        assert_eq!(tool_input_hint(Some(&v2)), "cargo test");
+    }
 }

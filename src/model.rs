@@ -46,7 +46,7 @@ pub struct Member {
     pub emoji: String,
     pub backend: BackendKind,
     pub model: Option<String>,
-    pub provider: Option<String>,
+    pub mcp_config: Option<String>,
     pub system_prompt: String, // team 公共 + 个人人设 拼装后的最终 prompt
     // 运行时
     pub state: AgentState,
@@ -178,7 +178,7 @@ pub enum Command {
         name: String,
         backend: BackendKind,
         model: Option<String>,
-        provider: Option<String>,
+        mcp_config: Option<String>,
         system_prompt: String,
         user_input: String, // 增量前情 + 本次指派
     },
