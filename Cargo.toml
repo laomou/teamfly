@@ -2,6 +2,7 @@
 name = "teamfly"
 version = "0.1.0"
 edition = "2021"
+authors = ["laomou <rui.mou@foxmail.com>"]
 
 [dependencies]
 ratatui = "0.28"
