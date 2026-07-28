@@ -31,14 +31,15 @@ const FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// 若 <teamfly_dir>/teams/default 不存在,则播种。已存在则不动(尊重用户改动)。
+/// 播种默认团队:目录不存在则完整播种;目录已存在但个别文件缺失,则补上缺失的。
+/// 已存在的文件不覆盖(尊重用户改动)。
 pub fn seed_default(teamfly_dir: &Path) -> Result<()> {
     let root = teamfly_dir.join("teams").join(DEFAULT_TEAM);
-    if root.is_dir() {
-        return Ok(());
-    }
     for (rel, content) in FILES {
         let path = root.join(rel);
+        if path.exists() {
+            continue; // 已存在,不动
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
