@@ -92,6 +92,13 @@ pub fn init() -> Result<()> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     println!("\n✓ 已写入 {}", path.display());
+
+    // 顺手建 ~/.teamfly/mcp.json 骨架(不存在才建)
+    if let Some(mcp) = crate::env::user_mcp_path() {
+        if crate::env::seed_user_mcp(&mcp).unwrap_or(false) {
+            println!("✓ 已建 MCP 骨架 {}(需要接 MCP 时在这里加)", mcp.display());
+        }
+    }
     Ok(())
 }
 

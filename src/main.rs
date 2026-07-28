@@ -7,6 +7,7 @@ mod issue;
 mod model;
 mod router;
 mod slash;
+mod stream;
 mod team;
 mod tui;
 

@@ -28,8 +28,8 @@ pub async fn run(spec: RunSpec, tx: UnboundedSender<Msg>) {
 
     for attempt in 1..=MAX_ATTEMPTS {
         let result = match spec.backend {
-            BackendKind::Claude => run_process(&spec, &tx, claude_cmd(&spec), true).await,
-            BackendKind::Codex => run_process(&spec, &tx, codex_cmd(&spec), false).await,
+            BackendKind::Claude => run_process(&spec, &tx, claude_cmd(&spec), crate::stream::StreamFmt::Claude).await,
+            BackendKind::Codex => run_process(&spec, &tx, codex_cmd(&spec), crate::stream::StreamFmt::Codex).await,
         };
 
         match result {
@@ -110,13 +110,18 @@ fn resolve_mcp_config(work_dir: &std::path::Path) -> Option<String> {
     }
 }
 
-/// 构造 codex CLI 非交互命令。codex exec 走一次性执行。
+/// 构造 codex CLI 非交互命令(JSONL 事件流 + 跳过 git/sandbox 检查)。
 fn codex_cmd(spec: &RunSpec) -> ProcSpec {
-    // codex 无「追加系统 prompt」的稳定 flag,MVP 把系统 prompt 前置进输入。
+    // codex 无「追加系统 prompt」的稳定 flag,把系统 prompt 前置进输入。
     let combined = format!("{}\n\n{}", spec.system_prompt, spec.user_input);
-    let mut args = vec!["exec".to_string()];
+    let args = vec![
+        "exec".to_string(),
+        "--json".to_string(),                              // JSONL 事件流
+        "--skip-git-repo-check".to_string(),               // 不要求工作目录是 git 库
+        "--dangerously-bypass-approvals-and-sandbox".to_string(), // 无拍板,和 claude 对齐
+        combined,
+    ];
     // 模型不走 --model,改由 env 接管
-    args.push(combined);
     ProcSpec {
         bin: "codex".into(),
         args,
@@ -132,7 +137,7 @@ async fn run_process(
     spec: &RunSpec,
     tx: &UnboundedSender<Msg>,
     proc: ProcSpec,
-    stream_json: bool,
+    fmt: crate::stream::StreamFmt,
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new(&proc.bin);
     cmd.args(&proc.args)
@@ -161,9 +166,9 @@ async fn run_process(
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
-    let mut full = String::new();       // 纯文本 backend:全部输出;stream-json:累积 assistant 文本
-    let mut result_text: Option<String> = None; // stream-json 的 result 事件最终文本
-    let mut stream_err: Option<String> = None;  // stream-json result.is_error 的内容
+    let mut full = String::new();       // 累积 assistant 文本
+    let mut result_text: Option<String> = None; // 最终 result 文本
+    let mut stream_err: Option<String> = None;  // 流里的错误内容
     let mut err_tail: Vec<String> = Vec::new(); // 保留最后几行 stderr 供报错
     let mut out_reader = BufReader::new(stdout).lines();
     let mut err_reader = BufReader::new(stderr).lines();
@@ -174,12 +179,18 @@ async fn run_process(
                 match line? {
                     Some(l) => {
                         let clean = strip_ansi(&l);
-                        if stream_json {
-                            handle_stream_line(&clean, spec, tx, &mut full, &mut result_text, &mut stream_err);
-                        } else {
-                            full.push_str(&clean);
+                        let outcome = crate::stream::classify(fmt, &clean);
+                        for disp in outcome.display {
+                            let _ = tx.send(Msg::AgentStdout { name: spec.name.clone(), line: disp });
+                        }
+                        if let Some(t) = outcome.text_delta {
+                            full.push_str(&t);
                             full.push('\n');
-                            let _ = tx.send(Msg::AgentStdout { name: spec.name.clone(), line: clean });
+                        }
+                        if let Some(e) = outcome.error {
+                            stream_err = Some(e);
+                        } else if let Some(r) = outcome.result {
+                            result_text = Some(r);
                         }
                     }
                     None => break,
@@ -232,121 +243,6 @@ async fn run_process(
     Ok(result_text.unwrap_or(full))
 }
 
-/// 解析一行 stream-json 事件:更新累积文本 / result / error,并把人类可读的活动行发给 UI。
-fn handle_stream_line(
-    line: &str,
-    spec: &RunSpec,
-    tx: &UnboundedSender<Msg>,
-    full: &mut String,
-    result_text: &mut Option<String>,
-    stream_err: &mut Option<String>,
-) {
-    let outcome = classify_stream_line(line);
-    for disp in outcome.display {
-        let _ = tx.send(Msg::AgentStdout {
-            name: spec.name.clone(),
-            line: disp,
-        });
-    }
-    if let Some(t) = outcome.text_delta {
-        full.push_str(&t);
-        full.push('\n');
-    }
-    if let Some(e) = outcome.error {
-        *stream_err = Some(e);
-    } else if let Some(r) = outcome.result {
-        *result_text = Some(r);
-    }
-}
-
-/// 一行 stream-json 解析结果(纯数据,便于单测)。
-#[derive(Debug, Default, PartialEq)]
-struct StreamOutcome {
-    display: Vec<String>,       // 发给 UI 的人类可读行
-    text_delta: Option<String>, // assistant 文本(累积进 full)
-    result: Option<String>,     // result 事件最终文本
-    error: Option<String>,      // result.is_error 内容
-}
-
-/// 纯函数:把一行 stream-json 分类成 StreamOutcome。非 JSON 行原样透出。
-fn classify_stream_line(line: &str) -> StreamOutcome {
-    let mut out = StreamOutcome::default();
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return out;
-    }
-    let v: serde_json::Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(_) => {
-            out.display.push(line.to_string());
-            return out;
-        }
-    };
-    match v.get("type").and_then(|t| t.as_str()) {
-        Some("system") => {
-            let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("?");
-            let ntools = v.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
-            out.display.push(format!("⟨init⟩ model={model} tools={ntools}"));
-        }
-        Some("assistant") => {
-            if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) {
-                let mut delta = String::new();
-                for blk in content {
-                    match blk.get("type").and_then(|t| t.as_str()) {
-                        Some("text") => {
-                            if let Some(t) = blk.get("text").and_then(|t| t.as_str()) {
-                                delta.push_str(t);
-                                delta.push('\n');
-                                for ln in t.lines() {
-                                    out.display.push(ln.to_string());
-                                }
-                            }
-                        }
-                        Some("tool_use") => {
-                            let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                            let hint = tool_input_hint(blk.get("input"));
-                            out.display.push(format!("🔧 {name}({hint})"));
-                        }
-                        _ => {}
-                    }
-                }
-                if !delta.is_empty() {
-                    out.text_delta = Some(delta.trim_end().to_string());
-                }
-            }
-        }
-        Some("result") => {
-            let is_err = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
-            let text = v.get("result").and_then(|r| r.as_str()).unwrap_or("").to_string();
-            if is_err {
-                out.error = Some(if text.is_empty() { "(无 result 文本)".into() } else { text });
-            } else if !text.is_empty() {
-                out.result = Some(text);
-            }
-        }
-        _ => {}
-    }
-    out
-}
-
-/// 从 tool_use 的 input 里取一个简短提示(文件路径 / 命令 / query)。
-fn tool_input_hint(input: Option<&serde_json::Value>) -> String {
-    let Some(obj) = input.and_then(|i| i.as_object()) else {
-        return String::new();
-    };
-    for key in ["file_path", "path", "command", "pattern", "query", "url"] {
-        if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
-            let s = s.trim();
-            return if s.chars().count() > 60 {
-                format!("{}…", s.chars().take(60).collect::<String>())
-            } else {
-                s.to_string()
-            };
-        }
-    }
-    String::new()
-}
-
 /// 只保留最后 8 行 stderr。
 fn push_tail(tail: &mut Vec<String>, line: &str) {
     tail.push(line.to_string());
@@ -355,53 +251,3 @@ fn push_tail(tail: &mut Vec<String>, line: &str) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stream_system_init() {
-        let line = r#"{"type":"system","subtype":"init","model":"claude-opus","tools":["Read","Bash","Edit"]}"#;
-        let o = classify_stream_line(line);
-        assert_eq!(o.display, vec!["⟨init⟩ model=claude-opus tools=3"]);
-        assert!(o.result.is_none() && o.error.is_none());
-    }
-
-    #[test]
-    fn stream_assistant_text_and_tool() {
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"看一下代码"},{"type":"tool_use","name":"Read","input":{"file_path":"auth.py"}}]}}"#;
-        let o = classify_stream_line(line);
-        assert_eq!(o.text_delta.as_deref(), Some("看一下代码"));
-        assert_eq!(o.display, vec!["看一下代码".to_string(), "🔧 Read(auth.py)".to_string()]);
-    }
-
-    #[test]
-    fn stream_result_success() {
-        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"【群聊】干完了 @QE 补测试"}"#;
-        let o = classify_stream_line(line);
-        assert_eq!(o.result.as_deref(), Some("【群聊】干完了 @QE 补测试"));
-        assert!(o.error.is_none());
-    }
-
-    #[test]
-    fn stream_result_error() {
-        let line = r#"{"type":"result","subtype":"error","is_error":true,"result":"overloaded"}"#;
-        let o = classify_stream_line(line);
-        assert_eq!(o.error.as_deref(), Some("overloaded"));
-        assert!(o.result.is_none());
-    }
-
-    #[test]
-    fn stream_non_json_passthrough() {
-        let o = classify_stream_line("not json at all");
-        assert_eq!(o.display, vec!["not json at all"]);
-    }
-
-    #[test]
-    fn tool_hint_prefers_path() {
-        let v = serde_json::json!({"file_path":"src/main.rs","other":"x"});
-        assert_eq!(tool_input_hint(Some(&v)), "src/main.rs");
-        let v2 = serde_json::json!({"command":"cargo test"});
-        assert_eq!(tool_input_hint(Some(&v2)), "cargo test");
-    }
-}
