@@ -61,23 +61,25 @@ impl AgentEnv {
     }
 }
 
-/// 加载 env.toml。合并顺序:
-///   1. 用户级 `~/.teamfly/env.toml`(不存在则自动创建带注释的模板)
-///   2. 项目级 `<工作目录>/.teamfly/env.toml`  ← 同名 key 覆盖用户级
-/// 两者都可选,都没有 = 空(但用户级会被首次自动 seed)。
+/// 加载 env.toml。**不合并**:
+///   项目级 `<工作目录>/.teamfly/env.toml` 存在 → 只用项目级(忽略用户级)
+///   否则 → 用用户级 `~/.teamfly/env.toml`(不存在则自动 seed 模板)
 pub fn load(teamfly_dir: &Path) -> Result<AgentEnv> {
     let mut env = AgentEnv::default();
-    // 用户级:不存在则播种模板
+
+    // 项目级存在 → 只用它
+    let project_path = teamfly_dir.join("env.toml");
+    if project_path.exists() {
+        merge_into(&mut env, &project_path)?;
+        return Ok(env);
+    }
+
+    // 否则用用户级(不存在则播种模板)
     if let Some(user_path) = user_env_path() {
         seed_user_env(&user_path).ok(); // seed 失败不致命
         if user_path.exists() {
             merge_into(&mut env, &user_path)?;
         }
-    }
-    // 项目级(覆盖用户级)
-    let project_path = teamfly_dir.join("env.toml");
-    if project_path.exists() {
-        merge_into(&mut env, &project_path)?;
     }
     Ok(env)
 }

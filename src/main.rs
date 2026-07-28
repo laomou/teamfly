@@ -16,6 +16,9 @@ use clap::Parser;
 async fn main() -> anyhow::Result<()> {
     let args = cli::Cli::parse();
     match args.cmd {
+        cli::Cmd::Init => {
+            cli::init()?;
+        }
         cli::Cmd::Work { dir, team } => {
             let (mut model, warns) = cli::build(dir, team)?;
             // 预检警告作为系统消息写进第一个议题的时间线
