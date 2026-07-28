@@ -221,9 +221,9 @@ mod tests {
 
     #[test]
     fn claude_result_success() {
-        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"干完了 @QE 补测试"}"#;
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"干完了 @TPM 请安排评审"}"#;
         let o = classify(StreamFmt::Claude, line);
-        assert_eq!(o.result.as_deref(), Some("干完了 @QE 补测试"));
+        assert_eq!(o.result.as_deref(), Some("干完了 @TPM 请安排评审"));
         assert!(o.error.is_none());
     }
 

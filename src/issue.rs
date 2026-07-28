@@ -94,7 +94,7 @@ pub fn build_prompt_input(timeline: &[ChatMsg], member: &Member, assignment: &st
     }
     s.push_str("现在轮到你:\n");
     s.push_str(assignment);
-    s.push_str("\n\n（干完后,用简短一段话总结你做了什么、结果如何;需要谁接力就 @他的名字。）");
+    s.push_str("\n\n（干完后,用简短一段话总结你做了什么、结果如何;仅在需要接力时才 @下一位成员。任务已完成或只是向用户汇总时,不要 @任何成员。）");
     s
 }
 
