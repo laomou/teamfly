@@ -92,18 +92,22 @@ pub fn parse_mentions(report: &str, roster: &[String], self_name: &str) -> Vec<S
 ///    `@DEVOPS` 会命中 `DEV`,凭空唤醒一个 agent 跑一整轮。
 ///    中文名不做这个限制 —— 中文没有词间空格,`@小盾对下接口` 是正常写法。
 fn longest_roster_prefix(rest: &str, roster: &[String]) -> Option<String> {
-    // 跳过紧跟 @ 的 Markdown 强调符
-    let rest = rest.trim_start_matches(['*', '`', '_']);
+    // 跳过紧跟 @ 的 Markdown 强调符。不含 `_`:`@_DEV` 更像文件名/标识符,
+    // 而 `_` 本身要当词内字符看(见下面的边界判定)。
+    let rest = rest.trim_start_matches(['*', '`']);
     let lower = rest.to_ascii_lowercase(); // ASCII 小写不改变字节长度,中文不受影响
     let mut best: Option<&String> = None;
     for name in roster {
         if !lower.starts_with(&name.to_ascii_lowercase()) {
             continue;
         }
-        // 纯 ASCII 名字要求词尾边界
+        // 纯 ASCII 名字要求词尾边界。`_ - / \` 也算词**内**字符 ——
+        // agent 写 `@dev_setup.md` / `@DEV-notes` / `@rev/main.rs` 指的是文件路径,
+        // 不是在 @人;命中一次就白起一整轮 bypass 权限的进程。
+        // `.` `,` `:` `。` 等标点仍算边界(`@DEV, 你来` 是正常写法)。
         if name.is_ascii() {
             let next = rest[name.len()..].chars().next();
-            if next.is_some_and(|c| c.is_ascii_alphanumeric()) {
+            if next.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '\\')) {
                 continue;
             }
         }
@@ -249,6 +253,18 @@ mod tests {
     }
 
     #[test]
+    fn mentions_treat_path_chars_as_word_internal() {
+        // 这些都是在说文件/路径,不是在 @人。命中一次就白起一整轮 bypass 进程。
+        let roster = vec!["DEV".to_string(), "REV".to_string()];
+        for s in ["见 @dev_setup.md", "参考 @DEV-notes", "见 @rev/main.rs", "@_DEV", "@DEV\\path"] {
+            assert!(
+                parse_mentions(s, &roster, "TPM").is_empty(),
+                "{s:?} 不该命中任何成员"
+            );
+        }
+    }
+
+    #[test]
     fn mentions_cjk_names_stay_permissive() {
         // 中文没有词间空格,@小盾对下接口 是正常写法,不能因为边界规则把它判掉
         assert_eq!(
@@ -293,3 +309,4 @@ mod tests {
         assert_eq!(strip_ansi("plain"), "plain");
     }
 }
+

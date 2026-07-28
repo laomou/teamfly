@@ -572,11 +572,74 @@ fn bottom_scroll(total: u16, height: u16, user_scroll: u16) -> u16 {
 /// `Line::width()` 用的是 unicode-width,和 ratatui 内部折行的度量一致。
 fn wrapped_height(lines: &[Line], w: u16) -> u16 {
     let w = w.max(1) as usize;
-    let total: usize = lines
-        .iter()
-        .map(|l| l.width().max(1).div_ceil(w))
-        .sum();
+    let total: usize = lines.iter().map(|l| word_wrap_rows(l, w)).sum();
     total.min(u16::MAX as usize) as u16
+}
+
+/// 一条 Line 在宽度 w 下被 WordWrapper 折成几行。
+///
+/// 不能简单用 `width / w` 向上取整:`Wrap` 是**按词**折行,
+/// 「若干短词 + 一个塞不进剩余宽度的长 token」会比整除多占一行。
+/// raw 视图里全是这种(`🔧 Read(很长的路径)`、命令行),少算就会让底部划不到。
+fn word_wrap_rows(line: &Line, w: usize) -> usize {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    if text.is_empty() {
+        return 1; // 空行也占一行
+    }
+    let mut rows = 1usize;
+    let mut used = 0usize; // 当前行已占列数
+    // 逐字符放置:宽 2 的字符在只剩 1 列时会整体挪到下一行,
+    // 所以不能用「列数整除宽度」来算硬切(中文长串会少算)。
+    let put = |ch: char, rows: &mut usize, used: &mut usize| {
+        let cw = char_cols(ch);
+        if *used + cw > w && *used > 0 {
+            *rows += 1;
+            *used = 0;
+        }
+        *used += cw;
+    };
+
+    let mut first = true;
+    let mut rest = text.as_str();
+    while !rest.is_empty() {
+        // 按「空白 + 非空白」成对推进,和 WordWrapper 的贪心一致
+        let ws_len = rest.find(|c: char| !c.is_whitespace()).unwrap_or(rest.len());
+        let (ws, tail) = rest.split_at(ws_len);
+        let word_len = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        let (word, next) = tail.split_at(word_len);
+
+        if first {
+            // 行首空白保留(Wrap{trim:false} 的语义)
+            for ch in ws.chars() {
+                put(ch, &mut rows, &mut used);
+            }
+            first = false;
+        } else if used > 0 && used + str_cols(ws) + str_cols(word) > w {
+            // 断行。断行处的分隔空白会被**吃掉**,不带到下一行 ——
+            // 否则每断一次多算一列,长句会整体多算出一行。
+            rows += 1;
+            used = 0;
+        } else {
+            for ch in ws.chars() {
+                put(ch, &mut rows, &mut used);
+            }
+        }
+        for ch in word.chars() {
+            put(ch, &mut rows, &mut used);
+        }
+        rest = next;
+    }
+    rows
+}
+
+fn char_cols(c: char) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    c.width().unwrap_or(0)
+}
+
+fn str_cols(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    s.width()
 }
 
 fn display_width(s: &str) -> usize {
@@ -631,16 +694,52 @@ mod tests {
         }
     }
 
-    /// 折行后的高度必须按渲染行算,否则贴底偏移会算少、最新输出划不到。
+    /// `text` 在宽度 w 下真实占了几行。
+    ///
+    /// 做法:在它后面放一个哨兵行,看哨兵落到第几行 —— 那就是 text 占的行数。
+    /// 不能数「非空行」:空行渲染出来什么都没有,但它在滚动坐标里确实占一行。
+    fn real_rows(text: &str, w: u16) -> usize {
+        const H: u16 = 60;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, H)).unwrap();
+        t.draw(|f| {
+            f.render_widget(
+                Paragraph::new(vec![Line::raw(text), Line::raw("\u{2588}")])
+                    .wrap(Wrap { trim: false }),
+                f.area(),
+            )
+        })
+        .unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..H)
+            .find(|y| (0..w).any(|x| buf[(x, *y)].symbol() == "\u{2588}"))
+            .expect("哨兵行应该在可视区内") as usize
+    }
+
+    /// 折行后的高度必须和 ratatui 的 WordWrapper 一致。
+    ///
+    /// 用 `width / w` 向上取整会算少:按词折行时「短词 + 塞不进的长 token」
+    /// 会多占一行。算少 → 贴底偏移偏小 → 最新输出被顶出可视区且划不回来。
     #[test]
-    fn wrapped_height_counts_render_rows() {
-        let lines = vec![Line::raw("abcdefghij")]; // 10 列宽
-        assert_eq!(wrapped_height(&lines, 10), 1);
-        assert_eq!(wrapped_height(&lines, 5), 2);
-        assert_eq!(wrapped_height(&lines, 3), 4);
-        // 空行也占一行
-        assert_eq!(wrapped_height(&[Line::raw("")], 10), 1);
-        // 中文按 2 列算
-        assert_eq!(wrapped_height(&[Line::raw("中文")], 2), 2);
+    fn wrapped_height_matches_real_rendering() {
+        let cases: &[(&str, u16)] = &[
+            ("abcdefghij", 10),
+            ("abcdefghij", 5),
+            ("abcdefghij", 3),
+            ("", 10),
+            ("中文", 2),
+            ("12345 67890 12345", 10),
+            ("  🔧 Read(/home/user/project/src/some/deep/path/module.rs)", 40),
+            ("📋 1 [package] 2 name = \"teamfly\" 3 version = \"0.1.0\"", 20),
+            ("💭 The user wants me to read two files and then reply", 24),
+            ("a b c d e f g h i j k l m n o p", 7),
+            ("单个超长中文词汇没有空格所以只能硬切", 9),
+            ("short", 80),
+        ];
+        for (txt, w) in cases {
+            let got = wrapped_height(&[Line::raw(*txt)], *w);
+            let want = real_rows(txt, *w) as u16;
+            assert_eq!(got, want, "宽{w} 文本{txt:?}: 算出 {got} 行,实际渲染 {want} 行");
+        }
     }
 }
+

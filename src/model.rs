@@ -51,8 +51,11 @@ pub struct Member {
     pub inbox: VecDeque<Assignment>,
     /// raw 输出流（环形缓冲，剥过 ANSI），供单人视图展示
     pub raw: VecDeque<String>,
-    /// 该成员上次「活跃」时群聊时间线的长度，用于算增量前情
-    pub last_seen_chat_len: usize,
+    /// 每个议题里「上次活跃时该议题时间线的长度」,用于算增量前情。
+    /// 必须按议题分开存:时间线是议题级的,而成员是跨议题共用的 ——
+    /// 存成一个数字的话,在长议题里活跃过之后再去短议题干活,
+    /// start 会等于 timeline.len(),整段前情被静默吞掉。
+    pub last_seen: std::collections::HashMap<u64, usize>,
 }
 
 pub const RAW_CAP: usize = 2000; // 单 agent raw 环形缓冲上限
@@ -62,6 +65,10 @@ pub const RAW_CAP: usize = 2000; // 单 agent raw 环形缓冲上限
 pub const CANCELLED: &str = "已取消";
 
 impl Member {
+    /// 该成员在某议题里上次看到的时间线长度(没记过就是 0 = 从头看)。
+    pub fn last_seen_for(&self, issue: u64) -> usize {
+        self.last_seen.get(&issue).copied().unwrap_or(0)
+    }
     pub fn push_raw(&mut self, line: String) {
         self.raw.push_back(line);
         while self.raw.len() > RAW_CAP {

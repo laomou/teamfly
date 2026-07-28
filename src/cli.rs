@@ -63,44 +63,29 @@ pub fn init() -> Result<()> {
     let openai_base = prompt_line("OPENAI_BASE_URL", &cur("codex", "OPENAI_BASE_URL"))?;
     let openai_key = prompt_secret("OPENAI_API_KEY", &cur("codex", "OPENAI_API_KEY"))?;
 
-    // 组装 toml
-    let mut out = String::new();
-    out.push_str("# teamfly 用户级 agent 环境变量(teamfly init 生成)\n");
-    out.push_str("# 项目里可写 <工作目录>/.teamfly/env.toml 覆盖同名 key\n\n");
+    // 在**现有 toml 树上原地改**这四个 key,再整棵序列化回去。
+    //
+    // 以前是手拼字符串 `K = "{v}"`:值里含 `"` 或 `\` 就写出非法 TOML,
+    // 下次 teamfly 在 env::load 就 bail,TUI 根本进不去;而且只认识
+    // claude/codex/顶层标量三处,别的段、嵌套表、数组一律被静默删掉。
+    // 交给 toml crate 序列化则转义和结构都不用自己操心。
+    let mut table: toml::Table = match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).unwrap_or_default(),
+        Err(_) => toml::Table::new(),
+    };
+    set_or_remove(&mut table, "claude", "ANTHROPIC_BASE_URL", &anthropic_base);
+    set_or_remove(&mut table, "claude", "ANTHROPIC_AUTH_TOKEN", &anthropic_token);
+    set_or_remove(&mut table, "codex", "OPENAI_BASE_URL", &openai_base);
+    set_or_remove(&mut table, "codex", "OPENAI_API_KEY", &openai_key);
 
-    out.push_str("[claude]\n");
-    if !anthropic_base.is_empty() {
-        out.push_str(&format!("ANTHROPIC_BASE_URL   = \"{anthropic_base}\"\n"));
-    }
-    if !anthropic_token.is_empty() {
-        out.push_str(&format!("ANTHROPIC_AUTH_TOKEN = \"{anthropic_token}\"\n"));
-    }
-    // 保留现有 [claude] 段里 init 不管的其它 key(如 ANTHROPIC_MODEL)
-    for (k, v) in extra_keys(&existing, "claude", &["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]) {
-        out.push_str(&format!("{k} = \"{v}\"\n"));
-    }
+    // 清掉空段(比如 codex 全跳过时),免得留一行光秃秃的 [codex]
+    table.retain(|_, v| !matches!(v.as_table(), Some(t) if t.is_empty()));
 
-    let codex_extra = extra_keys(&existing, "codex", &["OPENAI_BASE_URL", "OPENAI_API_KEY"]);
-    if !openai_base.is_empty() || !openai_key.is_empty() || !codex_extra.is_empty() {
-        out.push_str("\n[codex]\n");
-        if !openai_base.is_empty() {
-            out.push_str(&format!("OPENAI_BASE_URL = \"{openai_base}\"\n"));
-        }
-        if !openai_key.is_empty() {
-            out.push_str(&format!("OPENAI_API_KEY  = \"{openai_key}\"\n"));
-        }
-        for (k, v) in codex_extra {
-            out.push_str(&format!("{k} = \"{v}\"\n"));
-        }
-    }
-    // 顶层(不分段)的 key 也留着
-    let top_extra = extra_keys(&existing, "", &[]);
-    if !top_extra.is_empty() {
-        out.push_str("\n# —— 原有的顶层 key(所有 backend 共用)——\n");
-        for (k, v) in top_extra {
-            out.push_str(&format!("{k} = \"{v}\"\n"));
-        }
-    }
+    let body = toml::to_string_pretty(&table)?;
+    let out = format!(
+        "# teamfly 用户级 agent 环境变量(teamfly init 生成/更新)\n\
+         # 项目里可写 <工作目录>/.teamfly/env.toml 覆盖同名 key\n\n{body}"
+    );
 
     // 原子 + 0600 写入(不再「先 0644 再 chmod」留可读窗口)
     crate::env::write_private(&path, &out)?;
@@ -113,6 +98,20 @@ pub fn init() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 往 `[section]` 里写一个 key;值为空则删掉这个 key(而不是写空串)。
+/// 段不存在会新建;段存在但不是表(用户写歪了)则不动,免得把它的内容冲掉。
+fn set_or_remove(table: &mut toml::Table, section: &str, key: &str, value: &str) {
+    let entry = table
+        .entry(section.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let Some(sub) = entry.as_table_mut() else { return };
+    if value.is_empty() {
+        sub.remove(key);
+    } else {
+        sub.insert(key.to_string(), toml::Value::String(value.to_string()));
+    }
 }
 
 fn or_default(v: String, fallback: &str) -> String {
@@ -160,26 +159,6 @@ fn scalar(v: &toml::Value) -> Option<String> {
         toml::Value::Float(f) => Some(f.to_string()),
         _ => None,
     }
-}
-
-/// 某段里除 `known` 之外的 key —— init 不认识但用户写了的,要原样留下。
-fn extra_keys(
-    existing: &std::collections::BTreeMap<String, String>,
-    section: &str,
-    known: &[&str],
-) -> Vec<(String, String)> {
-    let prefix = format!("{section}.");
-    existing
-        .iter()
-        .filter_map(|(k, v)| {
-            let rest = k.strip_prefix(&prefix)?;
-            if rest.contains('.') || known.contains(&rest) {
-                None
-            } else {
-                Some((rest.to_string(), v.clone()))
-            }
-        })
-        .collect()
 }
 
 fn prompt_line(label: &str, default: &str) -> Result<String> {
