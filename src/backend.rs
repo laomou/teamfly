@@ -141,23 +141,18 @@ async fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // 模型不走 --model,改由 env 注入:若 frontmatter 指定了 model,则注入 ANTHROPIC_MODEL(claude)/OPENAI_MODEL(codex)
-    // 到 env 里,覆盖掉 shell 继承来的值
+    // 模型不走 --model,改由 env 注入
+    // 优先级:继承值 < env.toml(spec.env) < frontmatter model(最高,cmd.env 最后覆盖)
+    // 先注入 env.toml
+    cmd.envs(&spec.env);
+    // 再覆盖 frontmatter model(若指定)
     if let Some(m) = &spec.model {
         let env_key = match spec.backend {
             BackendKind::Claude => "ANTHROPIC_MODEL",
             BackendKind::Codex => "OPENAI_MODEL",
         };
-        // 加到 env 里(envs 最后加,会覆盖前面 unset 的逻辑)
-        // 但注意 env_remove 是在 envs 之前,所以这里直接在后面补不行。
-        // 改为:如果 spec.env 里没有这个 key,才去修改 cmd 的 env
-        if !spec.env.contains_key(env_key) {
-            cmd.env(env_key, m);
-        }
+        cmd.env(env_key, m);
     }
-
-    // 显式注入的 env(spec.env)最后加,覆盖继承来的
-    cmd.envs(&spec.env);
 
     let mut child = cmd
         .spawn()
