@@ -71,7 +71,7 @@ impl Member {
 pub struct ChatMsg {
     pub ts: String,            // ISO 时间戳
     pub author: String,        // "我" / agent 名 / "系统"
-    pub text: String,          // 展示文本（【群聊】后的内容 或 我原话）
+    pub text: String,          // 展示文本（agent 的最终回复精炼 或 我原话）
     #[serde(default)]
     pub is_system: bool,       // 掉线/暂停等系统消息
 }

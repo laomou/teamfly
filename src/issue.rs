@@ -85,7 +85,7 @@ pub fn build_prompt_input(timeline: &[ChatMsg], member: &Member, assignment: &st
 
     let mut s = String::new();
     if !recent.is_empty() {
-        s.push_str("[群聊新进展]\n");
+        s.push_str("[团队新进展]\n");
         for m in recent {
             let who = if m.is_system { "系统" } else { &m.author };
             s.push_str(&format!("{who}: {}\n", m.text));
@@ -94,10 +94,7 @@ pub fn build_prompt_input(timeline: &[ChatMsg], member: &Member, assignment: &st
     }
     s.push_str("现在轮到你:\n");
     s.push_str(assignment);
-    s.push_str(&format!(
-        "\n\n（干完后,请用一行以「{}」开头的话向群里汇报结论,需要谁接力就 @他。）",
-        crate::router::CHAT_MARK
-    ));
+    s.push_str("\n\n（干完后,用简短一段话总结你做了什么、结果如何;需要谁接力就 @他的名字。）");
     s
 }
 
@@ -142,13 +139,13 @@ mod tests {
         assert!(input.contains("拆三块"));
         assert!(!input.contains("把 auth 抽出来"));
         assert!(input.contains("接②限流"));
-        assert!(input.contains("【群聊】"));
+        assert!(input.contains("总结你做了什么"));
     }
 
     #[test]
     fn no_recent_when_caught_up() {
         let tl = vec![msg("我", "x")];
         let input = build_prompt_input(&tl, &member(1), "干活");
-        assert!(!input.contains("[群聊新进展]"));
+        assert!(!input.contains("[团队新进展]"));
     }
 }

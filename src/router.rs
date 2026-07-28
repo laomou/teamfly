@@ -1,37 +1,45 @@
-//! 路由：从 agent 的 raw 输出提取【群聊】汇报，解析 @ 指派，防乒乓。
+//! 路由：从 agent 的最终回复(result)提炼群聊汇报，解析 @ 指派，防乒乓。
 //! 尽量纯函数，便于单测。
 
-/// 群聊汇报标记。
-pub const CHAT_MARK: &str = "【群聊】";
+/// 群聊汇报的字数上限(超出截断)。
+const REPORT_MAX_CHARS: usize = 500;
 
-/// 从整轮 raw 输出里提取「面向群聊的一句汇报」。
-/// 优先取以【群聊】开头的行；没有则兜底取最后一段非空文本。
+/// 从 agent 一轮的最终回复(claude/codex 的 result 文本)提炼成群聊里好读的汇报。
+///
+/// 无需 agent 写任何标记 —— result 本就是它这轮的收尾回复。
+/// 做的清理:去掉首尾空白与空行、折叠连续空行、超长截断(保留 @)。
 pub fn extract_report(full_output: &str) -> String {
-    // 1) 找【群聊】行（可能多行，取最后一条，通常是收尾汇报）
-    let marked: Vec<&str> = full_output
-        .lines()
-        .filter_map(|l| {
-            let t = l.trim();
-            t.find(CHAT_MARK).map(|i| t[i + CHAT_MARK.len()..].trim())
-        })
-        .filter(|s| !s.is_empty())
-        .collect();
-    if let Some(last) = marked.last() {
-        return last.to_string();
+    let cleaned = collapse_blank_lines(full_output.trim());
+    if cleaned.is_empty() {
+        return "(无输出)".to_string();
     }
-    // 2) 兜底：取最后一段非空行（截断过长）
-    let last_line = full_output
-        .lines()
-        .rev()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())
-        .unwrap_or("(无输出)");
-    let s = last_line.to_string();
-    truncate_chars(&s, 200)
+    truncate_chars(&cleaned, REPORT_MAX_CHARS)
 }
 
-/// 从一条汇报文本里解析出被 @ 的、在花名册中的名字（去重、忽略自 @）。
-/// 只在汇报行内解析 —— 调用方保证传入的是汇报文本，而非 raw 正文。
+/// 折叠连续空行为单个空行，并去掉每行尾随空白。
+fn collapse_blank_lines(s: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut prev_blank = false;
+    for line in s.lines() {
+        let t = line.trim_end();
+        let blank = t.trim().is_empty();
+        if blank && prev_blank {
+            continue; // 跳过连续空行
+        }
+        out.push(t);
+        prev_blank = blank;
+    }
+    // 去掉首尾空行
+    while out.first().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        out.remove(0);
+    }
+    while out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+/// 从最终回复里解析出被 @ 的、在花名册中的名字（去重、忽略自 @）。
 pub fn parse_mentions(report: &str, roster: &[String], self_name: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let bytes = report.char_indices().collect::<Vec<_>>();
@@ -132,21 +140,20 @@ mod tests {
     }
 
     #[test]
-    fn extract_marked_report() {
-        let raw = "读了 auth.py\n想了想\n【群聊】①校验层抽完 @小盾 对接口";
-        assert_eq!(extract_report(raw), "①校验层抽完 @小盾 对接口");
+    fn extract_trims_and_keeps_body() {
+        let raw = "\n  改完了 auth.py @小盾 对下接口  \n";
+        assert_eq!(extract_report(raw), "改完了 auth.py @小盾 对下接口");
     }
 
     #[test]
-    fn extract_fallback_last_line() {
-        let raw = "开始干活\n改完了 auth.py";
-        assert_eq!(extract_report(raw), "改完了 auth.py");
+    fn extract_collapses_blank_lines() {
+        let raw = "第一段\n\n\n\n第二段";
+        assert_eq!(extract_report(raw), "第一段\n\n第二段");
     }
 
     #[test]
-    fn extract_takes_last_marked() {
-        let raw = "【群聊】阶段一好了\n又干了点\n【群聊】全好了 @老K";
-        assert_eq!(extract_report(raw), "全好了 @老K");
+    fn extract_empty_is_placeholder() {
+        assert_eq!(extract_report("   \n\n  "), "(无输出)");
     }
 
     #[test]

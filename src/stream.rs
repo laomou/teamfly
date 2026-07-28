@@ -221,9 +221,9 @@ mod tests {
 
     #[test]
     fn claude_result_success() {
-        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"【群聊】干完了 @QE 补测试"}"#;
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"干完了 @QE 补测试"}"#;
         let o = classify(StreamFmt::Claude, line);
-        assert_eq!(o.result.as_deref(), Some("【群聊】干完了 @QE 补测试"));
+        assert_eq!(o.result.as_deref(), Some("干完了 @QE 补测试"));
         assert!(o.error.is_none());
     }
 
@@ -267,10 +267,10 @@ mod tests {
 
     #[test]
     fn codex_agent_message_is_result() {
-        let line = r#"{"type":"item.completed","item":{"type":"agent_message","text":"【群聊】codex 干完了"}}"#;
+        let line = r#"{"type":"item.completed","item":{"type":"agent_message","text":"codex 干完了"}}"#;
         let o = classify(StreamFmt::Codex, line);
-        assert_eq!(o.result.as_deref(), Some("【群聊】codex 干完了"));
-        assert_eq!(o.display, vec!["【群聊】codex 干完了"]);
+        assert_eq!(o.result.as_deref(), Some("codex 干完了"));
+        assert_eq!(o.display, vec!["codex 干完了"]);
     }
 
     #[test]
