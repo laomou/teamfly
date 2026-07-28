@@ -141,7 +141,7 @@ pub fn load_team(dir: &Path) -> Result<Team> {
             state: AgentState::Idle,
             inbox: VecDeque::new(),
             raw: VecDeque::new(),
-            last_seen_chat_len: 0,
+            last_seen: std::collections::HashMap::new(),
         });
     }
 

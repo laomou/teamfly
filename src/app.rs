@@ -151,7 +151,18 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                     m.cancel.cancel();
                     // 换一个新 token,否则之后新起的 agent 一生下来就是取消态
                     m.cancel = tokio_util::sync::CancellationToken::new();
-                    set_hint(m, format!("已取消 {running} 个在跑的 agent;再按 ^C 退出"), 8);
+                    // 排队的活也得清:不清的话被取消的成员一交卷就走 drain_inbox,
+                    // 拿着**新** token 立刻起下一个进程,用户按不停也按不出去。
+                    let queued: usize = m.members.iter().map(|x| x.inbox.len()).sum();
+                    for mem in &mut m.members {
+                        mem.inbox.clear();
+                    }
+                    let extra = if queued > 0 {
+                        format!("、清掉 {queued} 条排队任务")
+                    } else {
+                        String::new()
+                    };
+                    set_hint(m, format!("已取消 {running} 个在跑的 agent{extra};再按 ^C 退出"), 8);
                 } else {
                     m.should_quit = true;
                 }
@@ -447,6 +458,15 @@ fn handle_agent_done(
         let smsg = ChatMsg { ts: now_ts(), author: "系统".into(), text, is_system: true };
         m.issues[idx].timeline.push(smsg.clone());
         cmds.push(Command::PersistChat { issue: issue_name, msg: smsg });
+        // 这一轮解析出的 @ 同样不能丢:议题已 paused,dispatch 会把它们入队,
+        // 等用户按 ^P 再放出来。以前这里直接 return,接力链无声蒸发,
+        // 而系统消息还在教用户「按 Ctrl+P 恢复」—— 按了也只会得到「已恢复」。
+        for target in mentions {
+            let assignment = format!("[来自 {name}] {report}");
+            if let Some(c) = dispatch(m, issue_id, &target, assignment, new_depth) {
+                cmds.push(c);
+            }
+        }
         return cmds;
     }
     m.issues[idx].chain_depth = new_depth;
@@ -482,8 +502,8 @@ fn dispatch(
     }
     // 闲 → 起进程
     let timeline = m.issues[idx].timeline.clone();
-    let user_input = issue::build_prompt_input(&timeline, &m.members[i], &assignment);
-    m.members[i].last_seen_chat_len = timeline.len();
+    let user_input = issue::build_prompt_input(issue_id, &timeline, &m.members[i], &assignment);
+    m.members[i].last_seen.insert(issue_id, timeline.len());
     m.members[i].state = AgentState::Thinking;
     m.issues[idx].chain_depth = chain_depth;
 
@@ -507,21 +527,32 @@ fn drain_inbox(m: &mut Model, name: &str) -> Vec<Command> {
     if m.members[i].state != AgentState::Idle {
         return vec![];
     }
-    let Some(issue_id) = m.members[i].inbox.front().map(|a| a.issue) else {
-        return vec![];
+    // 先清掉所属议题已关闭的条目(它们没有归属了,留着只会堵路)
+    let dropped = {
+        let before = m.members[i].inbox.len();
+        let alive: std::collections::HashSet<u64> = m.issues.iter().map(|x| x.id).collect();
+        m.members[i].inbox.retain(|a| alive.contains(&a.issue));
+        before - m.members[i].inbox.len()
     };
-    let Some(idx) = m.issue_index(issue_id) else {
-        // 所属议题已关闭:这条活没有归属了,丢掉并明说(总比静默消失好)
-        m.members[i].inbox.pop_front();
-        set_hint(m, format!("{name} 有排队任务所属议题已关闭,已丢弃"), 8);
-        return vec![];
-    };
-    if m.issues[idx].paused {
-        return vec![]; // 留在队里等 Ctrl+P
+    if dropped > 0 {
+        set_hint(m, format!("{name} 有 {dropped} 条排队任务所属议题已关闭,已丢弃"), 8);
     }
-    let depth = m.issues[idx].chain_depth;
-    let next = m.members[i].inbox.pop_front().expect("front 刚确认存在");
-    match dispatch(m, issue_id, name, next.text, depth) {
+
+    // 找**第一条能派出去的**,而不是只看队头 ——
+    // 队头若压在一个暂停的议题上,后面属于其它活跃议题的活会被永久饿死,
+    // 而界面上该成员显示「摸鱼」,一点痕迹都没有。
+    let pos = m.members[i].inbox.iter().position(|a| {
+        m.issue_index(a.issue)
+            .map(|idx| !m.issues[idx].paused)
+            .unwrap_or(false)
+    });
+    let Some(pos) = pos else { return vec![] };
+    let next = m.members[i].inbox.remove(pos).expect("pos 刚确认存在");
+    let depth = m
+        .issue_index(next.issue)
+        .map(|idx| m.issues[idx].chain_depth)
+        .unwrap_or(0);
+    match dispatch(m, next.issue, name, next.text, depth) {
         Some(c) => vec![c],
         None => vec![],
     }
@@ -1309,6 +1340,78 @@ mod e2e {
     }
 
     #[test]
+    fn chain_cap_queues_mentions_instead_of_dropping() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        m.max_chain_depth = 1;
+        m.issues[0].chain_depth = 1; // 下一轮就触顶
+        m.members[0].state = AgentState::Working;
+
+        let cmds = done(&mut m, "老K", id, "还得继续 @阿码 接手");
+
+        // 触顶暂停了
+        assert!(m.issues[0].paused);
+        // 但这一轮的 @ 不能蒸发 —— 必须在队里等 ^P
+        assert!(!cmds.iter().any(|c| matches!(c, Command::SpawnAgent { .. })));
+        assert_eq!(m.members[1].inbox.len(), 1, "触顶时 @ 被丢掉了");
+
+        // ^P 之后真的能放出来(以前必然是「放出 0 条」)
+        let cmds = ctrl_cmds(&mut m, 'p');
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::SpawnAgent { name, .. } if name == "阿码")));
+    }
+
+    #[test]
+    fn ctrl_c_also_clears_queued_work() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        m.members[0].state = AgentState::Working;
+        m.members[1].inbox.push_back(Assignment { issue: id, text: "排队的活".into() });
+
+        ctrl(&mut m, 'c');
+        // 不清队列的话,被取消的成员一交卷就走 drain_inbox,拿新 token 立刻重起,
+        // 用户既停不下来也退不出去
+        assert!(m.members[1].inbox.is_empty());
+        assert!(m.status_hint.as_ref().unwrap().contains("清掉 1 条"));
+
+        // 交卷后确实不会再起进程
+        let cmds = update(&mut m, Msg::AgentDone {
+            name: "老K".into(), issue: id, gen: 0,
+            full_output: String::new(), ok: false,
+            err: Some(crate::model::CANCELLED.into()),
+        });
+        assert!(!cmds.iter().any(|c| matches!(c, Command::SpawnAgent { .. })));
+    }
+
+    #[test]
+    fn paused_head_does_not_starve_other_issues() {
+        let mut m = min_model();
+        let a = m.issues[0].id;
+        ctrl(&mut m, 'n'); // 建议题2
+        let b = m.issues[1].id;
+        // 队头压在暂停的议题A 上,后面是活跃议题B 的活
+        m.issues[0].paused = true;
+        m.members[0].inbox.push_back(Assignment { issue: a, text: "A 的活".into() });
+        m.members[0].inbox.push_back(Assignment { issue: b, text: "B 的活".into() });
+
+        // 成员空闲后交卷触发 drain
+        let cmds = update(&mut m, Msg::AgentDone {
+            name: "老K".into(), issue: b, gen: 0,
+            full_output: "干完了".into(), ok: true, err: None,
+        });
+
+        // B 的活必须被放出来,不能被 A 的队头永久堵死
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SpawnAgent { issue, .. } if *issue == b)),
+            "队头压在暂停议题上,把后面别的议题的活饿死了"
+        );
+        // A 的活还留在队里等 ^P
+        assert_eq!(m.members[0].inbox.len(), 1);
+        assert_eq!(m.members[0].inbox[0].issue, a);
+    }
+
+    #[test]
     fn io_error_surfaces_as_hint() {
         let mut m = min_model();
         update(&mut m, Msg::IoError { detail: "磁盘已满".into() });
@@ -1327,7 +1430,7 @@ mod e2e {
             state: AgentState::Idle,
             inbox: VecDeque::new(),
             raw: VecDeque::new(),
-            last_seen_chat_len: 0,
+            last_seen: std::collections::HashMap::new(),
         }
     }
 
