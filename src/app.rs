@@ -477,15 +477,10 @@ fn set_hint(m: &mut Model, text: impl Into<String>, secs: u64) {
     m.status_hint_until = m.tick.wrapping_add(secs * 7); // 150ms/tick × 7 ≈ 1050ms
 }
 
-/// 处理斜杠命令。macro 展开成消息走正常派活流程;命令类直接改状态。
+/// 处理斜杠命令。均为本地命令,不派活给 agent。
 fn handle_slash(m: &mut Model, slash: crate::slash::Slash) -> Vec<Command> {
     use crate::slash::Slash;
     match slash {
-        Slash::Macro { expanded } => {
-            // 展开成消息:塞进 input,重新调 submit_input 走标准流程
-            m.input = expanded;
-            submit_input(m)
-        }
         Slash::SwitchTeam { name } => {
             let teams_dir = m.teamfly_dir.join("teams");
             let team_dir = teams_dir.join(&name);

@@ -1,4 +1,4 @@
-//! CLI:teamfly work [工作目录] [--team <团队文件夹>]
+//! CLI:teamfly work [工作目录] [--team <团队名字>] / teamfly init
 
 use crate::model::{Issue, Model, Selection};
 use crate::team;
@@ -19,14 +19,84 @@ pub enum Cmd {
     Work {
         /// 工作目录(缺省 = 当前目录)
         dir: Option<PathBuf>,
-        /// 团队文件夹
+        /// 团队名字(.teamfly/teams/<名> 下的子目录名)
         #[arg(long)]
-        team: Option<PathBuf>,
+        team: Option<String>,
     },
+    /// 交互式配置用户级 ~/.teamfly/env.toml(输入 BASE_URL / KEY)
+    Init,
+}
+
+/// 交互式初始化用户级配置:问 claude/codex 的 BASE_URL 和 KEY,写 ~/.teamfly/env.toml。
+pub fn init() -> Result<()> {
+    use std::io::Write;
+
+    let path = crate::env::user_env_path()
+        .ok_or_else(|| anyhow::anyhow!("无法确定 ~/.teamfly 路径(HOME 未设?)"))?;
+
+    println!("配置 teamfly 用户级环境变量 → {}", path.display());
+    println!("(直接回车跳过某项;已有文件会被覆盖)\n");
+
+    let prompt = |label: &str, default: &str| -> Result<String> {
+        if default.is_empty() {
+            print!("{label}: ");
+        } else {
+            print!("{label} [{default}]: ");
+        }
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let v = line.trim().to_string();
+        Ok(if v.is_empty() { default.to_string() } else { v })
+    };
+
+    println!("── claude backend ──");
+    let anthropic_base = prompt("ANTHROPIC_BASE_URL", "https://api.anthropic.com")?;
+    let anthropic_token = prompt("ANTHROPIC_AUTH_TOKEN", "")?;
+
+    println!("\n── codex backend(可跳过)──");
+    let openai_base = prompt("OPENAI_BASE_URL", "")?;
+    let openai_key = prompt("OPENAI_API_KEY", "")?;
+
+    // 组装 toml
+    let mut out = String::new();
+    out.push_str("# teamfly 用户级 agent 环境变量(teamfly init 生成)\n");
+    out.push_str("# 项目里可写 <工作目录>/.teamfly/env.toml 覆盖同名 key\n\n");
+
+    out.push_str("[claude]\n");
+    if !anthropic_base.is_empty() {
+        out.push_str(&format!("ANTHROPIC_BASE_URL   = \"{anthropic_base}\"\n"));
+    }
+    if !anthropic_token.is_empty() {
+        out.push_str(&format!("ANTHROPIC_AUTH_TOKEN = \"{anthropic_token}\"\n"));
+    }
+
+    if !openai_base.is_empty() || !openai_key.is_empty() {
+        out.push_str("\n[codex]\n");
+        if !openai_base.is_empty() {
+            out.push_str(&format!("OPENAI_BASE_URL = \"{openai_base}\"\n"));
+        }
+        if !openai_key.is_empty() {
+            out.push_str(&format!("OPENAI_API_KEY  = \"{openai_key}\"\n"));
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, out)?;
+    // 权限收紧(含 key)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("\n✓ 已写入 {}", path.display());
+    Ok(())
 }
 
 /// 组装初始 Model。
-pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, Vec<String>)> {
+pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, Vec<String>)> {
     let work_dir = dir
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .canonicalize()
@@ -100,22 +170,18 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, 
     Ok((model, warns))
 }
 
-fn resolve_team_dir(team_arg: Option<PathBuf>, teamfly_dir: &std::path::Path) -> Result<PathBuf> {
+fn resolve_team_dir(team_arg: Option<String>, teamfly_dir: &std::path::Path) -> Result<PathBuf> {
     let teams_dir = teamfly_dir.join("teams");
 
-    if let Some(t) = team_arg {
-        // 优先当「名字」解析:.teamfly/teams/<名>
-        let by_name = teams_dir.join(&t);
+    if let Some(name) = team_arg {
+        // --team 是团队名字:.teamfly/teams/<名>
+        let by_name = teams_dir.join(&name);
         if by_name.is_dir() {
             return Ok(by_name);
         }
-        // 兼容:也允许直接给一个存在的路径
-        if t.is_dir() {
-            return Ok(t);
-        }
         bail!(
             "找不到团队「{}」。它应是 {} 下的一个子目录名。\n现有团队:{}",
-            t.display(),
+            name,
             teams_dir.display(),
             list_team_names(&teams_dir)
         );
