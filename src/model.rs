@@ -137,8 +137,12 @@ pub struct Model {
     pub max_chain_depth: u32,
     /// 状态提示行（临时消息，如「已暂停」）
     pub status_hint: Option<String>,
+    /// 状态提示的过期 tick;超过后自动清除
+    pub status_hint_until: u64,
     /// 待删除议题的确认状态:(议题索引, 按下时的 tick)。5s(约 33 tick)内再按 Ctrl+W 才真删。
     pub pending_delete: Option<(usize, u64)>,
+    /// 是否显示帮助浮层(? 键切换)
+    pub show_help: bool,
 }
 
 impl Model {
@@ -166,6 +170,8 @@ pub enum Msg {
     Key(crossterm::event::KeyEvent),
     /// 鼠标选中左栏某项
     Select(Selection),
+    /// 鼠标点击顶部 tab 栏(col 是终端列号)
+    MouseTabClick { col: u16 },
     /// 某 agent 进程吐了一行 raw（已剥 ANSI）
     AgentStdout { name: String, line: String },
     /// 某 agent 一轮结束

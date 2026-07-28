@@ -48,6 +48,53 @@ pub fn draw(f: &mut Frame, m: &Model) {
     draw_main(f, right[0], m);
     draw_input(f, right[1], m);
     draw_hints(f, right[2], m);
+
+    // 帮助浮层(最后画,覆盖在上面)
+    if m.show_help {
+        draw_help_overlay(f);
+    }
+}
+
+/// 帮助浮层:居中显示所有键位,再按 ? 或 Esc 关闭。
+fn draw_help_overlay(f: &mut Frame) {
+    let area = f.area();
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = 20u16.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    // 先用 Clear 擦掉底下内容
+    f.render_widget(ratatui::widgets::Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " 帮助(? / Esc 关闭)",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("  发言", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
+        Line::from("    输入文字 + ⏎     发进群聊(不带 @ 只是留言)"),
+        Line::from("    @名字 …           派活给该 agent(TAB 补全)"),
+        Line::from("    Backspace / ^U    删字符 / 清空输入行"),
+        Line::from(""),
+        Line::from(vec![Span::styled("  切换视图", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
+        Line::from("    ↑ ↓               选左栏(#群聊 / 各成员;选中即显示)"),
+        Line::from("    Esc               回 #群聊"),
+        Line::from(""),
+        Line::from(vec![Span::styled("  议题", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
+        Line::from("    ^N                新建议题(自动命名,第一条消息决定名字)"),
+        Line::from("    ^W                关当前议题(有内容需再按一次确认)"),
+        Line::from("    Alt+1..9          切议题"),
+        Line::from(""),
+        Line::from(vec![Span::styled("  其他", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
+        Line::from("    ^P                解除防乒乓暂停"),
+        Line::from("    ^C                退出"),
+    ];
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 const SIDEBAR_W: u16 = 20;
@@ -106,8 +153,24 @@ fn draw_tabs(f: &mut Frame, area: Rect, m: &Model) {
         1,
     );
     let working = m.working_count();
+
+    // 议题过多时,以当前议题为中心,只画左右各 2 个;溢出用 «/» 提示
+    let total = m.issues.len();
+    let (start, end, prefix, suffix) = if total <= 6 {
+        (0, total, "", "")
+    } else {
+        let cur = m.current_issue;
+        let s = cur.saturating_sub(2);
+        let e = (cur + 3).min(total);
+        (s, e, if s > 0 { "« " } else { "" }, if e < total { " »" } else { "" })
+    };
+
     let mut spans = Vec::new();
-    for (i, issue) in m.issues.iter().enumerate() {
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
+    }
+    for i in start..end {
+        let issue = &m.issues[i];
         let badge = if i == m.current_issue && working > 0 {
             format!(" ⚙{working}")
         } else {
@@ -125,6 +188,9 @@ fn draw_tabs(f: &mut Frame, area: Rect, m: &Model) {
         };
         spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
+    }
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
     }
     spans.push(Span::styled("[+ 新议题]", Style::default().fg(Color::DarkGray)));
 
@@ -226,8 +292,18 @@ fn draw_timeline(f: &mut Frame, area: Rect, m: &Model) {
     let issue = m.cur_issue();
     let width = area.width.saturating_sub(1) as usize;
     let mut lines: Vec<Line> = Vec::new();
+    let mut last_date: Option<String> = None;
 
     for msg in &issue.timeline {
+        // 跨天:插一行日期分隔
+        let this_date = date_of(&msg.ts);
+        if last_date.as_deref() != Some(&this_date) {
+            lines.push(Line::styled(
+                format!("── {this_date} ──"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            last_date = Some(this_date);
+        }
         let (color, name) = if msg.is_system {
             (Color::Red, "⚠ 系统".to_string())
         } else if msg.author == "我" {
@@ -305,11 +381,25 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
         };
         lines.push(Line::styled(l.clone(), style));
     }
-    if lines.is_empty() {
-        lines.push(Line::styled(
-            format!("({} 还没有输出;被 @ 时才会开工)", mem.name),
-            Style::default().fg(Color::DarkGray),
-        ));
+    // 正在思考/干活:加一行 spinner
+    let frame = SPINNER[(m.tick as usize) % SPINNER.len()];
+    match mem.state {
+        AgentState::Thinking => lines.push(Line::styled(
+            format!("💭 {} 思考中… {frame}", mem.name),
+            Style::default().fg(Color::Yellow),
+        )),
+        AgentState::Working => lines.push(Line::styled(
+            format!("⚙ {} 干活中… {frame}", mem.name),
+            Style::default().fg(Color::Green),
+        )),
+        AgentState::Idle => {
+            if lines.is_empty() {
+                lines.push(Line::styled(
+                    format!("({} 还没有输出;被 @ 时才会开工)", mem.name),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
     }
     let total = lines.len() as u16;
     let scroll = bottom_scroll(total, area.height, m.scroll);
@@ -359,11 +449,33 @@ fn draw_input(f: &mut Frame, area: Rect, m: &Model) {
 }
 
 fn draw_hints(f: &mut Frame, area: Rect, m: &Model) {
-    let hint = m.status_hint.clone().unwrap_or_else(|| {
-        "^N 新议题 · ^W 关议题 · Alt+1-9 切议题 · ↑↓ 选成员 · ⏎ 发送 · ^C 退出".to_string()
+    // pending_delete 未过期时,动态显示剩余秒(覆盖普通 hint)
+    let dynamic_pending: Option<String> = m.pending_delete.and_then(|(idx, t0)| {
+        const WINDOW: u64 = 33; // 与 handle_close_issue 中一致
+        let elapsed = m.tick.wrapping_sub(t0);
+        if elapsed < WINDOW && idx < m.issues.len() {
+            let remain_ticks = WINDOW - elapsed;
+            let remain_secs = (remain_ticks * 150) / 1000 + 1;
+            Some(format!(
+                "议题「{}」有 {} 条消息;再按 ^W 删除(剩 {}s)",
+                m.issues[idx].name,
+                m.issues[idx].timeline.len(),
+                remain_secs
+            ))
+        } else {
+            None
+        }
     });
+    let hint = dynamic_pending.or_else(|| m.status_hint.clone()).unwrap_or_else(|| {
+        "? 帮助 · ^N 新议题 · ^W 关议题 · Alt+1-9 切议题 · ⏎ 发送 · ^C 退出".to_string()
+    });
+    let color = if m.pending_delete.is_some() {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
     f.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(hint).style(Style::default().fg(color)),
         area,
     );
 }
@@ -377,6 +489,11 @@ fn short_ts(ts: &str) -> String {
     } else {
         ts.chars().take(5).collect()
     }
+}
+
+/// 从 ISO 时间戳里取日期部分 YYYY-MM-DD。
+fn date_of(ts: &str) -> String {
+    ts.split('T').next().unwrap_or("").to_string()
 }
 
 fn bottom_scroll(total: u16, height: u16, user_scroll: u16) -> u16 {

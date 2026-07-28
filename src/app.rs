@@ -39,6 +39,16 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Command> {
     match msg {
         Msg::Tick => {
             m.tick = m.tick.wrapping_add(1);
+            // status_hint 到期自动清
+            if m.status_hint.is_some() && m.tick >= m.status_hint_until {
+                m.status_hint = None;
+            }
+            // pending_delete 窗口过期自动清
+            if let Some((_, t0)) = m.pending_delete {
+                if m.tick.wrapping_sub(t0) >= 33 {
+                    m.pending_delete = None;
+                }
+            }
             vec![]
         }
         Msg::Key(k) => handle_key(m, k),
@@ -51,6 +61,11 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Command> {
                 m.selection = sel;
                 m.scroll = 0;
             }
+            vec![]
+        }
+        Msg::MouseTabClick { col } => {
+            // 保守 hit-test:重现 draw_tabs 的 span 布局,算命中
+            handle_tab_click(m, col);
             vec![]
         }
         Msg::AgentStdout { name, line } => {
@@ -71,7 +86,24 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
     if k.kind == KeyEventKind::Release {
         return vec![];
     }
-    m.status_hint = None;
+    // ? 键切换帮助浮层(在任何状态下都可用,除非正在打字里输入 ?)
+    if matches!(k.code, KeyCode::Char('?')) && !k.modifiers.contains(KeyModifiers::CONTROL) {
+        // 只有输入框为空时,? 打开帮助;有内容则视为普通字符
+        if m.input.is_empty() {
+            m.show_help = !m.show_help;
+            return vec![];
+        }
+    }
+    // 帮助浮层打开时,任意键(除 ?/Esc)只关帮助,不做其他动作
+    if m.show_help {
+        if matches!(k.code, KeyCode::Char('?') | KeyCode::Esc) {
+            m.show_help = false;
+        }
+        // 其他键忽略
+        return vec![];
+    }
+
+    // status_hint 会在下面被清:见「_tick 自动过期」;这里不再无条件清
 
     // Alt+数字:切议题(比 Ctrl+数字 兼容性好——不少终端根本不发 Ctrl+数字)
     if k.modifiers.contains(KeyModifiers::ALT) {
@@ -82,7 +114,7 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                     m.current_issue = n - 1;
                     m.selection = Selection::Chat;
                     m.scroll = 0;
-                    m.status_hint = Some(format!("切到议题 {n}"));
+                    set_hint(m, format!("切到议题 {n}"), 5);
                 }
                 return vec![];
             }
@@ -96,11 +128,6 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 m.should_quit = true;
                 return vec![];
             }
-            // 有些终端把退格发成 Ctrl+H
-            KeyCode::Char('h') => {
-                m.input.pop();
-                return vec![];
-            }
             // Ctrl+U 清空输入行
             KeyCode::Char('u') => {
                 m.input.clear();
@@ -110,7 +137,7 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 // 恢复暂停
                 m.cur_issue_mut().paused = false;
                 m.cur_issue_mut().chain_depth = 0;
-                m.status_hint = Some("已恢复".into());
+                set_hint(m, "已恢复", 5);
                 return vec![];
             }
             KeyCode::Char('n') => {
@@ -122,7 +149,7 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 m.scroll = 0;
                 m.input.clear();
                 m.input_mode = InputMode::Chat;
-                m.status_hint = Some(format!("已建议题:{name}"));
+                set_hint(m, format!("已建议题:{name}"), 5);
                 m.pending_delete = None;
                 return vec![];
             }
@@ -136,9 +163,9 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                     m.current_issue = n - 1;
                     m.selection = Selection::Chat;
                     m.scroll = 0;
-                    m.status_hint = Some(format!("切到议题 {n}"));
+                    set_hint(m, format!("切到议题 {n}"), 5);
                 } else {
-                    m.status_hint = Some(format!("^{n}:超出议题数({}/{})", n, m.issues.len()));
+                    set_hint(m, format!("^{n}:超出议题数({}/{})", n, m.issues.len()), 5);
                 }
                 return vec![];
             }
@@ -152,7 +179,7 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 // 取消新建议题
                 m.input_mode = InputMode::Chat;
                 m.input.clear();
-                m.status_hint = Some("已取消新建议题".into());
+                set_hint(m, "已取消新建议题", 5);
             } else {
                 m.selection = Selection::Chat;
                 m.scroll = 0;
@@ -229,7 +256,7 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
         m.input_mode = InputMode::Chat;
         // 校验:非空、不重名、名字里不含分隔/路径字符(用于落盘 <名>.jsonl)
         if text.contains('/') || text.contains('\\') || text.contains('.') {
-            m.status_hint = Some(format!("议题名不能含 / \\ .:{text}"));
+            set_hint(m, format!("议题名不能含 / \\ .:{text}"), 5);
             return vec![];
         }
         if m.issues.iter().any(|i| i.name == text) {
@@ -238,7 +265,7 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
                 m.current_issue = idx;
                 m.selection = Selection::Chat;
                 m.scroll = 0;
-                m.status_hint = Some(format!("议题「{text}」已存在,切过去"));
+                set_hint(m, format!("议题「{text}」已存在,切过去"), 5);
             }
             return vec![];
         }
@@ -247,11 +274,26 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
         m.current_issue = m.issues.len() - 1;
         m.selection = Selection::Chat;
         m.scroll = 0;
-        m.status_hint = Some(format!("已建议题:{text}"));
+        set_hint(m, format!("已建议题:{text}"), 5);
         return vec![];
     }
 
     let mut cmds = Vec::new();
+
+    // 自动取名:议题名是「议题N」这种自动生成的、且时间线为空(只可能有系统欢迎消息也算)
+    // 用当前消息前 20 字符作新名字,把旧的 jsonl(如果存在)删掉
+    let is_auto_name = m.cur_issue().name.starts_with("议题")
+        && m.cur_issue().name[6..].chars().all(|c| c.is_ascii_digit())
+        || m.cur_issue().name == "默认议题";
+    let only_system_msgs = m.cur_issue().timeline.iter().all(|c| c.is_system);
+    if is_auto_name && only_system_msgs {
+        let new_name = derive_issue_name(&text, &m.issues, m.current_issue);
+        if new_name != m.cur_issue().name {
+            let old_name = std::mem::replace(&mut m.cur_issue_mut().name, new_name.clone());
+            cmds.push(Command::DeleteIssueFile { issue: old_name });
+        }
+    }
+
     let issue_name = m.cur_issue().name.clone();
 
     // 记入时间线 + 落盘
@@ -404,13 +446,116 @@ pub fn next_issue_name(issues: &[Issue]) -> String {
     unreachable!()
 }
 
+/// 设置状态提示,持续大约 `secs` 秒(1 tick ≈ 150ms)。
+fn set_hint(m: &mut Model, text: impl Into<String>, secs: u64) {
+    m.status_hint = Some(text.into());
+    m.status_hint_until = m.tick.wrapping_add(secs * 7); // 150ms/tick × 7 ≈ 1050ms
+}
+
+/// 点击顶部 tab 栏:命中某个议题 tab → 切;命中 [+ 新议题] → 建;命中其它 → 静默。
+fn handle_tab_click(m: &mut Model, col: u16) {
+    // tab 内容起始列(与 draw_tabs 一致:SIDEBAR_W=20,内容从 area.x 起,即列 20)
+    const START: u16 = 20;
+    if col < START {
+        return;
+    }
+    // 依样画:窗口逻辑必须和 draw_tabs 一致
+    let total = m.issues.len();
+    let (start, end, has_prefix, has_suffix) = if total <= 6 {
+        (0usize, total, false, false)
+    } else {
+        let cur = m.current_issue;
+        let s = cur.saturating_sub(2);
+        let e = (cur + 3).min(total);
+        (s, e, s > 0, e < total)
+    };
+
+    let mut x = START;
+    if has_prefix {
+        x = x.saturating_add(display_width("« ") as u16);
+    }
+    // 每个 tab:格式 " #<name>[ ⚙N][ ⏸] " + " "(spans 里两段之间的空格)
+    let working = m.working_count();
+    for i in start..end {
+        let issue = &m.issues[i];
+        let badge = if i == m.current_issue && working > 0 {
+            format!(" ⚙{working}")
+        } else {
+            String::new()
+        };
+        let paused = if issue.paused { " ⏸" } else { "" };
+        let label = format!(" #{}{}{} ", issue.name, badge, paused);
+        let w = display_width(&label) as u16;
+        if col >= x && col < x + w {
+            // 命中 → 切议题
+            m.current_issue = i;
+            m.selection = Selection::Chat;
+            m.scroll = 0;
+            set_hint(m, format!("切到议题 {}", i + 1), 3);
+            return;
+        }
+        x = x.saturating_add(w + 1); // +1 是 spans 间的空格
+    }
+    if has_suffix {
+        x = x.saturating_add(display_width(" »") as u16);
+    }
+    // [+ 新议题]
+    let plus_w = display_width("[+ 新议题]") as u16;
+    if col >= x && col < x + plus_w {
+        // 新建
+        let name = next_issue_name(&m.issues);
+        m.issues.push(Issue::new(name.clone()));
+        m.current_issue = m.issues.len() - 1;
+        m.selection = Selection::Chat;
+        m.scroll = 0;
+        set_hint(m, format!("已建议题:{name}"), 5);
+    }
+}
+
+/// 粗略计算显示宽度(CJK/emoji 记 2,其余 1)。
+fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| if (c as u32) > 0x1100 { 2 } else { 1 })
+        .sum()
+}
+
+/// 从我的第一句话里派生议题名(前 20 字符,去掉 @、清理换行、避免文件名非法字符,
+/// 若和已有议题重名则附 -2/-3…)。当前议题的原名允许重复(是它自己)。
+fn derive_issue_name(first_msg: &str, issues: &[Issue], current: usize) -> String {
+    let s: String = first_msg
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | '.' | '\n' | '\r' | '@'))
+        .take(20)
+        .collect();
+    let s = s.trim().to_string();
+    let base = if s.is_empty() { "新议题".to_string() } else { s };
+
+    // 去重
+    let taken: std::collections::HashSet<&str> = issues
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != current)
+        .map(|(_, x)| x.name.as_str())
+        .collect();
+    if !taken.contains(base.as_str()) {
+        return base;
+    }
+    for n in 2.. {
+        let cand = format!("{base}-{n}");
+        if !taken.contains(cand.as_str()) {
+            return cand;
+        }
+    }
+    unreachable!()
+}
+
 /// pending_delete 的确认窗口(tick 数,一 tick ≈ 150ms,33 tick ≈ 5s)。
 const DELETE_CONFIRM_TICKS: u64 = 33;
 
 /// Ctrl+W:关闭当前议题。空议题一键关;有内容先提示确认,窗口期内再按才真删。
 fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     if m.issues.len() <= 1 {
-        m.status_hint = Some("至少要留一个议题,不能关".into());
+        set_hint(m, "至少要留一个议题,不能关", 5);
         return vec![];
     }
     let idx = m.current_issue;
@@ -427,10 +572,11 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
                 // 首次或超窗:登记 pending,提示
                 let n = m.issues[idx].timeline.len();
                 m.pending_delete = Some((idx, m.tick));
-                m.status_hint = Some(format!(
+                let hint = format!(
                     "议题「{}」有 {n} 条消息;再按 ^W 确认删除(5s 内)",
                     m.issues[idx].name
-                ));
+                );
+                set_hint(m, hint, 5);
                 return vec![];
             }
         }
@@ -445,7 +591,7 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     }
     m.selection = Selection::Chat;
     m.scroll = 0;
-    m.status_hint = Some(format!("已关闭议题:{}", removed.name));
+    set_hint(m, format!("已关闭议题:{}", removed.name), 5);
     vec![Command::DeleteIssueFile { issue: removed.name }]
 }
 
@@ -591,8 +737,15 @@ fn translate_event(ev: Event, model: &Model) -> Option<Msg> {
         Event::Key(k) => Some(Msg::Key(k)),
         Event::Mouse(me) => {
             if let MouseEventKind::Down(MouseButton::Left) = me.kind {
-                // 左栏点击:品牌角占 3 行,左栏内容从 y=3 起。
-                // 左栏内部行序:0=团队名 1=空 2=#群聊 3=空 4..成员(每人 2 行)
+                // tab 栏在 y=1(顶部品牌+tab 栏共 3 行,其中中间那行是内容)
+                if me.row == 1 {
+                    // 简化:tab 行上任何点击都当作「切议题」的鼠标操作:
+                    //   点在议题名区域 = 尝试命中(暂只支持整体切下一个/上一个)
+                    //   点在 [+ 新议题] = 新建
+                    // 精确热区需要跨层信息,这里先把 [+ 新议题] 大致识别为"点得比较靠右"
+                    return Some(Msg::MouseTabClick { col: me.column });
+                }
+                // 左栏点击(品牌角占 3 行,左栏内容从 y=3 起)
                 const BODY_TOP: u16 = 3;
                 if me.column < 20 && me.row >= BODY_TOP {
                     let rel = me.row - BODY_TOP;
@@ -649,7 +802,9 @@ mod e2e {
             should_quit: false,
             max_chain_depth: 12,
             status_hint: None,
+            status_hint_until: 0,
             pending_delete: None,
+            show_help: false,
         }
     }
 
@@ -666,11 +821,8 @@ mod e2e {
         // BS(0x08) 也应删除
         key(&mut m, KeyCode::Char('\u{8}'));
         assert_eq!(m.input, "");
-        // Ctrl+H 删除
+        // Ctrl+U 清空(Ctrl+H 已让位给帮助的传统语义,不再删字符)
         for c in "xy".chars() { key(&mut m, KeyCode::Char(c)); }
-        ctrl(&mut m, 'h');
-        assert_eq!(m.input, "x");
-        // Ctrl+U 清空
         ctrl(&mut m, 'u');
         assert_eq!(m.input, "");
     }
