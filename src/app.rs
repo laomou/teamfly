@@ -78,7 +78,9 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Command> {
             }
             vec![]
         }
-        Msg::AgentDone { name, full_output, ok, err } => handle_agent_done(m, name, full_output, ok, err),
+        Msg::AgentDone { name, issue, full_output, ok, err } => {
+            handle_agent_done(m, name, issue, full_output, ok, err)
+        }
     }
 }
 
@@ -137,7 +139,17 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
             KeyCode::Char('c') => {
-                m.should_quit = true;
+                // 有 agent 在跑:先掐掉它们再说。这些进程跑的是 bypass 权限,
+                // 直接退出会把它们留成孤儿,继续在工作区里改文件。
+                let running = m.working_count();
+                if running > 0 {
+                    m.cancel.cancel();
+                    // 换一个新 token,否则之后新起的 agent 一生下来就是取消态
+                    m.cancel = tokio_util::sync::CancellationToken::new();
+                    set_hint(m, format!("已取消 {running} 个在跑的 agent;再按 ^C 退出"), 8);
+                } else {
+                    m.should_quit = true;
+                }
                 return vec![];
             }
             // 有些终端把退格发成 Ctrl+H
@@ -151,11 +163,18 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 return vec![];
             }
             KeyCode::Char('p') => {
-                // 恢复暂停
+                // 恢复暂停,并把暂停期间排队的活放出来
+                //(以前只清 paused 就完事,排队的任务得等下一次凑巧才被想起来)
                 m.cur_issue_mut().paused = false;
                 m.cur_issue_mut().chain_depth = 0;
-                set_hint(m, "已恢复", 5);
-                return vec![];
+                let cmds = drain_all_inboxes(m);
+                let n = cmds.len();
+                if n > 0 {
+                    set_hint(m, format!("已恢复,放出 {n} 条排队任务"), 5);
+                } else {
+                    set_hint(m, "已恢复", 5);
+                }
+                return cmds;
             }
             KeyCode::Char('n') => {
                 // 直接建一个新议题,名字自动递增,并切过去
@@ -335,11 +354,12 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
     m.cur_issue_mut().paused = false;
 
     // 解析 @ —— 不带 @ 则只是留言,不触发任何人
+    let issue_id = m.cur_issue().id;
     let roster: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
     let mentions = crate::router::parse_owner_mentions(&text, &roster);
     for name in mentions {
         let assignment = format!("[我] {text}");
-        if let Some(c) = dispatch(m, &name, assignment, 0) {
+        if let Some(c) = dispatch(m, issue_id, &name, assignment, 0) {
             cmds.push(c);
         }
     }
@@ -347,60 +367,81 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
 }
 
 /// 一轮结束:提取汇报入群聊、落盘、解析 @ 继续派活、处理排队。
+///
+/// `issue_id` 是派活时绑定的议题。**不能**用「当前选中议题」—— agent 干一轮要几十秒到几分钟,
+/// 这期间用户很可能切了 tab 甚至关掉原议题,那样汇报会写进别人的时间线和 jsonl。
 fn handle_agent_done(
     m: &mut Model,
     name: String,
+    issue_id: u64,
     full_output: String,
     ok: bool,
     err: Option<String>,
 ) -> Vec<Command> {
     let mut cmds = Vec::new();
-    let issue_name = m.cur_issue().name.clone();
 
     // 该成员回到空闲
-    let depth_when_started;
     if let Some(i) = m.member_index(&name) {
         m.members[i].state = AgentState::Idle;
     }
-    depth_when_started = m.cur_issue().chain_depth;
+
+    // 议题已被关掉:汇报无处可去。只给一条临时提示,绝不写进别的议题。
+    let Some(idx) = m.issue_index(issue_id) else {
+        set_hint(m, format!("{name} 的汇报所属议题已关闭,已丢弃"), 8);
+        cmds.extend(drain_inbox(m, &name));
+        return cmds;
+    };
+    let issue_name = m.issues[idx].name.clone();
+    let depth_when_started = m.issues[idx].chain_depth;
 
     if !ok {
-        // 掉线 → 系统消息
-        let text = format!("{name} 掉线:{}", err.unwrap_or_else(|| "未知错误".into()));
+        // 用户主动取消 与 真掉线 分开措辞,别把自己按的 ^C 说成「掉线」
+        let reason = err.unwrap_or_else(|| "未知错误".into());
+        let text = if reason == CANCELLED {
+            format!("{name} 已被取消")
+        } else {
+            format!("{name} 掉线:{reason}")
+        };
         let msg = ChatMsg { ts: now_ts(), author: "系统".into(), text, is_system: true };
-        m.cur_issue_mut().timeline.push(msg.clone());
+        m.issues[idx].timeline.push(msg.clone());
         cmds.push(Command::PersistChat { issue: issue_name.clone(), msg });
         // 尝试处理该成员排队的下一条
         cmds.extend(drain_inbox(m, &name));
         return cmds;
     }
 
-    // 提取汇报
+    // 提取汇报(完整,不截断)
     let report = crate::router::extract_report(&full_output);
-    let msg = ChatMsg { ts: now_ts(), author: name.clone(), text: report.clone(), is_system: false };
-    m.cur_issue_mut().timeline.push(msg.clone());
+
+    // 先解析 @ ——必须在截断之前。团队规约要求 agent「在结尾 @下一个人」,
+    // 先截断的话尾部的 @ 会被一起切掉,接力链断在第一跳且毫无提示。
+    let roster: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
+    let mentions = crate::router::parse_mentions(&report, &roster, &name);
+
+    // 群聊里展示/落盘的是截断版(若真截断了会标注派给了谁)
+    let chat_text = crate::router::report_for_chat(&report, &mentions);
+    let msg = ChatMsg { ts: now_ts(), author: name.clone(), text: chat_text, is_system: false };
+    m.issues[idx].timeline.push(msg.clone());
     cmds.push(Command::PersistChat { issue: issue_name.clone(), msg });
 
     // 防乒乓:连锁深度 +1
     let new_depth = depth_when_started + 1;
     if new_depth > m.max_chain_depth {
-        m.cur_issue_mut().paused = true;
+        m.issues[idx].paused = true;
         let text = format!(
             "@ 连锁已达 {new_depth} 轮,自动暂停以防打转。按 Ctrl+P 恢复,或直接发新指令。"
         );
         let smsg = ChatMsg { ts: now_ts(), author: "系统".into(), text, is_system: true };
-        m.cur_issue_mut().timeline.push(smsg.clone());
+        m.issues[idx].timeline.push(smsg.clone());
         cmds.push(Command::PersistChat { issue: issue_name, msg: smsg });
         return cmds;
     }
-    m.cur_issue_mut().chain_depth = new_depth;
+    m.issues[idx].chain_depth = new_depth;
 
-    // 解析汇报里的 @,派给在册的人(忽略自 @)
-    let roster: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
-    let mentions = crate::router::parse_mentions(&report, &roster, &name);
+    // 解析出的 @ 逐个派活(投递用**完整**汇报,不能把截断版喂给下游)
     for target in mentions {
         let assignment = format!("[来自 {name}] {report}");
-        if let Some(c) = dispatch(m, &target, assignment, new_depth) {
+        if let Some(c) = dispatch(m, issue_id, &target, assignment, new_depth) {
             cmds.push(c);
         }
     }
@@ -410,27 +451,33 @@ fn handle_agent_done(
     cmds
 }
 
-/// 派活给某成员。忙则入队;闲则起进程。返回 SpawnAgent 命令(如需)。
-fn dispatch(m: &mut Model, name: &str, assignment: String, chain_depth: u32) -> Option<Command> {
+/// 派活给某成员。议题暂停或成员忙 → 入队;闲则起进程。返回 SpawnAgent 命令(如需)。
+/// 任何情况下都**不丢**派活:以前 paused 时直接 return,那条活既不入队也不留痕,凭空消失。
+fn dispatch(
+    m: &mut Model,
+    issue_id: u64,
+    name: &str,
+    assignment: String,
+    chain_depth: u32,
+) -> Option<Command> {
     let i = m.member_index(name)?;
-    if m.cur_issue().paused {
-        return None;
-    }
-    if m.members[i].state != AgentState::Idle {
-        // 忙 → 排队
-        m.members[i].inbox.push_back(assignment);
+    let idx = m.issue_index(issue_id)?; // 议题已关闭 → 无处可派
+    if m.issues[idx].paused || m.members[i].state != AgentState::Idle {
+        // 暂停中 或 忙 → 排队(暂停的等 Ctrl+P 放出来)
+        m.members[i].inbox.push_back(Assignment { issue: issue_id, text: assignment });
         return None;
     }
     // 闲 → 起进程
-    let timeline = m.cur_issue().timeline.clone();
+    let timeline = m.issues[idx].timeline.clone();
     let user_input = issue::build_prompt_input(&timeline, &m.members[i], &assignment);
     m.members[i].last_seen_chat_len = timeline.len();
     m.members[i].state = AgentState::Thinking;
-    m.cur_issue_mut().chain_depth = chain_depth;
+    m.issues[idx].chain_depth = chain_depth;
 
     let mem = &m.members[i];
     Some(Command::SpawnAgent {
         name: mem.name.clone(),
+        issue: issue_id,
         backend: mem.backend,
         model: mem.model.clone(),
         env: m.agent_env.merged_for(mem.backend),
@@ -440,18 +487,40 @@ fn dispatch(m: &mut Model, name: &str, assignment: String, chain_depth: u32) -> 
 }
 
 /// 成员空闲后,取出它 inbox 里的下一条继续干。
+/// 队头那条所属议题若已暂停就先不取 —— 取出来也派不掉,白白在队里打转。
 fn drain_inbox(m: &mut Model, name: &str) -> Vec<Command> {
     let Some(i) = m.member_index(name) else { return vec![] };
     if m.members[i].state != AgentState::Idle {
         return vec![];
     }
-    if let Some(next) = m.members[i].inbox.pop_front() {
-        let depth = m.cur_issue().chain_depth;
-        if let Some(c) = dispatch(m, name, next, depth) {
-            return vec![c];
-        }
+    let Some(issue_id) = m.members[i].inbox.front().map(|a| a.issue) else {
+        return vec![];
+    };
+    let Some(idx) = m.issue_index(issue_id) else {
+        // 所属议题已关闭:这条活没有归属了,丢掉并明说(总比静默消失好)
+        m.members[i].inbox.pop_front();
+        set_hint(m, format!("{name} 有排队任务所属议题已关闭,已丢弃"), 8);
+        return vec![];
+    };
+    if m.issues[idx].paused {
+        return vec![]; // 留在队里等 Ctrl+P
     }
-    vec![]
+    let depth = m.issues[idx].chain_depth;
+    let next = m.members[i].inbox.pop_front().expect("front 刚确认存在");
+    match dispatch(m, issue_id, name, next.text, depth) {
+        Some(c) => vec![c],
+        None => vec![],
+    }
+}
+
+/// 把所有成员 inbox 队头能派的活都放出来(Ctrl+P 恢复暂停后用)。
+fn drain_all_inboxes(m: &mut Model) -> Vec<Command> {
+    let names: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
+    let mut cmds = Vec::new();
+    for n in names {
+        cmds.extend(drain_inbox(m, &n));
+    }
+    cmds
 }
 
 fn now_ts() -> String {
@@ -687,6 +756,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
         }
         Command::SpawnAgent {
             name,
+            issue,
             backend,
             model: mdl,
             env,
@@ -695,6 +765,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
         } => {
             let spec = RunSpec {
                 name,
+                issue,
                 backend,
                 model: mdl,
                 env,
@@ -703,8 +774,9 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                 work_dir: model.work_dir.clone(),
             };
             let tx = tx.clone();
+            let cancel = model.cancel.clone();
             tokio::spawn(async move {
-                backend::run(spec, tx).await;
+                backend::run(spec, cancel, tx).await;
             });
         }
     }
@@ -722,17 +794,25 @@ pub async fn run(model: Model) -> Result<()> {
 
     let (tx, rx) = unbounded_channel::<Msg>();
     let rt = Runtime::new(tx.clone());
+    // model 会被移进 run_loop,先把取消令牌取出来
+    let cancel = model.cancel.clone();
 
     let res = run_loop(&mut terminal, model, rt, tx, rx).await;
 
-    // 清理
-    disable_raw_mode()?;
-    execute!(
+    // 退出前掐掉所有在跑的 agent。不然它们会变成孤儿,继续用 bypass 权限改工作区,
+    // 而用户已经看不到任何界面了。
+    cancel.cancel();
+
+    // 清理:一律尽力而为,不用 ? 提前 return ——
+    // 一旦中途 return,后面的 LeaveAlternateScreen/show_cursor 就不会执行,
+    // 用户会被留在无回显的备用屏里,只能盲敲 reset。
+    let _ = disable_raw_mode();
+    let _ = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    );
+    let _ = terminal.show_cursor();
     res
 }
 
@@ -838,6 +918,21 @@ mod e2e {
     fn ctrl(m: &mut Model, c: char) {
         let _ = update(m, Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)));
     }
+    fn ctrl_cmds(m: &mut Model, c: char) -> Vec<Command> {
+        update(m, Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)))
+    }
+    fn done(m: &mut Model, name: &str, issue: u64, output: &str) -> Vec<Command> {
+        update(
+            m,
+            Msg::AgentDone {
+                name: name.into(),
+                issue,
+                full_output: output.into(),
+                ok: true,
+                err: None,
+            },
+        )
+    }
 
     fn min_model() -> Model {
         Model {
@@ -863,6 +958,7 @@ mod e2e {
             status_hint_until: 0,
             pending_delete: None,
             show_help: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -996,6 +1092,106 @@ mod e2e {
         ctrl(&mut m, 'w'); // 超窗,视为再次首次,又只提示
         assert_eq!(m.issues.len(), 2); // 未删
         assert!(m.pending_delete.is_some());
+    }
+
+    // ---- 回归:issue 绑定 / @ 截断 / paused 入队 / Ctrl+C 取消 ----
+
+    #[test]
+    fn report_goes_to_its_own_issue_after_tab_switch() {
+        let mut m = min_model();
+        let issue_a = m.issues[0].id;
+        m.members[0].state = AgentState::Working;
+        // 干活期间用户按 ^N 切到新议题
+        ctrl(&mut m, 'n');
+        assert_eq!(m.current_issue, 1);
+
+        done(&mut m, "老K", issue_a, "A 议题干完了");
+
+        // 汇报落在它自己的议题,不是当前选中的那个
+        assert_eq!(m.issues[0].timeline.len(), 1);
+        assert_eq!(m.issues[0].timeline[0].text, "A 议题干完了");
+        assert!(m.issues[1].timeline.is_empty());
+        // 连锁深度也必须加在原议题上,否则原议题的防乒乓永远不触发
+        assert_eq!(m.issues[0].chain_depth, 1);
+        assert_eq!(m.issues[1].chain_depth, 0);
+    }
+
+    #[test]
+    fn report_of_closed_issue_is_dropped_not_misfiled() {
+        let mut m = min_model();
+        ctrl(&mut m, 'n'); // 建 议题2 并切过去
+        let gone = m.issues[1].id;
+        m.members[0].state = AgentState::Working;
+        ctrl(&mut m, 'w'); // 空议题一键关
+        assert_eq!(m.issues.len(), 1);
+
+        let cmds = done(&mut m, "老K", gone, "已关议题的汇报");
+
+        // 绝不能写进剩下那个无关议题
+        assert!(m.issues[0].timeline.is_empty());
+        assert!(!cmds.iter().any(|c| matches!(c, Command::PersistChat { .. })));
+        assert_eq!(m.members[0].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn report_mentions_survive_truncation() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        m.members[0].state = AgentState::Working;
+        // 800 字汇报,按团队规约把 @ 写在结尾
+        let long = "改完了。".repeat(200);
+        let cmds = done(&mut m, "老K", id, &format!("{long}\n@阿码 接着上单测"));
+
+        // 接力没断
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::SpawnAgent { name, .. } if name == "阿码")));
+        assert_eq!(m.members[1].state, AgentState::Thinking);
+        // 群聊里是截断版,且标注了派给谁
+        let chat = &m.issues[0].timeline[0].text;
+        assert!(chat.contains('…'));
+        assert!(chat.contains("↪ 已派给 @阿码"));
+    }
+
+    #[test]
+    fn paused_issue_queues_assignment_and_ctrl_p_releases_it() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        m.issues[0].paused = true;
+        m.members[0].state = AgentState::Working;
+
+        let cmds = done(&mut m, "老K", id, "看完了 @阿码 接手");
+
+        // 暂停中不起进程,但活必须进队列 —— 以前这里直接丢了
+        assert!(!cmds.iter().any(|c| matches!(c, Command::SpawnAgent { .. })));
+        assert_eq!(m.members[1].inbox.len(), 1);
+        assert_eq!(m.members[1].inbox[0].issue, id);
+
+        // Ctrl+P 恢复 → 排队的活被放出来
+        let cmds = ctrl_cmds(&mut m, 'p');
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::SpawnAgent { name, .. } if name == "阿码")));
+        assert!(m.members[1].inbox.is_empty());
+        assert_eq!(m.members[1].state, AgentState::Thinking);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_running_agents_before_quitting() {
+        let mut m = min_model();
+        m.members[0].state = AgentState::Working;
+        let old = m.cancel.clone();
+
+        ctrl(&mut m, 'c');
+        assert!(!m.should_quit, "有 agent 在跑时第一次 ^C 应该只取消,不退出");
+        assert!(old.is_cancelled());
+        // 必须换新 token,否则之后新起的 agent 一生下来就是取消态
+        assert!(!m.cancel.is_cancelled());
+
+        // 没有 agent 在跑时才真退出
+        m.members[0].state = AgentState::Idle;
+        ctrl(&mut m, 'c');
+        assert!(m.should_quit);
     }
 
     fn member(name: &str, backend: BackendKind, role: &str) -> Member {

@@ -174,6 +174,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
         status_hint_until: 0,
         pending_delete: None,
         show_help: false,
+        cancel: tokio_util::sync::CancellationToken::new(),
     };
 
     Ok((model, warns))

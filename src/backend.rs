@@ -7,9 +7,12 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 
 pub struct RunSpec {
     pub name: String,
+    /// 这一轮属于哪个议题(Issue::id),原样回投给 AgentDone
+    pub issue: u64,
     pub backend: BackendKind,
     pub model: Option<String>,
     /// 注入到子进程的环境变量(来自 .teamfly/env.toml,全队共享)
@@ -21,21 +24,38 @@ pub struct RunSpec {
 
 /// 起一个 agent 干一轮活。流式把每行 raw 通过 tx 回投,结束回投 AgentDone。
 /// 本函数应在 tokio task 中调用。失败自动重试(应对中转站 429/5xx 等瞬时错误)。
-pub async fn run(spec: RunSpec, tx: UnboundedSender<Msg>) {
+/// `cancel` 用于外部取消(用户按 Ctrl+C 或退出),收到后 kill 子进程且不再重试。
+pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<Msg>) {
     let name = spec.name.clone();
+    let issue = spec.issue;
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
 
     for attempt in 1..=MAX_ATTEMPTS {
+        if cancel.is_cancelled() {
+            let _ = tx.send(Msg::AgentDone {
+                name,
+                issue,
+                full_output: String::new(),
+                ok: false,
+                err: Some(crate::model::CANCELLED.into()),
+            });
+            return;
+        }
         let result = match spec.backend {
-            BackendKind::Claude => run_process(&spec, &tx, claude_cmd(&spec), crate::stream::StreamFmt::Claude).await,
-            BackendKind::Codex => run_process(&spec, &tx, codex_cmd(&spec), crate::stream::StreamFmt::Codex).await,
+            BackendKind::Claude => {
+                run_process(&spec, &tx, claude_cmd(&spec), crate::stream::StreamFmt::Claude, &cancel).await
+            }
+            BackendKind::Codex => {
+                run_process(&spec, &tx, codex_cmd(&spec), crate::stream::StreamFmt::Codex, &cancel).await
+            }
         };
 
         match result {
             Ok(full) => {
                 let _ = tx.send(Msg::AgentDone {
                     name,
+                    issue,
                     full_output: full,
                     ok: true,
                     err: None,
@@ -44,6 +64,17 @@ pub async fn run(spec: RunSpec, tx: UnboundedSender<Msg>) {
             }
             Err(e) => {
                 last_err = e.to_string();
+                // 取消导致的失败:不重试、不报「重试 N 次仍失败」
+                if cancel.is_cancelled() {
+                    let _ = tx.send(Msg::AgentDone {
+                        name,
+                        issue,
+                        full_output: String::new(),
+                        ok: false,
+                        err: Some(crate::model::CANCELLED.into()),
+                    });
+                    return;
+                }
                 if attempt < MAX_ATTEMPTS {
                     // 提示这次失败要重试,并退避
                     let _ = tx.send(Msg::AgentStdout {
@@ -65,6 +96,7 @@ pub async fn run(spec: RunSpec, tx: UnboundedSender<Msg>) {
     // 重试用尽,报掉线
     let _ = tx.send(Msg::AgentDone {
         name,
+        issue,
         full_output: String::new(),
         ok: false,
         err: Some(format!("重试 {MAX_ATTEMPTS} 次仍失败:{last_err}")),
@@ -144,13 +176,17 @@ async fn run_process(
     tx: &UnboundedSender<Msg>,
     proc: ProcSpec,
     fmt: crate::stream::StreamFmt,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new(&proc.bin);
     cmd.args(&proc.args)
         .current_dir(&spec.work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // 兜底:任何提前 return / panic / 进程退出都别把子进程留成孤儿。
+        // 这些 agent 跑的是 bypassPermissions,留下来会继续改工作区。
+        .kill_on_drop(true);
 
     // 模型不走 --model,改由 env 注入
     // 优先级:继承值 < env.toml(spec.env) < frontmatter model(最高,cmd.env 最后覆盖)
@@ -174,13 +210,19 @@ async fn run_process(
 
     let mut full = String::new();       // 累积 assistant 文本
     let mut result_text: Option<String> = None; // 最终 result 文本
-    let mut stream_err: Option<String> = None;  // 流里的错误内容
+    let mut stream_err: Option<String> = None;  // 流里的**致命**错误
+    let mut last_warn: Option<String> = None;   // 流里最后一条**瞬时**错误(仅兜底用)
     let mut err_tail: Vec<String> = Vec::new(); // 保留最后几行 stderr 供报错
     let mut out_reader = BufReader::new(stdout).lines();
     let mut err_reader = BufReader::new(stderr).lines();
 
     loop {
         tokio::select! {
+            biased; // 优先响应取消
+            _ = cancel.cancelled() => {
+                let _ = child.kill().await;
+                anyhow::bail!("{}", crate::model::CANCELLED);
+            }
             line = out_reader.next_line() => {
                 match line? {
                     Some(l) => {
@@ -193,10 +235,16 @@ async fn run_process(
                             full.push_str(&t);
                             full.push('\n');
                         }
+                        if let Some(w) = outcome.warn {
+                            last_warn = Some(w);
+                        }
                         if let Some(e) = outcome.error {
                             stream_err = Some(e);
-                        } else if let Some(r) = outcome.result {
+                        }
+                        if let Some(r) = outcome.result {
                             result_text = Some(r);
+                            // 拿到结果 = 之前那些错误已经被恢复了,别再判整轮失败
+                            stream_err = None;
                         }
                     }
                     None => break,
@@ -223,7 +271,7 @@ async fn run_process(
 
     let status = child.wait().await?;
 
-    // stream-json 里 result.is_error 视为失败(即便退出码 0)
+    // 流里的致命错误(claude 的 result.is_error / codex 的 turn.failed)视为失败,即便退出码 0
     if let Some(e) = stream_err {
         anyhow::bail!("{} 报错:{e}", proc.bin);
     }
@@ -243,6 +291,13 @@ async fn run_process(
             anyhow::bail!("{} 退出码 {code}(无 stderr)", proc.bin);
         } else {
             anyhow::bail!("{} 退出码 {code}:{detail}", proc.bin);
+        }
+    }
+    // 退出码 0 但一个字都没产出:此时若流里有瞬时错误,它才是真正的失败原因。
+    // (否则会把「(无输出)」当成正式汇报入群聊,把真失败洗成成功。)
+    if result_text.is_none() && full.trim().is_empty() {
+        if let Some(w) = last_warn {
+            anyhow::bail!("{} 无输出,最后的错误:{w}", proc.bin);
         }
     }
     // stream-json:优先用 result 事件的最终文本;否则回退到累积的 assistant 文本

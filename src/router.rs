@@ -1,19 +1,42 @@
 //! 路由：从 agent 的最终回复(result)提炼群聊汇报，解析 @ 指派，防乒乓。
 //! 尽量纯函数，便于单测。
 
-/// 群聊汇报的字数上限(超出截断)。
+/// 群聊汇报的**展示**字数上限(超出截断)。注意:只影响群聊里怎么显示,
+/// 不影响 @ 解析和投递给下游的内容 —— 那两件事必须用完整文本。
 const REPORT_MAX_CHARS: usize = 500;
 
-/// 从 agent 一轮的最终回复(claude/codex 的 result 文本)提炼成群聊里好读的汇报。
+/// 从 agent 一轮的最终回复(claude/codex 的 result 文本)提炼成汇报。
 ///
 /// 无需 agent 写任何标记 —— result 本就是它这轮的收尾回复。
-/// 做的清理:去掉首尾空白与空行、折叠连续空行、超长截断(保留 @)。
+/// 做的清理:去掉首尾空白与空行、折叠连续空行。
+///
+/// **不截断**:团队规约要求 agent「在结尾 @下一个人」,一旦在这里截断,
+/// 尾部的 @ 会连同内容一起被切掉,接力链就断在第一跳(且毫无提示)。
+/// 截断只在 [`report_for_chat`] 里做,且发生在 @ 解析之后。
 pub fn extract_report(full_output: &str) -> String {
     let cleaned = collapse_blank_lines(full_output.trim());
     if cleaned.is_empty() {
         return "(无输出)".to_string();
     }
-    truncate_chars(&cleaned, REPORT_MAX_CHARS)
+    cleaned
+}
+
+/// 把汇报压成群聊里好读的展示文本。若发生截断且这轮派了活,
+/// 补一行说明派给了谁 —— 否则用户会看到一条以 … 结尾的汇报却不知道谁接手了。
+pub fn report_for_chat(report: &str, mentions: &[String]) -> String {
+    if report.chars().count() <= REPORT_MAX_CHARS {
+        return report.to_string();
+    }
+    let mut out = truncate_chars(report, REPORT_MAX_CHARS);
+    if !mentions.is_empty() {
+        let who = mentions
+            .iter()
+            .map(|n| format!("@{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!("\n↪ 已派给 {who}"));
+    }
+    out
 }
 
 /// 折叠连续空行为单个空行，并去掉每行尾随空白。
@@ -154,6 +177,32 @@ mod tests {
     #[test]
     fn extract_empty_is_placeholder() {
         assert_eq!(extract_report("   \n\n  "), "(无输出)");
+    }
+
+    #[test]
+    fn extract_does_not_truncate() {
+        // 截断必须留到 @ 解析之后 —— 否则结尾的 @ 会被切掉,接力链直接断
+        let raw = format!("{}\n@小盾 接手", "改完了。".repeat(200));
+        let r = extract_report(&raw);
+        assert!(r.chars().count() > REPORT_MAX_CHARS);
+        assert!(r.ends_with("@小盾 接手"));
+        // 完整文本里解析得到 @
+        assert_eq!(parse_mentions(&r, &roster(), "阿码"), vec!["小盾".to_string()]);
+    }
+
+    #[test]
+    fn report_for_chat_truncates_and_notes_targets() {
+        let long = "改完了。".repeat(200);
+        let out = report_for_chat(&long, &["小盾".to_string()]);
+        assert_eq!(out.lines().next().unwrap().chars().count(), REPORT_MAX_CHARS + 1);
+        assert!(out.contains('…'));
+        assert!(out.ends_with("↪ 已派给 @小盾"));
+    }
+
+    #[test]
+    fn report_for_chat_leaves_short_text_alone() {
+        let out = report_for_chat("干完了 @小盾 对下接口", &["小盾".to_string()]);
+        assert_eq!(out, "干完了 @小盾 对下接口");
     }
 
     #[test]
