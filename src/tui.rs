@@ -82,7 +82,6 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("    Backspace / ^U    删字符 / 清空输入行"),
         Line::from(""),
         Line::from(vec![Span::styled("  斜杠命令", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
-        Line::from("    /init             让 DEV 扫项目、生成 CLAUDE.md 概览"),
         Line::from("    /team <名>        切当前议题的团队"),
         Line::from(""),
         Line::from(vec![Span::styled("  切换视图", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),

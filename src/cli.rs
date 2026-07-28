@@ -167,7 +167,9 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
         scroll: 0,
         tick: 0,
         should_quit: false,
-        max_chain_depth: 12,
+        // TPM 星型调度:用户→TPM→DEV→TPM→REV→TPM→… 一个需求轻松 6-8 跳,
+        // 复审来回还会更长,给足余量避免被防乒乓误暂停。
+        max_chain_depth: 24,
         status_hint: None,
         status_hint_until: 0,
         pending_delete: None,
