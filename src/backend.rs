@@ -79,10 +79,7 @@ fn claude_cmd(spec: &RunSpec) -> ProcSpec {
         "--append-system-prompt".to_string(),
         spec.system_prompt.clone(),
     ];
-    if let Some(m) = &spec.model {
-        args.push("--model".into());
-        args.push(m.clone());
-    }
+    // 模型不走 --model,改由 env ANTHROPIC_MODEL 接管(见 run_process 里的注入逻辑)
     // MCP 两级 fallback:项目级 <work_dir>/.teamfly/mcp.json > 用户级 ~/.teamfly/mcp.json
     if let Some(mcp) = resolve_mcp_config(&spec.work_dir) {
         args.push("--mcp-config".into());
@@ -118,10 +115,7 @@ fn codex_cmd(spec: &RunSpec) -> ProcSpec {
     // codex 无「追加系统 prompt」的稳定 flag,MVP 把系统 prompt 前置进输入。
     let combined = format!("{}\n\n{}", spec.system_prompt, spec.user_input);
     let mut args = vec!["exec".to_string()];
-    if let Some(m) = &spec.model {
-        args.push("--model".into());
-        args.push(m.clone());
-    }
+    // 模型不走 --model,改由 env 接管
     args.push(combined);
     ProcSpec {
         bin: "codex".into(),
@@ -140,13 +134,32 @@ async fn run_process(
     proc: ProcSpec,
     stream_json: bool,
 ) -> anyhow::Result<String> {
-    let mut child = tokio::process::Command::new(&proc.bin)
-        .args(&proc.args)
+    let mut cmd = tokio::process::Command::new(&proc.bin);
+    cmd.args(&proc.args)
         .current_dir(&spec.work_dir)
-        .envs(&spec.env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // 模型不走 --model,改由 env 注入:若 frontmatter 指定了 model,则注入 ANTHROPIC_MODEL(claude)/OPENAI_MODEL(codex)
+    // 到 env 里,覆盖掉 shell 继承来的值
+    if let Some(m) = &spec.model {
+        let env_key = match spec.backend {
+            BackendKind::Claude => "ANTHROPIC_MODEL",
+            BackendKind::Codex => "OPENAI_MODEL",
+        };
+        // 加到 env 里(envs 最后加,会覆盖前面 unset 的逻辑)
+        // 但注意 env_remove 是在 envs 之前,所以这里直接在后面补不行。
+        // 改为:如果 spec.env 里没有这个 key,才去修改 cmd 的 env
+        if !spec.env.contains_key(env_key) {
+            cmd.env(env_key, m);
+        }
+    }
+
+    // 显式注入的 env(spec.env)最后加,覆盖继承来的
+    cmd.envs(&spec.env);
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("起 `{}` 失败: {e}", proc.bin))?;
 
