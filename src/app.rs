@@ -91,6 +91,11 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
         // 只有输入框为空时,? 打开帮助;有内容则视为普通字符
         if m.input.is_empty() {
             m.show_help = !m.show_help;
+            if m.show_help {
+                m.status_hint = Some("? / Esc 关闭帮助".into());
+            } else {
+                m.status_hint = None;
+            }
             return vec![];
         }
     }
@@ -133,6 +138,11 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
         match k.code {
             KeyCode::Char('c') => {
                 m.should_quit = true;
+                return vec![];
+            }
+            // 有些终端把退格发成 Ctrl+H
+            KeyCode::Char('h') => {
+                m.input.pop();
                 return vec![];
             }
             // Ctrl+U 清空输入行
