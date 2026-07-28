@@ -8,8 +8,9 @@ pub const DEFAULT_TEAM: &str = "default";
 /// (相对路径, 文件内容) —— 默认团队的全部文件(编译期从 src/assets 嵌入)。
 const FILES: &[(&str, &str)] = &[
     ("team.md", include_str!("assets/teams/default/team.md")),
+    ("agents/TPM.md", include_str!("assets/teams/default/agents/TPM.md")),
     ("agents/DEV.md", include_str!("assets/teams/default/agents/DEV.md")),
-    ("agents/QE.md", include_str!("assets/teams/default/agents/QE.md")),
+    ("agents/REV.md", include_str!("assets/teams/default/agents/REV.md")),
 ];
 
 /// 播种默认团队:目录不存在则完整播种;目录已存在但个别文件缺失,则补上缺失的。
