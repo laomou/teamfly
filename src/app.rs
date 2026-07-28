@@ -298,7 +298,7 @@ fn dispatch(m: &mut Model, name: &str, assignment: String, chain_depth: u32) -> 
         backend: mem.backend,
         model: mem.model.clone(),
         mcp_config: mem.mcp_config.clone(),
-        env: m.agent_env.clone(),
+        env: m.agent_env.merged_for(mem.backend),
         system_prompt: mem.system_prompt.clone(),
         user_input,
     })
@@ -505,11 +505,11 @@ mod e2e {
             team_name: "T".into(),
             work_dir: std::env::temp_dir(),
             teamfly_dir: std::env::temp_dir().join(".af_x"),
-            agent_env: std::collections::HashMap::new(),
+            agent_env: crate::env::AgentEnv::default(),
             members: vec![
-                member("老K", BackendKind::Mock, "架构"),
-                member("阿码", BackendKind::Mock, "实现"),
-                member("阿测", BackendKind::Mock, "测试"),
+                member("老K", BackendKind::Claude, "架构"),
+                member("阿码", BackendKind::Claude, "实现"),
+                member("阿测", BackendKind::Claude, "测试"),
             ],
             issues: vec![Issue::new("i")],
             current_issue: 0,
@@ -586,100 +586,4 @@ mod e2e {
         }
     }
 
-    fn model(dir: &std::path::Path) -> Model {
-        Model {
-            team_name: "演示队".into(),
-            work_dir: dir.to_path_buf(),
-            teamfly_dir: dir.join(".teamfly"),
-            agent_env: std::collections::HashMap::new(),
-            members: vec![
-                member("老K", BackendKind::Mock, "架构"),
-                member("阿码", BackendKind::Mock, "实现"),
-                member("阿测", BackendKind::Mock, "测试"),
-            ],
-            issues: vec![Issue::new("重构登录")],
-            current_issue: 0,
-            selection: Selection::Chat,
-            input: String::new(),
-            scroll: 0,
-            tick: 0,
-            should_quit: false,
-            max_chain_depth: 12,
-            status_hint: None,
-        }
-    }
-
-    /// 驱动整个 TEA 循环直到全体空闲。返回最终 Model。
-    async fn drive(mut m: Model, first_input: &str) -> Model {
-        let (tx, mut rx) = unbounded_channel::<Msg>();
-        std::fs::create_dir_all(&m.teamfly_dir).unwrap();
-        let rt = Runtime::new(tx.clone());
-
-        // 我输入
-        m.input = first_input.to_string();
-        let cmds = update(&mut m, Msg::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::empty(),
-        )));
-        for c in cmds { rt.exec(&m, c); }
-
-        // 处理消息直到通道空闲一段时间
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_millis(800), rx.recv()).await {
-                Ok(Some(msg)) => {
-                    let cmds = update(&mut m, msg);
-                    for c in cmds { rt.exec(&m, c); }
-                }
-                _ => break, // 超时 = 没有更多消息,收敛
-            }
-        }
-        m
-    }
-
-    #[tokio::test]
-    async fn full_flow_owner_to_agents() {
-        let tmp = std::env::temp_dir().join(format!("teamfly_e2e_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let m = model(&tmp);
-        // 我 @老K → 老K(mock,架构)会 @阿码 → 阿码 @阿测
-        let m = drive(m, "@老K 重构一下登录模块").await;
-
-        let tl = &m.issues[0].timeline;
-        let authors: Vec<&str> = tl.iter().map(|x| x.author.as_str()).collect();
-        // 应包含:我、老K、阿码、阿测 的汇报
-        assert!(authors.contains(&"我"), "authors={:?}", authors);
-        assert!(authors.contains(&"老K"), "authors={:?}", authors);
-        assert!(authors.contains(&"阿码"), "authors={:?}", authors);
-        assert!(authors.contains(&"阿测"), "authors={:?}", authors);
-        // 全体最终空闲
-        assert!(m.members.iter().all(|x| x.state == AgentState::Idle));
-        // 落盘文件存在且非空
-        let f = tmp.join(".teamfly/issues/重构登录.jsonl");
-        let content = std::fs::read_to_string(&f).unwrap();
-        assert!(content.lines().count() >= 4, "jsonl lines: {}", content.lines().count());
-
-        // 重放:load_all_issues 能恢复
-        let issues = crate::issue::load_all_issues(&tmp.join(".teamfly")).unwrap();
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].timeline.len(), tl.len());
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[tokio::test]
-    async fn no_mention_no_dispatch() {
-        let tmp = std::env::temp_dir().join(format!("teamfly_e2e2_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let m = model(&tmp);
-        let m = drive(m, "只是记个备注,不@任何人").await;
-        // 只有我一条,无 agent 被唤醒
-        assert_eq!(m.issues[0].timeline.len(), 1);
-        assert!(m.members.iter().all(|x| x.state == AgentState::Idle));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
 }

@@ -1,38 +1,113 @@
-//! .teamfly/env.toml —— 全队共享的 agent 环境变量,注入到每个 agent 子进程。
+//! .teamfly/env.toml —— agent 环境变量,注入到 agent 子进程。
 //!
-//! 格式(平铺 key=value):
+//! 格式:
 //! ```toml
-//! ANTHROPIC_BASE_URL = "https://中转站.example.com"
-//! ANTHROPIC_API_KEY  = "sk-..."
+//! # 顶层 = 全部 backend 共享
+//! LOG_LEVEL = "info"
+//!
+//! [claude]                     # 只注入 claude backend
+//! ANTHROPIC_BASE_URL = "https://中转站A.example.com"
+//! ANTHROPIC_API_KEY  = "${MY_CLAUDE_KEY}"
+//!
+//! [codex]                      # 只注入 codex backend
+//! OPENAI_API_KEY = "${MY_CODEX_KEY}"
+//!
+//! [api]                        # 只注入 api backend(agentfly 自跑 Anthropic)
+//! ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 //! ```
-//! 值支持 `$VAR` / `${VAR}` 引用当前进程环境变量(便于把 key 存在 shell 里)。
+//!
+//! 合并:全局 + 该 backend 段。同名 key 以 backend 段为准。
+//! 值支持 `$VAR` / `${VAR}` 引用当前进程环境变量。
 
+use crate::model::BackendKind;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// 加载 .teamfly/env.toml。文件不存在返回空 map。
-pub fn load(teamfly_dir: &Path) -> Result<HashMap<String, String>> {
+/// backend 段名。
+const SECTION_KEYS: &[&str] = &["claude", "codex"];
+
+#[derive(Debug, Default, Clone)]
+pub struct AgentEnv {
+    global: HashMap<String, String>,
+    claude: HashMap<String, String>,
+    codex: HashMap<String, String>,
+}
+
+impl AgentEnv {
+    /// 返回给某 backend 的最终环境变量(全局 + 该段覆盖)。
+    pub fn merged_for(&self, kind: BackendKind) -> HashMap<String, String> {
+        let mut out = self.global.clone();
+        let section = match kind {
+            BackendKind::Claude => &self.claude,
+            BackendKind::Codex => &self.codex,
+        };
+        for (k, v) in section {
+            out.insert(k.clone(), v.clone());
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub fn from_maps(
+        global: HashMap<String, String>,
+        claude: HashMap<String, String>,
+        codex: HashMap<String, String>,
+    ) -> Self {
+        AgentEnv { global, claude, codex }
+    }
+}
+
+/// 加载 .teamfly/env.toml。文件不存在返回空 AgentEnv。
+pub fn load(teamfly_dir: &Path) -> Result<AgentEnv> {
     let path = teamfly_dir.join("env.toml");
     if !path.exists() {
-        return Ok(HashMap::new());
+        return Ok(AgentEnv::default());
     }
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("读取 {}", path.display()))?;
     let table: toml::Table = toml::from_str(&content)
         .with_context(|| format!("解析 {}", path.display()))?;
 
-    let mut out = HashMap::new();
+    let mut env = AgentEnv::default();
     for (k, v) in table {
-        let raw = match v {
-            toml::Value::String(s) => s,
-            toml::Value::Integer(i) => i.to_string(),
-            toml::Value::Boolean(b) => b.to_string(),
-            _ => continue, // 只支持标量值
-        };
-        out.insert(k, expand(&raw));
+        // backend 段
+        if SECTION_KEYS.contains(&k.as_str()) {
+            if let toml::Value::Table(sub) = v {
+                let m = table_to_map(sub);
+                match k.as_str() {
+                    "claude" => env.claude = m,
+                    "codex" => env.codex = m,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        // 顶层标量 = 全局
+        if let Some(s) = scalar_to_string(v) {
+            env.global.insert(k, expand(&s));
+        }
     }
-    Ok(out)
+    Ok(env)
+}
+
+fn table_to_map(t: toml::Table) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (k, v) in t {
+        if let Some(s) = scalar_to_string(v) {
+            out.insert(k, expand(&s));
+        }
+    }
+    out
+}
+
+fn scalar_to_string(v: toml::Value) -> Option<String> {
+    match v {
+        toml::Value::String(s) => Some(s),
+        toml::Value::Integer(i) => Some(i.to_string()),
+        toml::Value::Boolean(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 /// 展开 `$VAR` 和 `${VAR}` 为当前进程环境变量的值(未定义则保留原样)。
@@ -117,5 +192,34 @@ mod tests {
     #[test]
     fn expand_literal_dollar() {
         assert_eq!(expand("cost $5"), "cost $5"); // $后跟数字,不当变量
+    }
+
+    fn m(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn merged_claude_overrides_global() {
+        let env = AgentEnv::from_maps(
+            m(&[("LOG", "info"), ("ANTHROPIC_API_KEY", "global-key")]),
+            m(&[("ANTHROPIC_API_KEY", "claude-key"), ("EXTRA", "c")]),
+            HashMap::new(),
+        );
+        let merged = env.merged_for(BackendKind::Claude);
+        assert_eq!(merged.get("LOG").unwrap(), "info");                 // 继承全局
+        assert_eq!(merged.get("ANTHROPIC_API_KEY").unwrap(), "claude-key"); // 覆盖
+        assert_eq!(merged.get("EXTRA").unwrap(), "c");                  // 段内独有
+    }
+
+    #[test]
+    fn merged_codex_ignores_claude() {
+        let env = AgentEnv::from_maps(
+            HashMap::new(),
+            m(&[("ANTHROPIC_API_KEY", "should-not-see")]),
+            m(&[("OPENAI_API_KEY", "codex-key")]),
+        );
+        let merged = env.merged_for(BackendKind::Codex);
+        assert!(!merged.contains_key("ANTHROPIC_API_KEY")); // claude 段不影响 codex
+        assert_eq!(merged.get("OPENAI_API_KEY").unwrap(), "codex-key");
     }
 }

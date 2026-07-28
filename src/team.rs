@@ -54,9 +54,7 @@ fn parse_backend(s: &str) -> Result<BackendKind> {
     match s.trim().to_lowercase().as_str() {
         "claude" => Ok(BackendKind::Claude),
         "codex" => Ok(BackendKind::Codex),
-        "api" => Ok(BackendKind::Api),
-        "mock" => Ok(BackendKind::Mock),
-        other => bail!("未知 backend: {other}(应为 claude/codex/api/mock)"),
+        other => bail!("未知 backend: {other}(应为 claude/codex)"),
     }
 }
 
@@ -179,17 +177,6 @@ pub fn preflight(team: &Team) -> Vec<String> {
         match m.backend {
             BackendKind::Claude => need_claude = true,
             BackendKind::Codex => need_codex = true,
-            BackendKind::Api => {
-                if std::env::var("ANTHROPIC_API_KEY").is_err()
-                    && std::env::var("ANTHROPIC_AUTH_TOKEN").is_err()
-                {
-                    warns.push(format!(
-                        "{} 用 api backend,但未见 ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN",
-                        m.name
-                    ));
-                }
-            }
-            BackendKind::Mock => {}
         }
         // MCP 配置文件存在性校验(claude/codex 才用)
         if let Some(mcp) = &m.mcp_config {
