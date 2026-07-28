@@ -12,13 +12,13 @@ cargo build --release
 # 一次性配置全局凭证(交互输入 BASE_URL / KEY,写 ~/.teamfly/env.toml)
 ./target/release/teamfly init
 
-# 在工作目录里开干(缺省用内置 default 队:DEV + QE)
+# 在工作目录里开干(缺省用内置 default 队:TPM + DEV + REV)
 ./target/release/teamfly work [工作目录] [--team <团队名>]
 ```
 
 进入后:
 
-- 底部输入框打字。**带 `@名字` 才会派活**(如 `@DEV 加个登录功能`);不带 `@` 只是留言。
+- 底部输入框打字。**带 `@名字` 才会派活**；默认团队从 `@TPM 加个登录功能` 开始，由 TPM 拆解、调度实现和评审。不带 `@` 只是留言。
 - `↑↓`(或鼠标点左栏)在 `# 总览`(全员时间线)/ 某个成员(看他进程的原始输出流)间切。
 - `?` 帮助 · `^N` 新议题 · `^W` 关议题 · `Alt+1-9` 切议题 · `Esc` 回总览 · `^C` 退出。
 - 斜杠命令:`/team <名>` 热切当前议题的团队。
@@ -31,14 +31,15 @@ cargo build --release
 default/
 ├─ team.md            # 队名 + 全员规矩 + 团队职责 + 任务流转(拼进每个 agent)
 └─ agents/
-   ├─ DEV.md          # frontmatter(name/role/emoji/backend/model) + 人设正文
-   └─ QE.md
+   ├─ TPM.md          # frontmatter(name/role/emoji/backend/model) + 调度职责
+   ├─ DEV.md          # 实现与测试
+   └─ REV.md          # 只做代码评审
 ```
 
 - **agent md** 只写单一职责(我是谁、做什么);**team.md** 写团队职责和任务流转(谁完成后交给谁),改流程只改一处。
 - `backend` 二选一:`claude`(claude CLI,stream-json)/ `codex`(codex CLI,JSONL)。
 - `model` 可选;不写则由 env.toml 的 `ANTHROPIC_MODEL` 或继承环境决定。
-- 内置 `default` 队(DEV/QE)首次运行自动播种到工作目录的 `.teamfly/teams/default/`。
+- 内置 `default` 队(TPM/DEV/REV)首次运行自动播种到工作目录的 `.teamfly/teams/default/`；旧的未修改 DEV/QE 默认队会自动迁移。
 
 ## 配置(env.toml / mcp.json)
 
