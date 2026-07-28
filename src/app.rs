@@ -73,6 +73,22 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
     }
     m.status_hint = None;
 
+    // Alt+数字:切议题(比 Ctrl+数字 兼容性好——不少终端根本不发 Ctrl+数字)
+    if k.modifiers.contains(KeyModifiers::ALT) {
+        if let KeyCode::Char(c) = k.code {
+            if let Some(d) = c.to_digit(10) {
+                let n = d as usize;
+                if n >= 1 && n <= m.issues.len() {
+                    m.current_issue = n - 1;
+                    m.selection = Selection::Chat;
+                    m.scroll = 0;
+                    m.status_hint = Some(format!("切到议题 {n}"));
+                }
+                return vec![];
+            }
+        }
+    }
+
     // Ctrl 组合
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
@@ -120,6 +136,9 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                     m.current_issue = n - 1;
                     m.selection = Selection::Chat;
                     m.scroll = 0;
+                    m.status_hint = Some(format!("切到议题 {n}"));
+                } else {
+                    m.status_hint = Some(format!("^{n}:超出议题数({}/{})", n, m.issues.len()));
                 }
                 return vec![];
             }
