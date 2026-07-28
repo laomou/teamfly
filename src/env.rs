@@ -62,13 +62,14 @@ impl AgentEnv {
 }
 
 /// 加载 env.toml。合并顺序:
-///   1. 用户级 `~/.teamfly/env.toml`
+///   1. 用户级 `~/.teamfly/env.toml`(不存在则自动创建带注释的模板)
 ///   2. 项目级 `<工作目录>/.teamfly/env.toml`  ← 同名 key 覆盖用户级
-/// 两者都可选,都没有 = 空。
+/// 两者都可选,都没有 = 空(但用户级会被首次自动 seed)。
 pub fn load(teamfly_dir: &Path) -> Result<AgentEnv> {
     let mut env = AgentEnv::default();
-    // 用户级
+    // 用户级:不存在则播种模板
     if let Some(user_path) = user_env_path() {
+        seed_user_template(&user_path).ok(); // seed 失败不致命
         if user_path.exists() {
             merge_into(&mut env, &user_path)?;
         }
@@ -85,6 +86,38 @@ pub fn load(teamfly_dir: &Path) -> Result<AgentEnv> {
 fn user_env_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(std::path::PathBuf::from(home).join(".teamfly").join("env.toml"))
+}
+
+/// 若用户级 env.toml 不存在,创建一个带注释的模板(全注释,不会实际注入任何 env)。
+fn seed_user_template(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmpl = r#"# teamfly 用户级 agent 环境变量(全局默认,所有项目共用)
+# 项目里可写 <工作目录>/.teamfly/env.toml 覆盖同名 key
+# 值支持 ${VAR} 或 $VAR 引用当前 shell 里的环境变量(避免密钥入文件)
+#
+# 常见用法:把 key 存在 shell(比如 ~/.zshrc),这里只写引用:
+#
+# [claude]
+# ANTHROPIC_BASE_URL   = "https://api.anthropic.com"
+# ANTHROPIC_AUTH_TOKEN = "${ANTHROPIC_AUTH_TOKEN}"
+#
+# [codex]
+# OPENAI_API_KEY = "${OPENAI_API_KEY}"
+
+# —— 取消下面注释、按需修改即可 ——
+
+# [claude]
+# ANTHROPIC_BASE_URL   = "https://api.anthropic.com"
+# ANTHROPIC_AUTH_TOKEN = "${ANTHROPIC_AUTH_TOKEN}"
+"#;
+    std::fs::write(path, tmpl)
+        .with_context(|| format!("写入模板 {}", path.display()))?;
+    Ok(())
 }
 
 /// 把一个 env.toml 文件的内容合并进 env(同名 key 覆盖)。
