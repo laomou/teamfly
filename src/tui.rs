@@ -393,8 +393,6 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
             (Style::default().fg(Color::Red), "  ")
         } else if l.starts_with("🔧") {
             (Style::default().fg(Color::Cyan), "  ")
-        } else if l.contains(crate::router::CHAT_MARK) {
-            (Style::default().fg(Color::Green).add_modifier(Modifier::BOLD), "  ")
         } else {
             (Style::default().fg(Color::Gray), "  ")
         };
