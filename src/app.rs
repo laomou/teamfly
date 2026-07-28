@@ -78,8 +78,13 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Command> {
             }
             vec![]
         }
-        Msg::AgentDone { name, issue, full_output, ok, err } => {
-            handle_agent_done(m, name, issue, full_output, ok, err)
+        Msg::AgentDone { name, issue, gen, full_output, ok, err } => {
+            handle_agent_done(m, name, issue, gen, full_output, ok, err)
+        }
+        Msg::IoError { detail } => {
+            // 落盘失败必须让用户看见 —— 否则他会以为历史都保住了
+            set_hint(m, format!("⚠ 落盘失败:{detail}"), 12);
+            vec![]
         }
     }
 }
@@ -374,11 +379,19 @@ fn handle_agent_done(
     m: &mut Model,
     name: String,
     issue_id: u64,
+    gen: u64,
     full_output: String,
     ok: bool,
     err: Option<String>,
 ) -> Vec<Command> {
     let mut cmds = Vec::new();
+
+    // 团队已经热切过了:这条结果属于旧花名册。按新花名册解析它的 @ 会把
+    // 新团队里同名的人莫名唤醒,所以整条作废(状态也不用清,成员对象已经换掉了)。
+    if gen != m.team_gen {
+        set_hint(m, format!("{name} 的结果属于已切换的团队,已丢弃"), 8);
+        return cmds;
+    }
 
     // 该成员回到空闲
     if let Some(i) = m.member_index(&name) {
@@ -478,6 +491,7 @@ fn dispatch(
     Some(Command::SpawnAgent {
         name: mem.name.clone(),
         issue: issue_id,
+        gen: m.team_gen,
         backend: mem.backend,
         model: mem.model.clone(),
         env: m.agent_env.merged_for(mem.backend),
@@ -565,11 +579,28 @@ fn handle_slash(m: &mut Model, slash: crate::slash::Slash) -> Vec<Command> {
                 }
             };
             let count = team.members.len();
+            // 先掐掉在跑的 agent:它们跑的是 bypass 权限,留着会和新团队的同名成员
+            // 并发写同一个仓库(旧成员对象马上就被丢掉,再没人能停它们)
+            let running = m.working_count();
+            if running > 0 {
+                m.cancel.cancel();
+                m.cancel = tokio_util::sync::CancellationToken::new();
+            }
+            // 代号 +1:旧团队那些迟到的 AgentDone 一律作废
+            m.team_gen += 1;
             m.team_name = team.name;
             m.members = team.members; // 旧成员的 raw/inbox 直接丢
             m.selection = Selection::Chat;
             m.scroll = 0;
-            set_hint(m, format!("已切到「{}」团队({count} 人)", m.team_name), 5);
+            if running > 0 {
+                set_hint(
+                    m,
+                    format!("已切到「{}」团队({count} 人);取消了 {running} 个在跑的 agent", m.team_name),
+                    8,
+                );
+            } else {
+                set_hint(m, format!("已切到「{}」团队({count} 人)", m.team_name), 5);
+            }
             vec![]
         }
         Slash::Unknown { text } => {
@@ -748,15 +779,20 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
     match cmd {
         Command::PersistChat { issue, msg } => {
             let dir = model.teamfly_dir.clone();
-            let _ = crate::issue::append_chat(&dir, &issue, &msg);
+            if let Err(e) = crate::issue::append_chat(&dir, &issue, &msg) {
+                let _ = tx.send(Msg::IoError { detail: format!("{e:#}") });
+            }
         }
         Command::DeleteIssueFile { issue } => {
             let dir = model.teamfly_dir.clone();
-            let _ = crate::issue::delete_file(&dir, &issue);
+            if let Err(e) = crate::issue::delete_file(&dir, &issue) {
+                let _ = tx.send(Msg::IoError { detail: format!("{e:#}") });
+            }
         }
         Command::SpawnAgent {
             name,
             issue,
+            gen,
             backend,
             model: mdl,
             env,
@@ -766,6 +802,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             let spec = RunSpec {
                 name,
                 issue,
+                gen,
                 backend,
                 model: mdl,
                 env,
@@ -785,6 +822,16 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
 // ---- 主循环 ----
 
 pub async fn run(model: Model) -> Result<()> {
+    // panic 兜底:raw mode + 备用屏下 panic 会把终端留在无回显、无光标的状态,
+    // 而 panic 信息打在备用屏上随退出一起被抹掉 —— 现象是「终端瞬间花掉且没有报错」。
+    // 装个 hook 先把终端恢复,再让默认 hook 正常打印。
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        default_hook(info);
+    }));
+
     // 终端初始化
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -865,6 +912,10 @@ async fn run_loop(
             break;
         }
         terminal.draw(|f| tui::draw(f, &model))?;
+        // 渲染时才知道内容有多高,顺手把用户的滚动量夹回可达范围。
+        // 不夹的话:在不满一屏的内容上连按 PageUp 会把 scroll 累到很大,
+        // 之后内容变长,视图就钉死在顶部,新消息永远看不到。
+        model.scroll = model.scroll.min(model.scroll_max.get());
     }
     Ok(())
 }
@@ -903,6 +954,38 @@ fn translate_event(ev: Event, model: &Model) -> Option<Msg> {
     }
 }
 
+/// 给别的模块的测试用的最小 Model 构造(仅测试编译时存在)。
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+
+    pub fn tiny_model() -> Model {
+        Model {
+            team_name: "T".into(),
+            work_dir: std::env::temp_dir(),
+            teamfly_dir: std::env::temp_dir().join(".af_tiny"),
+            agent_env: crate::env::AgentEnv::default(),
+            members: vec![],
+            issues: vec![Issue::new("i")],
+            current_issue: 0,
+            selection: Selection::Chat,
+            input_mode: InputMode::Chat,
+            input: String::new(),
+            scroll: 0,
+            scroll_max: std::cell::Cell::new(0),
+            tick: 0,
+            should_quit: false,
+            max_chain_depth: 12,
+            status_hint: None,
+            status_hint_until: 0,
+            pending_delete: None,
+            show_help: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            team_gen: 0,
+        }
+    }
+}
+
 // ---- 无终端的端到端测试 ----
 
 #[cfg(test)]
@@ -927,6 +1010,7 @@ mod e2e {
             Msg::AgentDone {
                 name: name.into(),
                 issue,
+                gen: 0,
                 full_output: output.into(),
                 ok: true,
                 err: None,
@@ -951,6 +1035,7 @@ mod e2e {
             input_mode: InputMode::Chat,
             input: String::new(),
             scroll: 0,
+            scroll_max: std::cell::Cell::new(0),
             tick: 0,
             should_quit: false,
             max_chain_depth: 12,
@@ -959,6 +1044,7 @@ mod e2e {
             pending_delete: None,
             show_help: false,
             cancel: tokio_util::sync::CancellationToken::new(),
+            team_gen: 0,
         }
     }
 
@@ -1192,6 +1278,42 @@ mod e2e {
         m.members[0].state = AgentState::Idle;
         ctrl(&mut m, 'c');
         assert!(m.should_quit);
+    }
+
+    #[test]
+    fn stale_team_generation_result_is_discarded() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        m.members[0].state = AgentState::Working;
+        // 模拟 /team 热切
+        m.team_gen += 1;
+
+        // 旧团队的 agent 迟到交卷(带旧代号)
+        let cmds = update(
+            &mut m,
+            Msg::AgentDone {
+                name: "老K".into(),
+                issue: id,
+                gen: 0,
+                full_output: "旧团队的汇报 @阿码 接手".into(),
+                ok: true,
+                err: None,
+            },
+        );
+
+        // 不入时间线、不落盘,更不能按新花名册把同名的人唤醒
+        assert!(m.issues[0].timeline.is_empty());
+        assert!(cmds.is_empty());
+        assert_eq!(m.members[1].state, AgentState::Idle);
+        assert!(m.members[1].inbox.is_empty());
+    }
+
+    #[test]
+    fn io_error_surfaces_as_hint() {
+        let mut m = min_model();
+        update(&mut m, Msg::IoError { detail: "磁盘已满".into() });
+        assert!(m.status_hint.as_ref().unwrap().contains("落盘失败"));
+        assert!(m.status_hint.as_ref().unwrap().contains("磁盘已满"));
     }
 
     fn member(name: &str, backend: BackendKind, role: &str) -> Member {

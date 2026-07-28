@@ -148,6 +148,11 @@ pub struct Model {
     pub input: String,
     /// 右区滚动偏移（0 = 贴底）
     pub scroll: u16,
+    /// 上一帧渲染时算出的「最多能往上滚多少行」。
+    /// 由渲染层回填(内容高度只有画的时候才知道),主循环每帧用它夹一下 `scroll`。
+    /// 否则在不满一屏的内容上连按 PageUp 会把 scroll 累到很大,
+    /// 之后内容变长时视图就钉死在顶部,新消息永远看不到。
+    pub scroll_max: std::cell::Cell<u16>,
     /// spinner 动画帧
     pub tick: u64,
     /// 是否请求退出
@@ -165,6 +170,10 @@ pub struct Model {
     /// 取消令牌:Ctrl+C / 退出时用它掐掉所有在跑的 agent 子进程。
     /// 取消后会立刻换一个新 token,否则之后新起的 agent 一生下来就是取消态。
     pub cancel: tokio_util::sync::CancellationToken,
+    /// 团队代号。每次 /team 热切 +1。在跑的 agent 带着派活时的代号,
+    /// 代号过期的结果一律丢弃 —— 否则旧团队的汇报会按**新**花名册解析 @,
+    /// 把新团队里同名的人莫名唤醒。
+    pub team_gen: u64,
 }
 
 impl Model {
@@ -205,6 +214,8 @@ pub enum Msg {
         name: String,
         /// 这一轮属于哪个议题(派活时绑定的 Issue::id)
         issue: u64,
+        /// 派活时的团队代号。与当前 team_gen 不符则整条结果作废
+        gen: u64,
         /// 整轮 raw 汇总（用于兜底提取汇报）
         full_output: String,
         ok: bool,
@@ -212,6 +223,9 @@ pub enum Msg {
     },
     /// spinner 定时器
     Tick,
+    /// 落盘/删文件失败。以前这类错误被 `let _ =` 吞掉:磁盘满或目录没写权限时
+    /// 界面完全正常、消息照样进时间线,但一条都没落盘,重开历史归零且零告警。
+    IoError { detail: String },
 }
 
 /// update 返回的副作用描述，由 runtime 执行后回投 Msg。
@@ -222,6 +236,8 @@ pub enum Command {
         name: String,
         /// 这一轮属于哪个议题(Issue::id)。结果回来时按它定位,不看「当前选中议题」
         issue: u64,
+        /// 派活时的团队代号,原样回投
+        gen: u64,
         backend: BackendKind,
         model: Option<String>,
         env: std::collections::HashMap<String, String>,

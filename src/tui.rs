@@ -10,6 +10,23 @@ use ratatui::Frame;
 
 const SPINNER: [&str; 4] = ["⣾", "⣽", "⣻", "⢿"];
 
+/// 把一个「内缩 1 行 1 列」的子区域裁到 `area` 内部。
+///
+/// 直接写 `Rect::new(area.x+1, area.y+1, ...)` 在终端只有 1 行高时会指到 buffer 外面
+/// (`Layout` 会把 `Length(3)` 夹成 1 行,而 y+1 已经越界),ratatui 写 cell 时直接 panic。
+/// 返回空 Rect 时调用方应当什么都不画。
+fn inset(area: Rect, dx: u16, dy: u16, shrink_w: u16) -> Rect {
+    if area.height <= dy || area.width <= shrink_w {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    Rect::new(
+        area.x + dx,
+        area.y + dy,
+        area.width.saturating_sub(shrink_w),
+        1,
+    )
+}
+
 pub fn draw(f: &mut Frame, m: &Model) {
     // 顶行(高 3):品牌角 | 议题标签栏  ——  下方:左栏 | 右列
     let root = Layout::default()
@@ -130,12 +147,10 @@ fn draw_topbar_frame(f: &mut Frame, area: Rect) {
 
 /// 左上角品牌块(无边框,边框由 topbar_frame 统一画)。
 fn draw_brand(f: &mut Frame, area: Rect, _m: &Model) {
-    let inner = Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        1,
-    );
+    let inner = inset(area, 1, 1, 2);
+    if inner.width == 0 {
+        return; // 终端太小/太矮,这块直接不画
+    }
     let line = Line::from(vec![
         Span::styled("✦ ", Style::default().fg(Color::Cyan)),
         Span::styled(
@@ -153,12 +168,10 @@ fn draw_brand(f: &mut Frame, area: Rect, _m: &Model) {
 fn draw_tabs(f: &mut Frame, area: Rect, m: &Model) {
     // 边框由 topbar_frame 统一画;分隔线在 area 左侧前一列。
     // 内容从 area 左缘起(紧贴分隔线),右侧留 1 列给外框右边。
-    let inner = Rect::new(
-        area.x,
-        area.y + 1,
-        area.width.saturating_sub(1),
-        1,
-    );
+    let inner = inset(area, 0, 1, 1);
+    if inner.width == 0 {
+        return; // 终端太小/太矮,这块直接不画
+    }
     let working = m.working_count();
 
     // 议题过多时,以当前议题为中心,只画左右各 2 个;溢出用 «/» 提示
@@ -367,7 +380,8 @@ fn draw_timeline(f: &mut Frame, area: Rect, m: &Model) {
         padded.append(&mut lines);
         lines = padded;
     }
-    let total = lines.len() as u16;
+    let total = wrapped_height(&lines, area.width);
+    m.scroll_max.set(total.saturating_sub(area.height));
     let scroll = bottom_scroll(total, area.height, m.scroll);
     f.render_widget(
         Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll, 0)),
@@ -436,7 +450,8 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
             }
         }
     }
-    let total = lines.len() as u16;
+    let total = wrapped_height(&lines, area.width);
+    m.scroll_max.set(total.saturating_sub(area.height));
     let scroll = bottom_scroll(total, area.height, m.scroll);
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
@@ -549,6 +564,21 @@ fn bottom_scroll(total: u16, height: u16, user_scroll: u16) -> u16 {
     }
 }
 
+/// 这批 Line 在宽度 `w` 下渲染成多少行。
+///
+/// 必须按**折行后**的行数算:Paragraph 开了 `Wrap` 时 `.scroll()` 的单位是渲染行,
+/// 而 `lines.len()` 是未折行的条目数。只要有一条比区域宽,贴底偏移就会算少,
+/// 底部内容被顶出可视区且再也划不下去(现象是「界面卡住不更新」)。
+/// `Line::width()` 用的是 unicode-width,和 ratatui 内部折行的度量一致。
+fn wrapped_height(lines: &[Line], w: u16) -> u16 {
+    let w = w.max(1) as usize;
+    let total: usize = lines
+        .iter()
+        .map(|l| l.width().max(1).div_ceil(w))
+        .sum();
+    total.min(u16::MAX as usize) as u16
+}
+
 fn display_width(s: &str) -> usize {
     // 粗略:CJK 记 2 宽,其余 1
     s.chars()
@@ -579,4 +609,38 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
         out.push(String::new());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 极小终端不能 panic。
+    ///
+    /// 以前 draw_brand / draw_tabs 直接算 `area.y + 1`:终端只有 1 行高时
+    /// `Layout` 会把 `Length(3)` 夹成 1 行,y+1 已在 buffer 外,ratatui 写 cell 时直接 panic ——
+    /// 而 panic 会绕过终端恢复,把用户留在花屏里。
+    #[test]
+    fn draw_survives_tiny_terminals() {
+        for (w, h) in [(1, 1), (2, 1), (80, 1), (80, 2), (80, 3), (1, 40), (5, 5), (20, 8)] {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            let m = crate::app::test_support::tiny_model();
+            term.draw(|f| draw(f, &m))
+                .unwrap_or_else(|e| panic!("{w}x{h} 渲染失败: {e}"));
+        }
+    }
+
+    /// 折行后的高度必须按渲染行算,否则贴底偏移会算少、最新输出划不到。
+    #[test]
+    fn wrapped_height_counts_render_rows() {
+        let lines = vec![Line::raw("abcdefghij")]; // 10 列宽
+        assert_eq!(wrapped_height(&lines, 10), 1);
+        assert_eq!(wrapped_height(&lines, 5), 2);
+        assert_eq!(wrapped_height(&lines, 3), 4);
+        // 空行也占一行
+        assert_eq!(wrapped_height(&[Line::raw("")], 10), 1);
+        // 中文按 2 列算
+        assert_eq!(wrapped_height(&[Line::raw("中文")], 2), 2);
+    }
 }

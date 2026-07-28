@@ -13,6 +13,8 @@ pub struct RunSpec {
     pub name: String,
     /// 这一轮属于哪个议题(Issue::id),原样回投给 AgentDone
     pub issue: u64,
+    /// 派活时的团队代号,原样回投给 AgentDone
+    pub gen: u64,
     pub backend: BackendKind,
     pub model: Option<String>,
     /// 注入到子进程的环境变量(来自 .teamfly/env.toml,全队共享)
@@ -22,40 +24,76 @@ pub struct RunSpec {
     pub work_dir: PathBuf,
 }
 
+/// 重试前追加给 agent 的提醒。上一次尝试已经动过工具(可能改了文件、跑过命令),
+/// 把同一个 prompt 原样再跑一遍会重复副作用(重复改动、重复 commit),
+/// 所以必须先让它自己核对现状。
+const RETRY_NOTE: &str = "\n\n[系统提醒] 上一次尝试中途失败了,而且当时你已经动过工具(读写文件或跑命令),\
+工作区可能已被部分修改。请先核对当前实际状态(比如 git status / git diff、读一遍相关文件),\
+在已完成的部分之上继续,不要从零重做,更不要重复提交。";
+
 /// 起一个 agent 干一轮活。流式把每行 raw 通过 tx 回投,结束回投 AgentDone。
 /// 本函数应在 tokio task 中调用。失败自动重试(应对中转站 429/5xx 等瞬时错误)。
 /// `cancel` 用于外部取消(用户按 Ctrl+C 或退出),收到后 kill 子进程且不再重试。
 pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<Msg>) {
     let name = spec.name.clone();
     let issue = spec.issue;
+    let gen = spec.gen;
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
+    // 之前的尝试有没有动过工具 —— 决定重试时要不要带上核对提醒
+    let mut touched_tools = false;
 
     for attempt in 1..=MAX_ATTEMPTS {
         if cancel.is_cancelled() {
             let _ = tx.send(Msg::AgentDone {
                 name,
                 issue,
+                gen,
                 full_output: String::new(),
                 ok: false,
                 err: Some(crate::model::CANCELLED.into()),
             });
             return;
         }
+        // 重试且上次动过工具:prompt 里补一段「先核对现状」的提醒
+        let effective_input = if attempt > 1 && touched_tools {
+            format!("{}{}", spec.user_input, RETRY_NOTE)
+        } else {
+            spec.user_input.clone()
+        };
+        let mut used_tools_this_attempt = false;
         let result = match spec.backend {
             BackendKind::Claude => {
-                run_process(&spec, &tx, claude_cmd(&spec), crate::stream::StreamFmt::Claude, &cancel).await
+                run_process(
+                    &spec,
+                    &tx,
+                    claude_cmd(&spec, &effective_input),
+                    crate::stream::StreamFmt::Claude,
+                    &cancel,
+                    &mut used_tools_this_attempt,
+                )
+                .await
             }
             BackendKind::Codex => {
-                run_process(&spec, &tx, codex_cmd(&spec), crate::stream::StreamFmt::Codex, &cancel).await
+                run_process(
+                    &spec,
+                    &tx,
+                    codex_cmd(&spec, &effective_input),
+                    crate::stream::StreamFmt::Codex,
+                    &cancel,
+                    &mut used_tools_this_attempt,
+                )
+                .await
             }
         };
+        touched_tools |= used_tools_this_attempt;
 
         match result {
             Ok(full) => {
                 let _ = tx.send(Msg::AgentDone {
                     name,
                     issue,
+                    gen,
                     full_output: full,
                     ok: true,
                     err: None,
@@ -69,6 +107,7 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
                     let _ = tx.send(Msg::AgentDone {
                         name,
                         issue,
+                        gen,
                         full_output: String::new(),
                         ok: false,
                         err: Some(crate::model::CANCELLED.into()),
@@ -76,11 +115,14 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
                     return;
                 }
                 if attempt < MAX_ATTEMPTS {
-                    // 提示这次失败要重试,并退避
-                    let _ = tx.send(Msg::AgentStdout {
-                        name: name.clone(),
-                        line: format!("⟨err⟩ 第{attempt}次失败,重试中… {last_err}"),
-                    });
+                    // 提示这次失败要重试,并退避。动过工具时明说重试会带核对提醒,
+                    // 因为这时候的重跑不是「白跑一遍」,用户有权知道。
+                    let hint = if touched_tools {
+                        format!("⟨err⟩ 第{attempt}次失败(已动过工具,重试会先让它核对现状):{last_err}")
+                    } else {
+                        format!("⟨err⟩ 第{attempt}次失败,重试中… {last_err}")
+                    };
+                    let _ = tx.send(Msg::AgentStdout { name: name.clone(), line: hint });
                     tokio::time::sleep(std::time::Duration::from_millis(600 * attempt as u64)).await;
                 } else {
                     // 最后一次也失败,打印后走下面的掉线
@@ -93,18 +135,25 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
         }
     }
 
-    // 重试用尽,报掉线
+    // 重试用尽,报掉线。动过工具就明说工作区可能已被改过 ——
+    // 以前只说「掉线」,用户根本不知道仓库已经被动了。
+    let tail = if touched_tools {
+        ";期间它动过工具,工作区可能已被部分修改,建议 git status 看一眼"
+    } else {
+        ""
+    };
     let _ = tx.send(Msg::AgentDone {
         name,
         issue,
+        gen,
         full_output: String::new(),
         ok: false,
-        err: Some(format!("重试 {MAX_ATTEMPTS} 次仍失败:{last_err}")),
+        err: Some(format!("重试 {MAX_ATTEMPTS} 次仍失败:{last_err}{tail}")),
     });
 }
 
 /// 构造 claude CLI 命令(headless stream-json + bypass 权限 + 禁反问 + 追加系统 prompt)。
-fn claude_cmd(spec: &RunSpec) -> ProcSpec {
+fn claude_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
     let mut args = vec![
         "--print".to_string(),
         "--output-format".to_string(),
@@ -124,7 +173,7 @@ fn claude_cmd(spec: &RunSpec) -> ProcSpec {
         args.push(mcp);
         args.push("--strict-mcp-config".into());
     }
-    args.push(spec.user_input.clone());
+    args.push(user_input.to_string());
     ProcSpec {
         bin: "claude".into(),
         args,
@@ -149,9 +198,9 @@ fn resolve_mcp_config(work_dir: &std::path::Path) -> Option<String> {
 }
 
 /// 构造 codex CLI 非交互命令(JSONL 事件流 + 跳过 git/sandbox 检查)。
-fn codex_cmd(spec: &RunSpec) -> ProcSpec {
+fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
     // codex 无「追加系统 prompt」的稳定 flag,把系统 prompt 前置进输入。
-    let combined = format!("{}\n\n{}", spec.system_prompt, spec.user_input);
+    let combined = format!("{}\n\n{}", spec.system_prompt, user_input);
     let args = vec![
         "exec".to_string(),
         "--json".to_string(),                              // JSONL 事件流
@@ -177,6 +226,8 @@ async fn run_process(
     proc: ProcSpec,
     fmt: crate::stream::StreamFmt,
     cancel: &CancellationToken,
+    // 出参:这一轮 agent 有没有动过工具(决定重试要不要带核对提醒)
+    used_tools: &mut bool,
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new(&proc.bin);
     cmd.args(&proc.args)
@@ -234,6 +285,9 @@ async fn run_process(
                         if let Some(t) = outcome.text_delta {
                             full.push_str(&t);
                             full.push('\n');
+                        }
+                        if outcome.tool_used {
+                            *used_tools = true;
                         }
                         if let Some(w) = outcome.warn {
                             last_warn = Some(w);
