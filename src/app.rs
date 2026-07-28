@@ -98,10 +98,15 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 return vec![];
             }
             KeyCode::Char('n') => {
-                // 进入「新建议题」输入模式
-                m.input_mode = InputMode::NewIssue;
+                // 直接建一个新议题,名字自动递增,并切过去
+                let name = next_issue_name(&m.issues);
+                m.issues.push(Issue::new(name.clone()));
+                m.current_issue = m.issues.len() - 1;
+                m.selection = Selection::Chat;
+                m.scroll = 0;
                 m.input.clear();
-                m.status_hint = Some("输入议题名,⏎ 创建 · Esc 取消".into());
+                m.input_mode = InputMode::Chat;
+                m.status_hint = Some(format!("已建议题:{name}"));
                 return vec![];
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -364,6 +369,18 @@ fn now_ts() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
+/// 生成一个未占用的议题名:议题2、议题3…(默认议题算 1 号)。
+pub fn next_issue_name(issues: &[Issue]) -> String {
+    let existing: std::collections::HashSet<&str> = issues.iter().map(|i| i.name.as_str()).collect();
+    for n in 2.. {
+        let candidate = format!("议题{n}");
+        if !existing.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
 /// 根据当前输入,算出 @ 补全建议(正在输入的最后一个 @token)。
 /// 返回匹配的成员名列表;无 @ 或已是完整名则为空。
 pub fn at_suggestions(input: &str, roster: &[String]) -> Vec<String> {
@@ -613,54 +630,36 @@ mod e2e {
     }
 
     #[test]
-    fn new_issue_flow_creates_and_switches() {
+    fn ctrl_n_creates_and_switches_immediately() {
         let mut m = min_model();
         assert_eq!(m.issues.len(), 1);
-        // Ctrl+N 进入新建模式
         ctrl(&mut m, 'n');
-        assert_eq!(m.input_mode, InputMode::NewIssue);
-        // 输入名字
-        for c in "修支付bug".chars() { key(&mut m, KeyCode::Char(c)); }
-        assert_eq!(m.input, "修支付bug");
-        // 回车创建
-        key(&mut m, KeyCode::Enter);
+        // 无输入直接建 + 切,input_mode 保持 Chat
         assert_eq!(m.input_mode, InputMode::Chat);
         assert_eq!(m.issues.len(), 2);
-        assert_eq!(m.issues[1].name, "修支付bug");
-        assert_eq!(m.current_issue, 1); // 切到新议题
+        assert_eq!(m.issues[1].name, "议题2");
+        assert_eq!(m.current_issue, 1);
         assert!(m.input.is_empty());
     }
 
     #[test]
-    fn new_issue_duplicate_switches_not_creates() {
+    fn ctrl_n_repeated_generates_unique_names() {
         let mut m = min_model();
-        // 用 issue "i"(min_model 默认)
         ctrl(&mut m, 'n');
-        for c in "i".chars() { key(&mut m, KeyCode::Char(c)); }
-        key(&mut m, KeyCode::Enter);
-        assert_eq!(m.issues.len(), 1); // 未新增,已存在
-        assert_eq!(m.current_issue, 0);
+        ctrl(&mut m, 'n');
+        ctrl(&mut m, 'n');
+        let names: Vec<&str> = m.issues.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["i", "议题2", "议题3", "议题4"]);
+        assert_eq!(m.current_issue, 3);
     }
 
     #[test]
-    fn new_issue_esc_cancels() {
+    fn next_issue_name_skips_taken() {
         let mut m = min_model();
+        // 手动占用 议题2,再按 Ctrl+N 应给出 议题3
+        m.issues.push(Issue::new("议题2"));
         ctrl(&mut m, 'n');
-        for c in "abc".chars() { key(&mut m, KeyCode::Char(c)); }
-        key(&mut m, KeyCode::Esc);
-        assert_eq!(m.input_mode, InputMode::Chat);
-        assert!(m.input.is_empty());
-        assert_eq!(m.issues.len(), 1);
-    }
-
-    #[test]
-    fn new_issue_rejects_bad_chars() {
-        let mut m = min_model();
-        ctrl(&mut m, 'n');
-        for c in "a/b".chars() { key(&mut m, KeyCode::Char(c)); }
-        key(&mut m, KeyCode::Enter);
-        // 拒绝创建,但 submit 完成后 input_mode 会重置为 Chat(见校验分支)
-        assert_eq!(m.issues.len(), 1);
+        assert_eq!(m.issues.last().unwrap().name, "议题3");
     }
 
     fn member(name: &str, backend: BackendKind, role: &str) -> Member {
