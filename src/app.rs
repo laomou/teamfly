@@ -251,6 +251,13 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
     }
     m.input.clear();
 
+    // 斜杠命令:/init 展开成消息,/team 直接切队
+    if m.input_mode == InputMode::Chat {
+        if let Some(slash) = crate::slash::parse(&text) {
+            return handle_slash(m, slash);
+        }
+    }
+
     // 新建议题模式:创建议题并切过去,不进时间线
     if m.input_mode == InputMode::NewIssue {
         m.input_mode = InputMode::Chat;
@@ -435,6 +442,7 @@ fn now_ts() -> String {
 }
 
 /// 生成一个未占用的议题名:议题2、议题3…(默认议题算 1 号)。
+/// 生成一个未占用的议题名:议题2、议题3…(默认议题算 1 号)。
 pub fn next_issue_name(issues: &[Issue]) -> String {
     let existing: std::collections::HashSet<&str> = issues.iter().map(|i| i.name.as_str()).collect();
     for n in 2.. {
@@ -450,6 +458,44 @@ pub fn next_issue_name(issues: &[Issue]) -> String {
 fn set_hint(m: &mut Model, text: impl Into<String>, secs: u64) {
     m.status_hint = Some(text.into());
     m.status_hint_until = m.tick.wrapping_add(secs * 7); // 150ms/tick × 7 ≈ 1050ms
+}
+
+/// 处理斜杠命令。macro 展开成消息走正常派活流程;命令类直接改状态。
+fn handle_slash(m: &mut Model, slash: crate::slash::Slash) -> Vec<Command> {
+    use crate::slash::Slash;
+    match slash {
+        Slash::Macro { expanded } => {
+            // 展开成消息:塞进 input,重新调 submit_input 走标准流程
+            m.input = expanded;
+            submit_input(m)
+        }
+        Slash::SwitchTeam { name } => {
+            let teams_dir = m.teamfly_dir.join("teams");
+            let team_dir = teams_dir.join(&name);
+            if !team_dir.is_dir() {
+                set_hint(m, format!("找不到团队「{name}」;查 {}", teams_dir.display()), 5);
+                return vec![];
+            }
+            let team = match crate::team::load_team(&team_dir) {
+                Ok(t) => t,
+                Err(e) => {
+                    set_hint(m, format!("加载团队「{name}」失败:{e}"), 8);
+                    return vec![];
+                }
+            };
+            let count = team.members.len();
+            m.team_name = team.name;
+            m.members = team.members; // 旧成员的 raw/inbox 直接丢
+            m.selection = Selection::Chat;
+            m.scroll = 0;
+            set_hint(m, format!("已切到「{}」团队({count} 人)", m.team_name), 5);
+            vec![]
+        }
+        Slash::Unknown { text } => {
+            set_hint(m, format!("未知斜杠命令:{text}(试试 /init / /team <名>)"), 5);
+            vec![]
+        }
+    }
 }
 
 /// 点击顶部 tab 栏:命中某个议题 tab → 切;命中 [+ 新议题] → 建;命中其它 → 静默。

@@ -69,7 +69,7 @@ pub fn load(teamfly_dir: &Path) -> Result<AgentEnv> {
     let mut env = AgentEnv::default();
     // 用户级:不存在则播种模板
     if let Some(user_path) = user_env_path() {
-        seed_user_template(&user_path).ok(); // seed 失败不致命
+        seed_user_env(&user_path).ok(); // seed 失败不致命
         if user_path.exists() {
             merge_into(&mut env, &user_path)?;
         }
@@ -83,15 +83,21 @@ pub fn load(teamfly_dir: &Path) -> Result<AgentEnv> {
 }
 
 /// 用户级 env.toml 路径:~/.teamfly/env.toml
-fn user_env_path() -> Option<std::path::PathBuf> {
+pub fn user_env_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(std::path::PathBuf::from(home).join(".teamfly").join("env.toml"))
 }
 
-/// 若用户级 env.toml 不存在,创建一个带注释的模板(全注释,不会实际注入任何 env)。
-fn seed_user_template(path: &Path) -> Result<()> {
+/// 用户级 mcp.json 路径:~/.teamfly/mcp.json
+pub fn user_mcp_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".teamfly").join("mcp.json"))
+}
+
+/// 若用户级 env.toml 不存在,创建一个带注释的模板。返回是否新建。
+pub fn seed_user_env(path: &Path) -> Result<bool> {
     if path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -116,8 +122,23 @@ fn seed_user_template(path: &Path) -> Result<()> {
 # ANTHROPIC_AUTH_TOKEN = "${ANTHROPIC_AUTH_TOKEN}"
 "#;
     std::fs::write(path, tmpl)
-        .with_context(|| format!("写入模板 {}", path.display()))?;
-    Ok(())
+        .with_context(|| format!("写入 {}", path.display()))?;
+    Ok(true)
+}
+
+/// 若用户级 mcp.json 不存在,创建一个空的 mcpServers 骨架。返回是否新建。
+pub fn seed_user_mcp(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // 只写空 mcpServers,新加 server 时把配置塞进这个对象即可
+    let tmpl = "{\n  \"mcpServers\": {}\n}\n";
+    std::fs::write(path, tmpl)
+        .with_context(|| format!("写入 {}", path.display()))?;
+    Ok(true)
 }
 
 /// 把一个 env.toml 文件的内容合并进 env(同名 key 覆盖)。
