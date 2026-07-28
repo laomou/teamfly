@@ -360,7 +360,7 @@ fn draw_input(f: &mut Frame, area: Rect, m: &Model) {
 
 fn draw_hints(f: &mut Frame, area: Rect, m: &Model) {
     let hint = m.status_hint.clone().unwrap_or_else(|| {
-        "^N 新议题 · ^W 关议题 · ^1-9 切议题 · ↑↓ 选左栏 · ⏎ 发送/看TA · ^C 退出".to_string()
+        "^N 新议题 · ^W 关议题 · ^1-9 切议题 · ↑↓ 选成员 · ⏎ 发送 · ^C 退出".to_string()
     });
     f.render_widget(
         Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
