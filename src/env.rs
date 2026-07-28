@@ -1,4 +1,8 @@
-//! .teamfly/env.toml —— agent 环境变量,注入到 agent 子进程。
+//! env.toml —— agent 环境变量,注入到 agent 子进程。
+//!
+//! 两级加载(后覆盖前):
+//!   1. 用户级 `~/.teamfly/env.toml` —— API key 等全局默认放这里,一次配好多项目共用
+//!   2. 项目级 `<工作目录>/.teamfly/env.toml` —— 覆盖用户级同名 key,项目特定的东西放这里
 //!
 //! 格式:
 //! ```toml
@@ -11,9 +15,6 @@
 //!
 //! [codex]                      # 只注入 codex backend
 //! OPENAI_API_KEY = "${MY_CODEX_KEY}"
-//!
-//! [api]                        # 只注入 api backend(agentfly 自跑 Anthropic)
-//! ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 //! ```
 //!
 //! 合并:全局 + 该 backend 段。同名 key 以 backend 段为准。
@@ -58,27 +59,51 @@ impl AgentEnv {
     }
 }
 
-/// 加载 .teamfly/env.toml。文件不存在返回空 AgentEnv。
+/// 加载 env.toml。合并顺序:
+///   1. 用户级 `~/.teamfly/env.toml`
+///   2. 项目级 `<工作目录>/.teamfly/env.toml`  ← 同名 key 覆盖用户级
+/// 两者都可选,都没有 = 空。
 pub fn load(teamfly_dir: &Path) -> Result<AgentEnv> {
-    let path = teamfly_dir.join("env.toml");
-    if !path.exists() {
-        return Ok(AgentEnv::default());
+    let mut env = AgentEnv::default();
+    // 用户级
+    if let Some(user_path) = user_env_path() {
+        if user_path.exists() {
+            merge_into(&mut env, &user_path)?;
+        }
     }
-    let content = std::fs::read_to_string(&path)
+    // 项目级(覆盖用户级)
+    let project_path = teamfly_dir.join("env.toml");
+    if project_path.exists() {
+        merge_into(&mut env, &project_path)?;
+    }
+    Ok(env)
+}
+
+/// 用户级 env.toml 路径:~/.teamfly/env.toml
+fn user_env_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".teamfly").join("env.toml"))
+}
+
+/// 把一个 env.toml 文件的内容合并进 env(同名 key 覆盖)。
+fn merge_into(env: &mut AgentEnv, path: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取 {}", path.display()))?;
     let table: toml::Table = toml::from_str(&content)
         .with_context(|| format!("解析 {}", path.display()))?;
 
-    let mut env = AgentEnv::default();
     for (k, v) in table {
         // backend 段
         if SECTION_KEYS.contains(&k.as_str()) {
             if let toml::Value::Table(sub) = v {
-                let m = table_to_map(sub);
-                match k.as_str() {
-                    "claude" => env.claude = m,
-                    "codex" => env.codex = m,
-                    _ => {}
+                for (kk, vv) in sub {
+                    if let Some(s) = scalar_to_string(vv) {
+                        match k.as_str() {
+                            "claude" => { env.claude.insert(kk, expand(&s)); }
+                            "codex" => { env.codex.insert(kk, expand(&s)); }
+                            _ => {}
+                        }
+                    }
                 }
             }
             continue;
@@ -88,17 +113,7 @@ pub fn load(teamfly_dir: &Path) -> Result<AgentEnv> {
             env.global.insert(k, expand(&s));
         }
     }
-    Ok(env)
-}
-
-fn table_to_map(t: toml::Table) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for (k, v) in t {
-        if let Some(s) = scalar_to_string(v) {
-            out.insert(k, expand(&s));
-        }
-    }
-    out
+    Ok(())
 }
 
 fn scalar_to_string(v: toml::Value) -> Option<String> {
