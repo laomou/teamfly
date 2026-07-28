@@ -107,7 +107,12 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 m.input.clear();
                 m.input_mode = InputMode::Chat;
                 m.status_hint = Some(format!("已建议题:{name}"));
+                m.pending_delete = None;
                 return vec![];
+            }
+            KeyCode::Char('w') => {
+                // 关闭当前议题(有内容需二次确认)
+                return handle_close_issue(m);
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 let n = c.to_digit(10).unwrap() as usize;
@@ -381,6 +386,51 @@ pub fn next_issue_name(issues: &[Issue]) -> String {
     unreachable!()
 }
 
+/// pending_delete 的确认窗口(tick 数,一 tick ≈ 150ms,33 tick ≈ 5s)。
+const DELETE_CONFIRM_TICKS: u64 = 33;
+
+/// Ctrl+W:关闭当前议题。空议题一键关;有内容先提示确认,窗口期内再按才真删。
+fn handle_close_issue(m: &mut Model) -> Vec<Command> {
+    if m.issues.len() <= 1 {
+        m.status_hint = Some("至少要留一个议题,不能关".into());
+        return vec![];
+    }
+    let idx = m.current_issue;
+    let has_content = !m.issues[idx].timeline.is_empty();
+
+    if has_content {
+        // 二次确认逻辑
+        match m.pending_delete {
+            Some((pidx, t0)) if pidx == idx && m.tick.wrapping_sub(t0) < DELETE_CONFIRM_TICKS => {
+                // 窗口期内再按,真删
+                m.pending_delete = None;
+            }
+            _ => {
+                // 首次或超窗:登记 pending,提示
+                let n = m.issues[idx].timeline.len();
+                m.pending_delete = Some((idx, m.tick));
+                m.status_hint = Some(format!(
+                    "议题「{}」有 {n} 条消息;再按 ^W 确认删除(5s 内)",
+                    m.issues[idx].name
+                ));
+                return vec![];
+            }
+        }
+    }
+
+    // 真删:从 Model 移除 + 删 jsonl
+    let removed = m.issues.remove(idx);
+    m.pending_delete = None;
+    // 调整 current_issue
+    if m.current_issue >= m.issues.len() {
+        m.current_issue = m.issues.len() - 1;
+    }
+    m.selection = Selection::Chat;
+    m.scroll = 0;
+    m.status_hint = Some(format!("已关闭议题:{}", removed.name));
+    vec![Command::DeleteIssueFile { issue: removed.name }]
+}
+
 /// 根据当前输入,算出 @ 补全建议(正在输入的最后一个 @token)。
 /// 返回匹配的成员名列表;无 @ 或已是完整名则为空。
 pub fn at_suggestions(input: &str, roster: &[String]) -> Vec<String> {
@@ -408,6 +458,10 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
         Command::PersistChat { issue, msg } => {
             let dir = model.teamfly_dir.clone();
             let _ = crate::issue::append_chat(&dir, &issue, &msg);
+        }
+        Command::DeleteIssueFile { issue } => {
+            let dir = model.teamfly_dir.clone();
+            let _ = crate::issue::delete_file(&dir, &issue);
         }
         Command::SpawnAgent {
             name,
@@ -579,6 +633,7 @@ mod e2e {
             should_quit: false,
             max_chain_depth: 12,
             status_hint: None,
+            pending_delete: None,
         }
     }
 
@@ -660,6 +715,61 @@ mod e2e {
         m.issues.push(Issue::new("议题2"));
         ctrl(&mut m, 'n');
         assert_eq!(m.issues.last().unwrap().name, "议题3");
+    }
+
+    #[test]
+    fn ctrl_w_refuses_when_only_one() {
+        let mut m = min_model();
+        assert_eq!(m.issues.len(), 1);
+        ctrl(&mut m, 'w');
+        assert_eq!(m.issues.len(), 1); // 拒绝
+        assert!(m.status_hint.as_ref().unwrap().contains("至少"));
+    }
+
+    #[test]
+    fn ctrl_w_closes_empty_issue_immediately() {
+        let mut m = min_model();
+        ctrl(&mut m, 'n'); // 建 议题2(空)
+        assert_eq!(m.issues.len(), 2);
+        assert_eq!(m.current_issue, 1);
+        ctrl(&mut m, 'w'); // 空议题直接关
+        assert_eq!(m.issues.len(), 1);
+        assert_eq!(m.current_issue, 0);
+    }
+
+    #[test]
+    fn ctrl_w_needs_double_press_when_content() {
+        let mut m = min_model();
+        ctrl(&mut m, 'n'); // 建议题2
+        // 塞一条消息
+        m.issues[1].timeline.push(ChatMsg {
+            ts: "t".into(), author: "我".into(), text: "x".into(), is_system: false,
+        });
+        // 第一次:提示确认
+        let cmds = update(&mut m, Msg::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+        assert!(cmds.is_empty());
+        assert_eq!(m.issues.len(), 2); // 未删
+        assert!(m.pending_delete.is_some());
+        assert!(m.status_hint.as_ref().unwrap().contains("再按"));
+        // 第二次:真删,返回 DeleteIssueFile Command
+        let cmds = update(&mut m, Msg::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+        assert_eq!(m.issues.len(), 1);
+        assert!(matches!(cmds.first(), Some(Command::DeleteIssueFile { .. })));
+    }
+
+    #[test]
+    fn ctrl_w_pending_expires() {
+        let mut m = min_model();
+        ctrl(&mut m, 'n');
+        m.issues[1].timeline.push(ChatMsg {
+            ts: "t".into(), author: "我".into(), text: "x".into(), is_system: false,
+        });
+        ctrl(&mut m, 'w'); // 首次 → pending
+        // 时间流逝
+        m.tick = m.tick.wrapping_add(100);
+        ctrl(&mut m, 'w'); // 超窗,视为再次首次,又只提示
+        assert_eq!(m.issues.len(), 2); // 未删
+        assert!(m.pending_delete.is_some());
     }
 
     fn member(name: &str, backend: BackendKind, role: &str) -> Member {
