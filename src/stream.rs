@@ -48,7 +48,11 @@ fn parse_json(line: &str) -> Result<serde_json::Value, StreamOutcome> {
     }
 }
 
-/// claude CLI 的 stream-json:system(init) / assistant(text+tool_use) / result。
+/// claude CLI 的 stream-json:
+///   system(init)                        — 会话头
+///   assistant(text / thinking / tool_use)
+///   user(tool_result)                   — 工具执行结果是用一条 user 消息回投的,不在 assistant 里
+///   result                              — 整轮结束
 fn classify_claude(line: &str) -> StreamOutcome {
     let v = match parse_json(line) {
         Ok(v) => v,
@@ -57,7 +61,8 @@ fn classify_claude(line: &str) -> StreamOutcome {
     let mut out = StreamOutcome::default();
     match v.get("type").and_then(|t| t.as_str()) {
         Some("system") => {
-            // 只显示 init;thinking_tokens 等其它 system 子类型忽略(否则刷屏)
+            // 只显示 init。thinking_tokens 是每几十毫秒一发的累计计数器(一轮几十条,
+            // 且只有 estimated_tokens 没有文本),显示就是刷屏;思考文本走 assistant/thinking。
             if v.get("subtype").and_then(|s| s.as_str()) == Some("init") {
                 let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("?");
                 let ntools = v.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
@@ -83,11 +88,42 @@ fn classify_claude(line: &str) -> StreamOutcome {
                             let hint = tool_input_hint(blk.get("input"));
                             out.display.push(format!("🔧 {name}({hint})"));
                         }
+                        // extended thinking 的中间推理:只展示,不进 text_delta
+                        //(它不是给队友看的回复正文,混进 full 会污染汇报)
+                        Some("thinking") => {
+                            if let Some(t) = blk.get("thinking").and_then(|t| t.as_str()) {
+                                for ln in t.lines() {
+                                    let ln = ln.trim_end();
+                                    if !ln.is_empty() {
+                                        out.display.push(format!("💭 {ln}"));
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
                 if !delta.is_empty() {
                     out.text_delta = Some(delta.trim_end().to_string());
+                }
+            }
+        }
+        Some("user") => {
+            // 工具执行结果。user 消息里的 text 块是喂进去的 prompt,不回显。
+            if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) {
+                for blk in content {
+                    if blk.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                        continue;
+                    }
+                    let body = tool_result_text(blk.get("content"));
+                    let summary = summarize(&body, TOOL_RESULT_MAX);
+                    if blk.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false) {
+                        // 失败时错误文本也在 content 里,没有单独的 error 字段
+                        let msg = if summary.is_empty() { "执行失败".to_string() } else { summary };
+                        out.display.push(format!("❌ {msg}"));
+                    } else if !summary.is_empty() {
+                        out.display.push(format!("📋 {summary}"));
+                    }
                 }
             }
         }
@@ -190,6 +226,47 @@ pub fn tool_input_hint(input: Option<&serde_json::Value>) -> String {
     String::new()
 }
 
+/// tool_result 摘要保留的最大字符数。
+const TOOL_RESULT_MAX: usize = 200;
+
+/// tool_result 的 content:可能是字符串,也可能是内容块数组(取里面的 text 块,图片等跳过)。
+fn tool_result_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(blocks)) => {
+            let mut buf = String::new();
+            for b in blocks {
+                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    if !buf.is_empty() {
+                        buf.push(' ');
+                    }
+                    buf.push_str(t);
+                }
+            }
+            buf
+        }
+        _ => String::new(),
+    }
+}
+
+/// 压成单行(空白折叠)再截断到 max 字符,超长补 …。
+/// 折成单行是必须的:一条 display 就是 raw 视图里的一行,内嵌换行会把渲染搞乱。
+fn summarize(s: &str, max: usize) -> String {
+    let mut one = String::new();
+    for w in s.split_whitespace() {
+        if !one.is_empty() {
+            one.push(' ');
+        }
+        one.push_str(w);
+    }
+    if one.chars().count() <= max {
+        return one;
+    }
+    let mut r: String = one.chars().take(max).collect();
+    r.push('…');
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,9 +283,58 @@ mod tests {
 
     #[test]
     fn claude_system_thinking_tokens_ignored() {
-        let line = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":8}"#;
+        // 真机形状:纯计数器,一轮发几十条,没有文本 —— 显示就是刷屏
+        let line = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":8,"estimated_tokens_delta":3}"#;
         let o = classify(StreamFmt::Claude, line);
         assert!(o.display.is_empty());
+    }
+
+    #[test]
+    fn claude_assistant_thinking_block_shown_but_not_in_delta() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"先看 auth.py\n\n再补空指针检查"}]}}"#;
+        let o = classify(StreamFmt::Claude, line);
+        assert_eq!(o.display, vec!["💭 先看 auth.py", "💭 再补空指针检查"]);
+        // 思考不是回复正文,不能进 full
+        assert!(o.text_delta.is_none());
+    }
+
+    #[test]
+    fn claude_tool_result_comes_from_user_message() {
+        // 真机形状:tool_result 挂在 type=user 上,不在 assistant 里
+        let line = r#"{"type":"user","message":{"content":[{"tool_use_id":"t1","type":"tool_result","content":"1\t[package]\n2\tname = \"teamfly\"\n"}]}}"#;
+        let o = classify(StreamFmt::Claude, line);
+        assert_eq!(o.display, vec![r#"📋 1 [package] 2 name = "teamfly""#]);
+    }
+
+    #[test]
+    fn claude_tool_result_content_array() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"3 passed"},{"type":"image"}]}]}}"#;
+        let o = classify(StreamFmt::Claude, line);
+        assert_eq!(o.display, vec!["📋 3 passed"]);
+    }
+
+    #[test]
+    fn claude_tool_result_error() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"File does not exist.","is_error":true}]}}"#;
+        let o = classify(StreamFmt::Claude, line);
+        assert_eq!(o.display, vec!["❌ File does not exist."]);
+    }
+
+    #[test]
+    fn claude_user_prompt_text_not_echoed() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"text","text":"帮我改 auth.py"}]}}"#;
+        let o = classify(StreamFmt::Claude, line);
+        assert!(o.display.is_empty());
+    }
+
+    #[test]
+    fn summarize_flattens_and_truncates() {
+        // 摘要必须是单行:内嵌换行会把 raw 视图渲染搞乱
+        assert_eq!(summarize("a\nb  c\t\nd", 100), "a b c d");
+        let long = "x".repeat(250);
+        let s = summarize(&long, TOOL_RESULT_MAX);
+        assert_eq!(s.chars().count(), TOOL_RESULT_MAX + 1);
+        assert!(s.ends_with('…') && !s.contains('\n'));
     }
 
     #[test]

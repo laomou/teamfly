@@ -396,6 +396,15 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
             (Style::default().fg(Color::Red), "  ")
         } else if l.starts_with("🔧") {
             (Style::default().fg(Color::Cyan), "  ")
+        } else if l.starts_with("📋") {
+            // 工具结果:挂在工具调用下面,再缩一层 + 灰色弱化
+            (Style::default().fg(Color::DarkGray), "    ")
+        } else if l.starts_with("❌") {
+            // 工具执行失败
+            (Style::default().fg(Color::Red), "    ")
+        } else if l.starts_with("💭") {
+            // 思考链:黄色 + dim,和回复正文拉开
+            (Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM), "  ")
         } else {
             (Style::default().fg(Color::Gray), "  ")
         };
