@@ -51,6 +51,12 @@ pub async fn run(spec: RunSpec, tx: UnboundedSender<Msg>) {
                         line: format!("⟨err⟩ 第{attempt}次失败,重试中… {last_err}"),
                     });
                     tokio::time::sleep(std::time::Duration::from_millis(600 * attempt as u64)).await;
+                } else {
+                    // 最后一次也失败,打印后走下面的掉线
+                    let _ = tx.send(Msg::AgentStdout {
+                        name: name.clone(),
+                        line: format!("⟨err⟩ 第{attempt}次失败(已达上限):{last_err}"),
+                    });
                 }
             }
         }
