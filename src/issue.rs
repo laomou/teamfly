@@ -29,6 +29,15 @@ pub fn append_chat(teamfly_dir: &Path, issue_name: &str, msg: &ChatMsg) -> Resul
     Ok(())
 }
 
+/// 删除议题的落盘文件(关闭议题时);文件不存在视为成功。
+pub fn delete_file(teamfly_dir: &Path, issue_name: &str) -> Result<()> {
+    let path = issue_path(teamfly_dir, issue_name);
+    if path.exists() {
+        std::fs::remove_file(&path).with_context(|| format!("删除 {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// 从盘上重放所有 issue(重开恢复 tab 与时间线)。
 pub fn load_all_issues(teamfly_dir: &Path) -> Result<Vec<Issue>> {
     let dir = issues_dir(teamfly_dir);

@@ -138,6 +138,8 @@ pub struct Model {
     pub max_chain_depth: u32,
     /// 状态提示行（临时消息，如「已暂停」）
     pub status_hint: Option<String>,
+    /// 待删除议题的确认状态:(议题索引, 按下时的 tick)。5s(约 33 tick)内再按 Ctrl+W 才真删。
+    pub pending_delete: Option<(usize, u64)>,
 }
 
 impl Model {
@@ -194,4 +196,6 @@ pub enum Command {
     },
     /// 把一条群聊消息追加落盘
     PersistChat { issue: String, msg: ChatMsg },
+    /// 删除议题的落盘文件 .teamfly/issues/<名>.jsonl(关闭议题时)
+    DeleteIssueFile { issue: String },
 }

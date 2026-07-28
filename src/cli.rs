@@ -68,6 +68,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, 
         should_quit: false,
         max_chain_depth: 12,
         status_hint: None,
+        pending_delete: None,
     };
 
     Ok((model, warns))
