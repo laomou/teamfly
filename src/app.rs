@@ -97,6 +97,13 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 m.status_hint = Some("已恢复".into());
                 return vec![];
             }
+            KeyCode::Char('n') => {
+                // 进入「新建议题」输入模式
+                m.input_mode = InputMode::NewIssue;
+                m.input.clear();
+                m.status_hint = Some("输入议题名,⏎ 创建 · Esc 取消".into());
+                return vec![];
+            }
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 let n = c.to_digit(10).unwrap() as usize;
                 if n >= 1 && n <= m.issues.len() {
@@ -112,8 +119,15 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
 
     match k.code {
         KeyCode::Esc => {
-            m.selection = Selection::Chat;
-            m.scroll = 0;
+            if m.input_mode == InputMode::NewIssue {
+                // 取消新建议题
+                m.input_mode = InputMode::Chat;
+                m.input.clear();
+                m.status_hint = Some("已取消新建议题".into());
+            } else {
+                m.selection = Selection::Chat;
+                m.scroll = 0;
+            }
         }
         KeyCode::Up => {
             move_selection(m, -1);
@@ -180,6 +194,33 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
         return vec![];
     }
     m.input.clear();
+
+    // 新建议题模式:创建议题并切过去,不进时间线
+    if m.input_mode == InputMode::NewIssue {
+        m.input_mode = InputMode::Chat;
+        // 校验:非空、不重名、名字里不含分隔/路径字符(用于落盘 <名>.jsonl)
+        if text.contains('/') || text.contains('\\') || text.contains('.') {
+            m.status_hint = Some(format!("议题名不能含 / \\ .:{text}"));
+            return vec![];
+        }
+        if m.issues.iter().any(|i| i.name == text) {
+            // 已存在,直接切过去
+            if let Some(idx) = m.issues.iter().position(|i| i.name == text) {
+                m.current_issue = idx;
+                m.selection = Selection::Chat;
+                m.scroll = 0;
+                m.status_hint = Some(format!("议题「{text}」已存在,切过去"));
+            }
+            return vec![];
+        }
+        // 新建
+        m.issues.push(Issue::new(text.clone()));
+        m.current_issue = m.issues.len() - 1;
+        m.selection = Selection::Chat;
+        m.scroll = 0;
+        m.status_hint = Some(format!("已建议题:{text}"));
+        return vec![];
+    }
 
     let mut cmds = Vec::new();
     let issue_name = m.cur_issue().name.clone();
@@ -514,6 +555,7 @@ mod e2e {
             issues: vec![Issue::new("i")],
             current_issue: 0,
             selection: Selection::Chat,
+            input_mode: InputMode::Chat,
             input: String::new(),
             scroll: 0,
             tick: 0,
@@ -568,6 +610,57 @@ mod e2e {
         assert!(at_suggestions("@老K 继续", &roster).is_empty());
         // 无 @ 不提示
         assert!(at_suggestions("普通留言", &roster).is_empty());
+    }
+
+    #[test]
+    fn new_issue_flow_creates_and_switches() {
+        let mut m = min_model();
+        assert_eq!(m.issues.len(), 1);
+        // Ctrl+N 进入新建模式
+        ctrl(&mut m, 'n');
+        assert_eq!(m.input_mode, InputMode::NewIssue);
+        // 输入名字
+        for c in "修支付bug".chars() { key(&mut m, KeyCode::Char(c)); }
+        assert_eq!(m.input, "修支付bug");
+        // 回车创建
+        key(&mut m, KeyCode::Enter);
+        assert_eq!(m.input_mode, InputMode::Chat);
+        assert_eq!(m.issues.len(), 2);
+        assert_eq!(m.issues[1].name, "修支付bug");
+        assert_eq!(m.current_issue, 1); // 切到新议题
+        assert!(m.input.is_empty());
+    }
+
+    #[test]
+    fn new_issue_duplicate_switches_not_creates() {
+        let mut m = min_model();
+        // 用 issue "i"(min_model 默认)
+        ctrl(&mut m, 'n');
+        for c in "i".chars() { key(&mut m, KeyCode::Char(c)); }
+        key(&mut m, KeyCode::Enter);
+        assert_eq!(m.issues.len(), 1); // 未新增,已存在
+        assert_eq!(m.current_issue, 0);
+    }
+
+    #[test]
+    fn new_issue_esc_cancels() {
+        let mut m = min_model();
+        ctrl(&mut m, 'n');
+        for c in "abc".chars() { key(&mut m, KeyCode::Char(c)); }
+        key(&mut m, KeyCode::Esc);
+        assert_eq!(m.input_mode, InputMode::Chat);
+        assert!(m.input.is_empty());
+        assert_eq!(m.issues.len(), 1);
+    }
+
+    #[test]
+    fn new_issue_rejects_bad_chars() {
+        let mut m = min_model();
+        ctrl(&mut m, 'n');
+        for c in "a/b".chars() { key(&mut m, KeyCode::Char(c)); }
+        key(&mut m, KeyCode::Enter);
+        // 拒绝创建,但 submit 完成后 input_mode 会重置为 Chat(见校验分支)
+        assert_eq!(m.issues.len(), 1);
     }
 
     fn member(name: &str, backend: BackendKind, role: &str) -> Member {
