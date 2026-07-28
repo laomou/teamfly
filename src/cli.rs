@@ -44,12 +44,36 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, 
     // 团队来源优先级:--team > 唯一/default 团队
     let team_dir = resolve_team_dir(team_arg, &teamfly_dir)?;
     let team = team::load_team(&team_dir)?;
-    let warns = team::preflight(&team);
+    let mut warns = team::preflight(&team);
+    // env.toml 里未展开的 ${VAR}
+    for name in &agent_env.unresolved {
+        warns.push(format!("env.toml 里 ${{{name}}} 未定义,将按字面量传给 agent"));
+    }
 
     // 恢复落盘的议题;没有则建一个默认议题
     let mut issues = crate::issue::load_all_issues(&teamfly_dir)?;
-    if issues.is_empty() {
+    let fresh_start = issues.is_empty();
+    if fresh_start {
         issues.push(Issue::new("默认议题"));
+    }
+
+    // 首次开箱:塞一条欢迎消息进默认议题(不落盘,仅当前会话)
+    if fresh_start {
+        let member_hints: Vec<String> = team
+            .members
+            .iter()
+            .map(|m| format!("@{}", m.name))
+            .collect();
+        let welcome = format!(
+            "欢迎!输入框打字发言,带 @名字 才会派活。 成员:{} · 按 ? 看帮助",
+            member_hints.join(" · ")
+        );
+        issues[0].timeline.push(crate::model::ChatMsg {
+            ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            author: "系统".into(),
+            text: welcome,
+            is_system: true,
+        });
     }
 
     let model = Model {
@@ -68,7 +92,9 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<PathBuf>) -> Result<(Model, 
         should_quit: false,
         max_chain_depth: 12,
         status_hint: None,
+        status_hint_until: 0,
         pending_delete: None,
+        show_help: false,
     };
 
     Ok((model, warns))

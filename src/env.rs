@@ -33,6 +33,8 @@ pub struct AgentEnv {
     global: HashMap<String, String>,
     claude: HashMap<String, String>,
     codex: HashMap<String, String>,
+    /// 未在当前进程环境里展开的 ${VAR} / $VAR 名字集合(供预检 warn)。
+    pub unresolved: Vec<String>,
 }
 
 impl AgentEnv {
@@ -55,7 +57,7 @@ impl AgentEnv {
         claude: HashMap<String, String>,
         codex: HashMap<String, String>,
     ) -> Self {
-        AgentEnv { global, claude, codex }
+        AgentEnv { global, claude, codex, unresolved: Vec::new() }
     }
 }
 
@@ -98,9 +100,10 @@ fn merge_into(env: &mut AgentEnv, path: &Path) -> Result<()> {
             if let toml::Value::Table(sub) = v {
                 for (kk, vv) in sub {
                     if let Some(s) = scalar_to_string(vv) {
+                        let expanded = expand(&s, &mut env.unresolved);
                         match k.as_str() {
-                            "claude" => { env.claude.insert(kk, expand(&s)); }
-                            "codex" => { env.codex.insert(kk, expand(&s)); }
+                            "claude" => { env.claude.insert(kk, expanded); }
+                            "codex" => { env.codex.insert(kk, expanded); }
                             _ => {}
                         }
                     }
@@ -110,7 +113,8 @@ fn merge_into(env: &mut AgentEnv, path: &Path) -> Result<()> {
         }
         // 顶层标量 = 全局
         if let Some(s) = scalar_to_string(v) {
-            env.global.insert(k, expand(&s));
+            let expanded = expand(&s, &mut env.unresolved);
+            env.global.insert(k, expanded);
         }
     }
     Ok(())
@@ -125,8 +129,8 @@ fn scalar_to_string(v: toml::Value) -> Option<String> {
     }
 }
 
-/// 展开 `$VAR` 和 `${VAR}` 为当前进程环境变量的值(未定义则保留原样)。
-fn expand(s: &str) -> String {
+/// 展开 `$VAR` 和 `${VAR}` 为当前进程环境变量的值(未定义则保留原样,并记入 unresolved)。
+fn expand(s: &str, unresolved: &mut Vec<String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -147,6 +151,9 @@ fn expand(s: &str) -> String {
             match std::env::var(&name) {
                 Ok(v) => out.push_str(&v),
                 Err(_) => {
+                    if !name.is_empty() && !unresolved.contains(&name) {
+                        unresolved.push(name.clone());
+                    }
                     out.push_str("${");
                     out.push_str(&name);
                     out.push('}');
@@ -169,6 +176,9 @@ fn expand(s: &str) -> String {
                 match std::env::var(&name) {
                     Ok(v) => out.push_str(&v),
                     Err(_) => {
+                        if !unresolved.contains(&name) {
+                            unresolved.push(name.clone());
+                        }
                         out.push('$');
                         out.push_str(&name);
                     }
@@ -186,27 +196,27 @@ mod tests {
     #[test]
     fn expand_braces() {
         std::env::set_var("TF_TEST_A", "hello");
-        assert_eq!(expand("${TF_TEST_A}-world"), "hello-world");
+        assert_eq!(expand("${TF_TEST_A}-world", &mut Vec::new()), "hello-world");
         std::env::remove_var("TF_TEST_A");
     }
 
     #[test]
     fn expand_bare() {
         std::env::set_var("TF_TEST_B", "yo");
-        assert_eq!(expand("prefix-$TF_TEST_B/x"), "prefix-yo/x");
+        assert_eq!(expand("prefix-$TF_TEST_B/x", &mut Vec::new()), "prefix-yo/x");
         std::env::remove_var("TF_TEST_B");
     }
 
     #[test]
     fn expand_missing_kept() {
         std::env::remove_var("TF_ABSENT_XYZ");
-        assert_eq!(expand("${TF_ABSENT_XYZ}!"), "${TF_ABSENT_XYZ}!");
-        assert_eq!(expand("$TF_ABSENT_XYZ!"), "$TF_ABSENT_XYZ!");
+        assert_eq!(expand("${TF_ABSENT_XYZ}!", &mut Vec::new()), "${TF_ABSENT_XYZ}!");
+        assert_eq!(expand("$TF_ABSENT_XYZ!", &mut Vec::new()), "$TF_ABSENT_XYZ!");
     }
 
     #[test]
     fn expand_literal_dollar() {
-        assert_eq!(expand("cost $5"), "cost $5"); // $后跟数字,不当变量
+        assert_eq!(expand("cost $5", &mut Vec::new()), "cost $5"); // $后跟数字,不当变量
     }
 
     fn m(pairs: &[(&str, &str)]) -> HashMap<String, String> {
