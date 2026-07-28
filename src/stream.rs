@@ -22,6 +22,10 @@ pub struct StreamOutcome {
     pub result: Option<String>,
     /// 错误内容(非空则整轮失败)
     pub error: Option<String>,
+    /// 工具执行结果摘要(如 Read 读到的内容, Bash 的输出)
+    pub tool_results: Vec<String>,
+    /// 思考链文本(extended thinking 中间推理过程)
+    pub thinking_tokens: Vec<String>,
 }
 
 /// 按格式分类一行。
@@ -48,7 +52,7 @@ fn parse_json(line: &str) -> Result<serde_json::Value, StreamOutcome> {
     }
 }
 
-/// claude CLI 的 stream-json:system(init) / assistant(text+tool_use) / result。
+/// claude CLI 的 stream-json:system(init/thinking_tokens) / assistant(text+tool_use+tool_result) / result。
 fn classify_claude(line: &str) -> StreamOutcome {
     let v = match parse_json(line) {
         Ok(v) => v,
@@ -57,11 +61,28 @@ fn classify_claude(line: &str) -> StreamOutcome {
     let mut out = StreamOutcome::default();
     match v.get("type").and_then(|t| t.as_str()) {
         Some("system") => {
-            // 只显示 init;thinking_tokens 等其它 system 子类型忽略(否则刷屏)
-            if v.get("subtype").and_then(|s| s.as_str()) == Some("init") {
-                let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("?");
-                let ntools = v.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
-                out.display.push(format!("⟨init⟩ model={model} tools={ntools}"));
+            match v.get("subtype").and_then(|s| s.as_str()) {
+                Some("init") => {
+                    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("?");
+                    let ntools = v.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
+                    out.display.push(format!("⟨init⟩ model={model} tools={ntools}"));
+                }
+                Some("thinking_tokens") => {
+                    // 捕获思考链信息
+                    if let Some(tokens) = v.get("estimated_tokens").and_then(|t| t.as_u64()) {
+                        out.display.push(format!("💭 思考中... ({tokens} tokens)"));
+                    }
+                    // 如果有 thinking 文本(部分 thinking 模式下会有),捕获为思考链
+                    if let Some(text) = v.get("thinking").and_then(|t| t.as_str()) {
+                        for line in text.lines() {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                out.thinking_tokens.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         Some("assistant") => {
@@ -82,6 +103,22 @@ fn classify_claude(line: &str) -> StreamOutcome {
                             let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                             let hint = tool_input_hint(blk.get("input"));
                             out.display.push(format!("🔧 {name}({hint})"));
+                        }
+                        Some("tool_result") => {
+                            // 工具执行结果:展示摘要
+                            if let Some(content) = blk.get("content").and_then(|c| c.as_str()) {
+                                let summary = truncate(content, 200);
+                                let line = format!("  📋 {summary}");
+                                out.display.push(line.clone());
+                                out.tool_results.push(summary);
+                            } else if let Some(error) = blk.get("is_error").and_then(|e| e.as_bool()) {
+                                if error {
+                                    let err_msg = blk.get("error").and_then(|e| e.as_str()).unwrap_or("执行失败");
+                                    let line = format!("  ❌ {err_msg}");
+                                    out.display.push(line);
+                                    out.tool_results.push(format!("❌ {err_msg}"));
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -190,6 +227,17 @@ pub fn tool_input_hint(input: Option<&serde_json::Value>) -> String {
     String::new()
 }
 
+/// 截断字符串到指定字符数,末尾加 …。
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut r: String = s.chars().take(max).collect();
+        r.push('…');
+        r
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,10 +253,19 @@ mod tests {
     }
 
     #[test]
-    fn claude_system_thinking_tokens_ignored() {
-        let line = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":8}"#;
+    fn claude_system_thinking_tokens() {
+        let line = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":8,"thinking":"逐步分析\nauth.py 中\n缺少空指针检查"}"#;
         let o = classify(StreamFmt::Claude, line);
-        assert!(o.display.is_empty());
+        assert_eq!(o.display, vec!["💭 思考中... (8 tokens)"]);
+        assert_eq!(o.thinking_tokens, vec!["逐步分析", "auth.py 中", "缺少空指针检查"]);
+    }
+
+    #[test]
+    fn claude_tool_result_shows_summary() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_result","content":"def login():\n    pass\n"}]}}"#;
+        let o = classify(StreamFmt::Claude, line);
+        assert!(o.display.iter().any(|d| d.contains("📋")));
+        assert_eq!(o.tool_results.len(), 1);
     }
 
     #[test]

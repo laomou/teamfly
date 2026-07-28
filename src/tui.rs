@@ -380,6 +380,7 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
     let mem = &m.members[idx];
     let mut lines: Vec<Line> = Vec::new();
     let mut seen_init = false;
+    let mut thinking_expanded = false; // 简单:首次进入 thinking 模式时展开,退出后折叠
     for l in &mem.raw {
         // 每轮以 ⟨init⟩ 开头:新一轮前插一条空行 + 分隔,和上一轮拉开
         if l.starts_with("⟨init⟩") {
@@ -393,10 +394,36 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
             ));
             continue;
         }
+        // 思考链行:黄色折叠展示
+        if l.starts_with("💭 思考中") {
+            lines.push(Line::styled(
+                l,
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+            thinking_expanded = true;
+            continue;
+        }
+        // 思考链具体内容:灰色,缩进
+        if thinking_expanded && l.starts_with("  💭") {
+            lines.push(Line::styled(
+                l,
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+            ));
+            continue;
+        }
+        // 退出思考链模式(遇到非 thinking 行)
+        thinking_expanded = false;
+
         let (style, prefix) = if l.starts_with("⟨err⟩") {
             (Style::default().fg(Color::Red), "  ")
         } else if l.starts_with("🔧") {
             (Style::default().fg(Color::Cyan), "  ")
+        } else if l.starts_with("  📋") {
+            // 工具结果:灰色,缩进
+            (Style::default().fg(Color::DarkGray), "")
+        } else if l.starts_with("  ❌") {
+            // 工具执行错误:红色
+            (Style::default().fg(Color::Red), "")
         } else {
             (Style::default().fg(Color::Gray), "  ")
         };
