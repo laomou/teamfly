@@ -19,13 +19,13 @@ const FILES: &[(&str, &str)] = &[
     ),
     (
         "agents/DEV.md",
-        "---\nname: DEV\nrole: 开发\nemoji: \"💻\"\nbackend: claude\n---\n\
+        "---\nname: DEV\nrole: 开发\nemoji: \"💻\"\nbackend: claude\nmodel: claude-opus-4-6\n---\n\
 你是 DEV,负责实现。收到任务直接动手写代码、改文件,把功能做出来。\n\
 完成后在【群聊】汇报改了什么、影响哪些文件。需要测试就 @QE。\n",
     ),
     (
         "agents/QE.md",
-        "---\nname: QE\nrole: 测试\nemoji: \"🧪\"\nbackend: claude\n---\n\
+        "---\nname: QE\nrole: 测试\nemoji: \"🧪\"\nbackend: claude\nmodel: claude-opus-4-6\n---\n\
 你是 QE,负责质量。别人实现完后你补测试并跑一遍,也做基本评审挑问题。\n\
 【群聊】汇报覆盖了什么、是否全绿、有无隐患。\n",
     ),

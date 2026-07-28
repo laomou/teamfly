@@ -12,8 +12,6 @@ pub struct RunSpec {
     pub name: String,
     pub backend: BackendKind,
     pub model: Option<String>,
-    /// per-agent MCP 配置文件路径(仅 claude backend 使用)
-    pub mcp_config: Option<String>,
     /// 注入到子进程的环境变量(来自 .teamfly/env.toml,全队共享)
     pub env: std::collections::HashMap<String, String>,
     pub system_prompt: String,
@@ -85,15 +83,33 @@ fn claude_cmd(spec: &RunSpec) -> ProcSpec {
         args.push("--model".into());
         args.push(m.clone());
     }
-    if let Some(mcp) = &spec.mcp_config {
+    // MCP 两级 fallback:项目级 <work_dir>/.teamfly/mcp.json > 用户级 ~/.teamfly/mcp.json
+    if let Some(mcp) = resolve_mcp_config(&spec.work_dir) {
         args.push("--mcp-config".into());
-        args.push(mcp.clone());
+        args.push(mcp);
         args.push("--strict-mcp-config".into());
     }
     args.push(spec.user_input.clone());
     ProcSpec {
         bin: "claude".into(),
         args,
+    }
+}
+
+/// MCP 配置文件:项目级优先,回退到用户级。都不存在返回 None。
+fn resolve_mcp_config(work_dir: &std::path::Path) -> Option<String> {
+    // 项目级
+    let proj = work_dir.join(".teamfly").join("mcp.json");
+    if proj.is_file() {
+        return Some(proj.to_string_lossy().into_owned());
+    }
+    // 用户级
+    let home = std::env::var_os("HOME")?;
+    let user = std::path::PathBuf::from(home).join(".teamfly").join("mcp.json");
+    if user.is_file() {
+        Some(user.to_string_lossy().into_owned())
+    } else {
+        None
     }
 }
 
