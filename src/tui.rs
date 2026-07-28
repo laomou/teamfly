@@ -453,6 +453,16 @@ fn draw_input(f: &mut Frame, area: Rect, m: &Model) {
 }
 
 fn draw_hints(f: &mut Frame, area: Rect, m: &Model) {
+    // 帮助浮层打开时,提示关闭方式
+    if m.show_help {
+        let hint = "「? / Esc 关闭帮助」 · 按其它键自动关闭并继续操作";
+        f.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
+
     // pending_delete 未过期时,动态显示剩余秒(覆盖普通 hint)
     let dynamic_pending: Option<String> = m.pending_delete.and_then(|(idx, t0)| {
         const WINDOW: u64 = 33; // 与 handle_close_issue 中一致
