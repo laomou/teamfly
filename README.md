@@ -1,62 +1,83 @@
 # teamfly
 
-终端里的 AI 团队协作台 —— **你是我,agent 是群友**。在一个全屏群聊界面里发目标、`@` 圈人,看群友放养式自动干活。
+终端里的 AI 团队协作台 —— **你带一支队,agent 是队员**。在全屏界面里发目标、`@` 圈人,看队员放养式自动干活。
 
-> 甩一句目标 → 群友全自动开干 → 你在群聊/单人视图里看进展、随时可 `@` 插手,但从不被拦。
+> 甩一句目标 → 队员全自动开干 → 你在总览/单人视图里看进展、随时可 `@` 插手,但从不被拦。
 
 ## 快速开始
 
 ```bash
 cargo build --release
-./target/release/teamfly work [工作目录] --team <团队文件夹>
-# 缺省工作目录 = 当前目录;缺省团队 = ./teams/后端队
-```
 
-例:
+# 一次性配置全局凭证(交互输入 BASE_URL / KEY,写 ~/.teamfly/env.toml)
+./target/release/teamfly init
 
-```bash
-./target/release/teamfly work ./sample --team ./teams/后端队
+# 在工作目录里开干(缺省用内置 default 队:DEV + QE)
+./target/release/teamfly work [工作目录] [--team <团队名>]
 ```
 
 进入后:
 
-- 在底部输入框打字。**带 `@名字` 才会派活**(如 `@老K 重构登录模块`);不带 `@` 只是留言。
-- `↑↓` 或鼠标点击左栏:`# 群聊`(全员时间线)/ 某个成员(看他 backend 进程的原始输出流)。
-- `Esc` 回群聊 · `^1`~`^9` 切议题 · `Ctrl+P` 解除防乒乓暂停 · `Ctrl+C` 退出。
+- 底部输入框打字。**带 `@名字` 才会派活**(如 `@DEV 加个登录功能`);不带 `@` 只是留言。
+- `↑↓`(或鼠标点左栏)在 `# 总览`(全员时间线)/ 某个成员(看他进程的原始输出流)间切。
+- `?` 帮助 · `^N` 新议题 · `^W` 关议题 · `Alt+1-9` 切议题 · `Esc` 回总览 · `^C` 退出。
+- 斜杠命令:`/team <名>` 热切当前议题的团队。
 
 ## 团队 = 磁盘文件夹
 
-无造队命令,团队就是一个文件夹,改文件即自定义:
+无造队命令,团队就是 `.teamfly/teams/<名>/` 下的一个文件夹,改文件即自定义:
 
 ```
-后端队/
-├─ team.md          # 群名 + 全员公共规矩 + 项目背景(拼进每个 agent)
+default/
+├─ team.md            # 队名 + 全员规矩 + 团队职责 + 任务流转(拼进每个 agent)
 └─ agents/
-   ├─ 老K.md         # frontmatter(name/role/backend/model/provider) + 人设正文
-   ├─ 阿码.md
-   ├─ 小盾.md
-   └─ 阿测.md
+   ├─ DEV.md          # frontmatter(name/role/emoji/backend/model) + 人设正文
+   └─ QE.md
 ```
 
-`backend` 三选一(静态写死):
+- **agent md** 只写单一职责(我是谁、做什么);**team.md** 写团队职责和任务流转(谁完成后交给谁),改流程只改一处。
+- `backend` 二选一:`claude`(claude CLI,stream-json)/ `codex`(codex CLI,JSONL)。
+- `model` 可选;不写则由 env.toml 的 `ANTHROPIC_MODEL` 或继承环境决定。
+- 内置 `default` 队(DEV/QE)首次运行自动播种到工作目录的 `.teamfly/teams/default/`。
 
-- `claude` / `codex` — 起对应 CLI(headless,凭证透传环境;带跳过权限 flag)
-- `api` — teamfly 自跑 Anthropic 原生 loop(端点/key 走 `.teamfly/providers.toml` 或 `~/.teamfly/providers.toml`)
-- `mock` — 无凭证的确定性后端,供测试/演示
+## 配置(env.toml / mcp.json)
+
+两级,**不合并**——项目级存在就只用项目级,否则用用户级:
+
+| 文件 | 用户级 | 项目级 |
+|---|---|---|
+| `env.toml` | `~/.teamfly/env.toml` | `<工作目录>/.teamfly/env.toml` |
+| `mcp.json` | `~/.teamfly/mcp.json` | `<工作目录>/.teamfly/mcp.json` |
+
+`env.toml` 按 backend 分段,值支持 `${VAR}` 引用 shell 环境变量:
+
+```toml
+[claude]
+ANTHROPIC_BASE_URL   = "https://api.anthropic.com"
+ANTHROPIC_AUTH_TOKEN = "${ANTHROPIC_AUTH_TOKEN}"
+ANTHROPIC_MODEL      = "claude-opus-4-6"
+
+[codex]
+OPENAI_API_KEY = "${OPENAI_API_KEY}"
+```
+
+模型优先级:**frontmatter `model:` > env.toml 的 `ANTHROPIC_MODEL` > 继承环境**。
 
 ## 工作机制
 
-- **每轮重起、无状态**:被 `@` 时起一个新进程,干完产出一句 `【群聊】…` 汇报就退。
+- **每轮重起、无状态**:被 `@` 时起一个新子进程,干完输出最终回复就退。
 - **只被 `@` 才干,干完即停**:默认静止,`@` 驱动。无人 `@` 则全体安静。
-- **群上下文**:精炼的群聊时间线一物两用——既是 UI,又作为「增量前情」喂给被唤醒的 agent。
-- **agent 互 `@`**:汇报里的 `@小盾` 会把消息投递给小盾进程,交接在群聊可见。忙时排队,不打断。防乒乓:`@` 连锁过深自动暂停。
-- **落盘**:每个议题的时间线追加到 `<工作目录>/.teamfly/issues/<名>.jsonl`,关掉重开自动恢复。
+- **汇报**:agent 一轮的最终回复(claude/codex 的 result)自动进总览;`@名字` 从中解析,投递给对应成员。
+- **上下文**:总览时间线一物两用——既是 UI,又作为「增量前情」喂给被唤醒的 agent。
+- **议题(tab)**:属于项目,落盘 `.teamfly/issues/<名>.jsonl`,关掉重开自动恢复。空议题不落盘。
+- **忙时被 @ → 排队**,不打断。防乒乓:`@` 连锁过深自动暂停(`^P` 恢复)。
+- **失败自动重试** 3 次(应对中转站 429/5xx),仍失败则作为系统消息掉线提示。
 
 ## 架构
 
 手写 TEA-like:单一 `Model` + `Msg` 枚举 + 集中 `update` + `view`。tokio 所有并发事件源汇成一条 `mpsc<Msg>`,主循环逐条喂 `update`,无锁无竞态。副作用由 `update` 返回 `Command`、runtime 执行后回投 `Msg`。
 
-模块:`cli` · `team` · `provider` · `backend` · `router` · `issue` · `tui` · `app` · `model`。
+模块:`cli` · `team` · `backend` · `stream` · `router` · `issue` · `env` · `builtin` · `slash` · `tui` · `app` · `model`。
 
 ## 测试
 
@@ -64,9 +85,10 @@ cargo build --release
 cargo test
 ```
 
-含单元测试(路由/汇报提取/剥 ANSI/增量前情)与两个端到端测试(通过真实 TEA 循环 + mock 后端驱动完整 `@` 级联与落盘/重放)。
+纯函数单测(汇报提炼/@ 解析/剥 ANSI/env 展开与分段/claude+codex 事件解析)+ 键盘操作与议题增删测试,共 45 项。
 
-## 已知边界(MVP)
+## 已知边界
 
 - 多 agent 并行改同一文件不做 git worktree 隔离(建议工作目录是 git 库)。
-- 不做:运行时增删成员、`@all`、同角色多开、右侧抽屉、拍板/权限审批。
+- 不做:运行时增删成员、`@all`、同角色多开。
+- 内置团队文件是 UTF-8 无 BOM;用编辑器改 agent md 时保持 UTF-8,别存成 GBK。
