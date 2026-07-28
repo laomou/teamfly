@@ -34,8 +34,6 @@ impl AgentState {
 pub enum BackendKind {
     Claude,
     Codex,
-    Api,
-    Mock, // 测试用：不需要凭证，回显+套路化产出
 }
 
 /// 花名册里的一个群友（静态定义 + 运行时状态）。
@@ -113,8 +111,8 @@ pub struct Model {
     pub team_name: String,
     pub work_dir: std::path::PathBuf,
     pub teamfly_dir: std::path::PathBuf,
-    /// 全队共享的环境变量,注入到每个 agent 子进程(来自 .teamfly/env.toml)
-    pub agent_env: std::collections::HashMap<String, String>,
+    /// agent 环境变量集合(全局 + 按 backend 分段;来自 .teamfly/env.toml)
+    pub agent_env: crate::env::AgentEnv,
     pub members: Vec<Member>,
     pub issues: Vec<Issue>,
     pub current_issue: usize,

@@ -1,5 +1,5 @@
 //! backend 驱动:无状态每轮重起。喂 (system_prompt, user_input) → 流式产出 raw 行 → 结束汇总。
-//! claude/codex 走子进程 headless;api 走 Anthropic 原生 HTTP;mock 供无凭证测试。
+//! 只支持 claude(stream-json)与 codex(纯文本)两个子进程 backend。
 
 use crate::model::{BackendKind, Msg};
 use crate::router::strip_ansi;
@@ -32,8 +32,6 @@ pub async fn run(spec: RunSpec, tx: UnboundedSender<Msg>) {
         let result = match spec.backend {
             BackendKind::Claude => run_process(&spec, &tx, claude_cmd(&spec), true).await,
             BackendKind::Codex => run_process(&spec, &tx, codex_cmd(&spec), false).await,
-            BackendKind::Api => run_api(&spec, &tx).await,
-            BackendKind::Mock => run_mock(&spec, &tx).await,
         };
 
         match result {
@@ -331,102 +329,6 @@ fn push_tail(tail: &mut Vec<String>, line: &str) {
     while tail.len() > 8 {
         tail.remove(0);
     }
-}
-
-/// api backend:Anthropic 原生 messages API(非流式,MVP 一次拿回)。
-/// base_url / key 优先看 spec.env(.teamfly/env.toml),再看进程环境变量。
-async fn run_api(spec: &RunSpec, tx: &UnboundedSender<Msg>) -> anyhow::Result<String> {
-    let lookup = |k: &str| -> Option<String> {
-        spec.env.get(k).cloned().or_else(|| std::env::var(k).ok())
-    };
-    let base = lookup("ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-    let key = lookup("ANTHROPIC_API_KEY")
-        .or_else(|| lookup("ANTHROPIC_AUTH_TOKEN"))
-        .ok_or_else(|| anyhow::anyhow!("api backend 缺 API key(在 .teamfly/env.toml 或环境变量里设 ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN)"))?;
-    let model = spec
-        .model
-        .clone()
-        .unwrap_or_else(|| "claude-sonnet-4-5".to_string());
-
-    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "model": model,
-        "max_tokens": 2048,
-        "system": spec.system_prompt,
-        "messages": [{"role": "user", "content": spec.user_input}],
-    });
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .header("x-api-key", &key)
-        .header("authorization", format!("Bearer {key}"))
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("请求失败: {e}"))?;
-
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
-        anyhow::bail!("API {code}: {}", strip_ansi(&txt));
-    }
-    let v: serde_json::Value = resp.json().await?;
-    let text = v["content"]
-        .as_array()
-        .and_then(|arr| {
-            let mut s = String::new();
-            for blk in arr {
-                if let Some(t) = blk["text"].as_str() {
-                    s.push_str(t);
-                }
-            }
-            Some(s)
-        })
-        .unwrap_or_default();
-
-    for line in text.lines() {
-        let _ = tx.send(Msg::AgentStdout {
-            name: spec.name.clone(),
-            line: line.to_string(),
-        });
-    }
-    Ok(text)
-}
-
-/// mock backend:确定性产出,无需凭证。用于端到端/CI。
-/// 老K 会拆活并 @阿码;其余人回一句完成。
-async fn run_mock(spec: &RunSpec, tx: &UnboundedSender<Msg>) -> anyhow::Result<String> {
-    let steps: Vec<String> = if spec.name.contains('K') || spec.system_prompt.contains("架构") {
-        vec![
-            format!("[{}] 收到目标,分析中…", spec.name),
-            "读了一下项目结构".to_string(),
-            "【群聊】拆成两块:实现与测试。@阿码 你接实现,完成后 @阿测 补测试".to_string(),
-        ]
-    } else if spec.name.contains("测") {
-        vec![
-            format!("[{}] 开始补测试", spec.name),
-            "【群聊】测试写完,全绿 ✓".to_string(),
-        ]
-    } else {
-        vec![
-            format!("[{}] 开始干活", spec.name),
-            "改了几个文件".to_string(),
-            format!("【群聊】{} 干完了 (+12 -3)", spec.name),
-        ]
-    };
-    for s in &steps {
-        // 轻微延时,模拟流式;用 tokio sleep(不依赖 Instant::now 之类被禁 API)
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        let _ = tx.send(Msg::AgentStdout {
-            name: spec.name.clone(),
-            line: s.clone(),
-        });
-    }
-    Ok(steps.join("\n"))
 }
 
 #[cfg(test)]

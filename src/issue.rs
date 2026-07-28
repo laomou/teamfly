@@ -103,7 +103,7 @@ mod tests {
             name: "小盾".into(),
             role: "安全".into(),
             emoji: "🛡".into(),
-            backend: BackendKind::Mock,
+            backend: BackendKind::Claude,
             model: None,
             mcp_config: None,
             system_prompt: String::new(),
