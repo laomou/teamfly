@@ -95,7 +95,7 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from(""),
         Line::from(vec![Span::styled("  其他", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
         Line::from("    ^P                解除防乒乓暂停"),
-        Line::from("    ^C                退出"),
+        Line::from("    ^C                有 agent 在跑时:取消它们;否则退出"),
     ];
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
@@ -512,7 +512,7 @@ fn draw_hints(f: &mut Frame, area: Rect, m: &Model) {
         }
     });
     let hint = dynamic_pending.or_else(|| m.status_hint.clone()).unwrap_or_else(|| {
-        "? 帮助 · ^N 新议题 · ^W 关议题 · Alt+1-9 切议题 · ⏎ 发送 · ^C 退出".to_string()
+        "? 帮助 · ^N 新议题 · ^W 关议题 · Alt+1-9 切议题 · ⏎ 发送 · ^C 取消/退出".to_string()
     });
     let color = if m.pending_delete.is_some() {
         Color::Yellow

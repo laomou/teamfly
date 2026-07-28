@@ -20,8 +20,12 @@ pub struct StreamOutcome {
     pub text_delta: Option<String>,
     /// 最终结果文本(整轮汇报)
     pub result: Option<String>,
-    /// 错误内容(非空则整轮失败)
+    /// **致命**错误内容(非空则整轮失败)
     pub error: Option<String>,
+    /// **瞬时/可恢复**错误(如 codex 的 "Reconnecting... 2/5")。
+    /// 只展示,不判整轮失败 —— 重连成功后这一轮照样能出结果。
+    /// 仅在整轮既无 result 又无正文时被当作兜底失败原因。
+    pub warn: Option<String>,
 }
 
 /// 按格式分类一行。
@@ -143,8 +147,10 @@ fn classify_claude(line: &str) -> StreamOutcome {
 
 /// codex CLI 的 --json JSONL:
 ///   thread.started / turn.started / turn.completed — 生命周期(基本忽略)
-///   item.completed {item:{type, text|message|...}} — 输出项
-///   error {message} — 错误
+///   turn.failed {error:{message}}                  — 整轮真失败
+///   item.completed {item:{type, text|message|...}} — 输出项(含 item.type=error)
+///   error {message}                                — **瞬时**错误,多为 "Reconnecting... 2/5",
+///                                                    重连成功后照常出结果,不能当整轮失败
 fn classify_codex(line: &str) -> StreamOutcome {
     let v = match parse_json(line) {
         Ok(v) => v,
@@ -157,6 +163,14 @@ fn classify_codex(line: &str) -> StreamOutcome {
         }
         Some("turn.started") | Some("turn.completed") => {
             // 生命周期,不展示
+        }
+        // 整轮失败的正式收尾事件(实测存在,字段是 error.message)
+        Some("turn.failed") => {
+            let msg = v
+                .pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(未知错误)");
+            out.error = Some(msg.to_string());
         }
         Some("item.completed") => {
             let item = v.get("item");
@@ -200,8 +214,12 @@ fn classify_codex(line: &str) -> StreamOutcome {
             }
         }
         Some("error") => {
+            // 瞬时错误:codex 网络抖动时会连发 "Reconnecting... 2/5 (...)",
+            // 重连成功后照常给出完整答案并以 turn.completed 收尾、退出码 0。
+            // 当成整轮失败会把已经拿到的结果丢掉并从零重跑,所以只展示不判失败。
             let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("(未知错误)");
-            out.error = Some(msg.to_string());
+            out.display.push(format!("⚠ {msg}"));
+            out.warn = Some(msg.to_string());
         }
         _ => {}
     }
@@ -407,9 +425,30 @@ mod tests {
     }
 
     #[test]
-    fn codex_error_event() {
-        let line = r#"{"type":"error","message":"401 Unauthorized"}"#;
+    fn codex_transient_error_is_warn_not_failure() {
+        // 真机形状:网络抖动时连发 Reconnecting,重连成功后照常出结果。
+        // 当成整轮失败会把已拿到的结果丢掉并从零重跑,所以只能是 warn。
+        let line = r#"{"type":"error","message":"Reconnecting... 2/5 (unexpected status 401)"}"#;
         let o = classify(StreamFmt::Codex, line);
-        assert_eq!(o.error.as_deref(), Some("401 Unauthorized"));
+        assert!(o.error.is_none());
+        assert_eq!(o.warn.as_deref(), Some("Reconnecting... 2/5 (unexpected status 401)"));
+        assert_eq!(o.display.len(), 1);
+        assert!(o.display[0].starts_with("⚠"));
+    }
+
+    #[test]
+    fn codex_turn_failed_is_real_failure() {
+        // turn.failed 才是整轮失败的正式收尾(实测存在,字段是 error.message)
+        let line = r#"{"type":"turn.failed","error":{"message":"context window exceeded"}}"#;
+        let o = classify(StreamFmt::Codex, line);
+        assert_eq!(o.error.as_deref(), Some("context window exceeded"));
+    }
+
+    #[test]
+    fn codex_item_error_is_real_failure() {
+        // item.completed 里的 error 项是真实存在的(抓包见过),不是死代码
+        let line = r#"{"type":"item.completed","item":{"id":"i1","type":"error","message":"stream disconnected"}}"#;
+        let o = classify(StreamFmt::Codex, line);
+        assert_eq!(o.error.as_deref(), Some("stream disconnected"));
     }
 }

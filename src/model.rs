@@ -47,8 +47,8 @@ pub struct Member {
     pub system_prompt: String, // team 公共 + 个人人设 拼装后的最终 prompt
     // 运行时
     pub state: AgentState,
-    /// 忙时被 @，进这个待办队列（原文投递内容）
-    pub inbox: VecDeque<String>,
+    /// 忙时/议题暂停时被 @，进这个待办队列
+    pub inbox: VecDeque<Assignment>,
     /// raw 输出流（环形缓冲，剥过 ANSI），供单人视图展示
     pub raw: VecDeque<String>,
     /// 该成员上次「活跃」时群聊时间线的长度，用于算增量前情
@@ -57,6 +57,10 @@ pub struct Member {
 
 pub const RAW_CAP: usize = 2000; // 单 agent raw 环形缓冲上限
 
+/// 用户主动取消时 AgentDone.err 的内容。用它区分「用户掐的」和「真掉线」,
+/// 两者在群聊里的措辞不一样。
+pub const CANCELLED: &str = "已取消";
+
 impl Member {
     pub fn push_raw(&mut self, line: String) {
         self.raw.push_back(line);
@@ -64,6 +68,15 @@ impl Member {
             self.raw.pop_front();
         }
     }
+}
+
+/// 一条待办派活。必须带 issue —— 排队期间用户可能切议题甚至关掉原议题，
+/// 出队时不能再看「当前选中的议题」。
+#[derive(Debug, Clone)]
+pub struct Assignment {
+    /// 这条派活属于哪个议题（Issue::id，不是索引也不是名字）
+    pub issue: u64,
+    pub text: String,
 }
 
 /// 群聊时间线里的一条消息。既是 UI，又是共享上下文。
@@ -79,6 +92,9 @@ pub struct ChatMsg {
 /// 一个议题（tab）。属于项目，各有独立时间线。
 #[derive(Debug, Clone)]
 pub struct Issue {
+    /// 进程内稳定唯一 id。索引会因增删议题而变、名字会被自动改名，
+    /// 所以在跑的 agent 只认这个 id。
+    pub id: u64,
     pub name: String,
     pub timeline: Vec<ChatMsg>,
     /// 本议题当前「一条我指令引发的 @ 连锁」轮数，用于防乒乓
@@ -87,9 +103,12 @@ pub struct Issue {
     pub paused: bool,
 }
 
+static NEXT_ISSUE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl Issue {
     pub fn new(name: impl Into<String>) -> Self {
         Issue {
+            id: NEXT_ISSUE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             name: name.into(),
             timeline: Vec::new(),
             chain_depth: 0,
@@ -143,6 +162,9 @@ pub struct Model {
     pub pending_delete: Option<(usize, u64)>,
     /// 是否显示帮助浮层(? 键切换)
     pub show_help: bool,
+    /// 取消令牌:Ctrl+C / 退出时用它掐掉所有在跑的 agent 子进程。
+    /// 取消后会立刻换一个新 token,否则之后新起的 agent 一生下来就是取消态。
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 impl Model {
@@ -151,6 +173,10 @@ impl Model {
     }
     pub fn cur_issue_mut(&mut self) -> &mut Issue {
         &mut self.issues[self.current_issue]
+    }
+    /// 按稳定 id 找议题下标。已被关闭则返回 None。
+    pub fn issue_index(&self, id: u64) -> Option<usize> {
+        self.issues.iter().position(|i| i.id == id)
     }
     pub fn member_index(&self, name: &str) -> Option<usize> {
         self.members.iter().position(|m| m.name == name)
@@ -177,6 +203,8 @@ pub enum Msg {
     /// 某 agent 一轮结束
     AgentDone {
         name: String,
+        /// 这一轮属于哪个议题(派活时绑定的 Issue::id)
+        issue: u64,
         /// 整轮 raw 汇总（用于兜底提取汇报）
         full_output: String,
         ok: bool,
@@ -192,6 +220,8 @@ pub enum Command {
     /// 起一个 agent 进程干活：喂 prompt（含增量前情），流式回 AgentStdout，结束回 AgentDone
     SpawnAgent {
         name: String,
+        /// 这一轮属于哪个议题(Issue::id)。结果回来时按它定位,不看「当前选中议题」
+        issue: u64,
         backend: BackendKind,
         model: Option<String>,
         env: std::collections::HashMap<String, String>,
