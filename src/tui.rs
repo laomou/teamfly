@@ -375,27 +375,48 @@ fn draw_timeline(f: &mut Frame, area: Rect, m: &Model) {
 fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
     let mem = &m.members[idx];
     let mut lines: Vec<Line> = Vec::new();
+    let mut seen_init = false;
     for l in &mem.raw {
-        let style = if l.starts_with("⟨err⟩") {
-            Style::default().fg(Color::Red)
+        // 每轮以 ⟨init⟩ 开头:新一轮前插一条空行 + 分隔,和上一轮拉开
+        if l.starts_with("⟨init⟩") {
+            if seen_init {
+                lines.push(Line::raw(""));
+            }
+            seen_init = true;
+            lines.push(Line::styled(
+                format!("── {l} ──"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            continue;
+        }
+        let (style, prefix) = if l.starts_with("⟨err⟩") {
+            (Style::default().fg(Color::Red), "  ")
+        } else if l.starts_with("🔧") {
+            (Style::default().fg(Color::Cyan), "  ")
         } else if l.contains(crate::router::CHAT_MARK) {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            (Style::default().fg(Color::Green).add_modifier(Modifier::BOLD), "  ")
         } else {
-            Style::default().fg(Color::Gray)
+            (Style::default().fg(Color::Gray), "  ")
         };
-        lines.push(Line::styled(l.clone(), style));
+        lines.push(Line::styled(format!("{prefix}{l}"), style));
     }
     // 正在思考/干活:加一行 spinner
     let frame = SPINNER[(m.tick as usize) % SPINNER.len()];
     match mem.state {
-        AgentState::Thinking => lines.push(Line::styled(
-            format!("💭 {} 思考中… {frame}", mem.name),
-            Style::default().fg(Color::Yellow),
-        )),
-        AgentState::Working => lines.push(Line::styled(
-            format!("⚙ {} 干活中… {frame}", mem.name),
-            Style::default().fg(Color::Green),
-        )),
+        AgentState::Thinking => {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                format!("💭 {} 思考中… {frame}", mem.name),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        AgentState::Working => {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                format!("⚙ {} 干活中… {frame}", mem.name),
+                Style::default().fg(Color::Green),
+            ));
+        }
         AgentState::Idle => {
             if lines.is_empty() {
                 lines.push(Line::styled(
