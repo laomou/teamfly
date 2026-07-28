@@ -77,7 +77,7 @@ fn draw_help_overlay(f: &mut Frame) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled("  发言", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
-        Line::from("    输入文字 + ⏎     发进群聊(不带 @ 只是留言)"),
+        Line::from("    输入文字 + ⏎     发到总览(不带 @ 只是留言)"),
         Line::from("    @名字 …           派活给该 agent(TAB 补全)"),
         Line::from("    Backspace / ^U    删字符 / 清空输入行"),
         Line::from(""),
@@ -86,8 +86,8 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from("    /team <名>        切当前议题的团队"),
         Line::from(""),
         Line::from(vec![Span::styled("  切换视图", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
-        Line::from("    ↑ ↓               选左栏(#群聊 / 各成员;选中即显示)"),
-        Line::from("    Esc               回 #群聊"),
+        Line::from("    ↑ ↓               选左栏(#总览 / 各成员;选中即显示)"),
+        Line::from("    Esc               回 #总览"),
         Line::from(""),
         Line::from(vec![Span::styled("  议题", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
         Line::from("    ^N                新建议题(自动命名,第一条消息决定名字)"),
@@ -142,6 +142,10 @@ fn draw_brand(f: &mut Frame, area: Rect, _m: &Model) {
         Span::styled(
             "teamfly",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::DarkGray),
         ),
     ]);
     f.render_widget(Paragraph::new(line), inner);
@@ -242,7 +246,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, m: &Model) {
 
     // # 群聊 入口
     let chat_selected = m.selection == Selection::Chat;
-    lines.push(sel_line("# 群聊", chat_selected, Color::White));
+    lines.push(sel_line("# 总览", chat_selected, Color::White));
 
     lines.push(Line::raw(""));
 
