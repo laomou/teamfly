@@ -6,6 +6,7 @@ mod env;
 mod issue;
 mod model;
 mod router;
+mod slash;
 mod team;
 mod tui;
 
