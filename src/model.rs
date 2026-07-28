@@ -2,6 +2,7 @@
 //! 纯数据 + 少量纯函数，无 I/O、无 await。
 
 use std::collections::VecDeque;
+use tokio_util::sync::CancellationToken;
 
 /// 群友（agent）的运行状态。无「等你」态（已砍拍板）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,10 +140,12 @@ pub struct Model {
     pub status_hint: Option<String>,
     /// 状态提示的过期 tick;超过后自动清除
     pub status_hint_until: u64,
-    /// 待删除议题的确认状态:(议题索引, 按下时的 tick)。5s(约 33 tick)内再按 Ctrl+W 才真删。
-    pub pending_delete: Option<(usize, u64)>,
+    /// 待删除议题的确认状态:(议题索引, 按下时的 Instant)。5s 内再按 Ctrl+W 才真删。
+    pub pending_delete: Option<(usize, std::time::Instant)>,
     /// 是否显示帮助浮层(? 键切换)
     pub show_help: bool,
+    /// 取消正在运行的 agent 的令牌(每个 SpawnAgent 获得一个派生 token)
+    pub cancel: CancellationToken,
 }
 
 impl Model {
@@ -202,4 +205,6 @@ pub enum Command {
     PersistChat { issue: String, msg: ChatMsg },
     /// 删除议题的落盘文件 .teamfly/issues/<名>.jsonl(关闭议题时)
     DeleteIssueFile { issue: String },
+    /// 取消所有正在运行的 agent
+    CancelAgents,
 }

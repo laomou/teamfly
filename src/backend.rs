@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 
 pub struct RunSpec {
     pub name: String,
@@ -21,15 +22,26 @@ pub struct RunSpec {
 
 /// 起一个 agent 干一轮活。流式把每行 raw 通过 tx 回投,结束回投 AgentDone。
 /// 本函数应在 tokio task 中调用。失败自动重试(应对中转站 429/5xx 等瞬时错误)。
-pub async fn run(spec: RunSpec, tx: UnboundedSender<Msg>) {
+/// `cancel` 用于外部取消(如用户按 Ctrl+C)。
+pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<Msg>) {
     let name = spec.name.clone();
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
 
     for attempt in 1..=MAX_ATTEMPTS {
+        // 检查是否被取消
+        if cancel.is_cancelled() {
+            let _ = tx.send(Msg::AgentDone {
+                name,
+                full_output: String::new(),
+                ok: false,
+                err: Some("用户取消".into()),
+            });
+            return;
+        }
         let result = match spec.backend {
-            BackendKind::Claude => run_process(&spec, &tx, claude_cmd(&spec), crate::stream::StreamFmt::Claude).await,
-            BackendKind::Codex => run_process(&spec, &tx, codex_cmd(&spec), crate::stream::StreamFmt::Codex).await,
+            BackendKind::Claude => run_process(&spec, &tx, claude_cmd(&spec), crate::stream::StreamFmt::Claude, &cancel).await,
+            BackendKind::Codex => run_process(&spec, &tx, codex_cmd(&spec), crate::stream::StreamFmt::Codex, &cancel).await,
         };
 
         match result {
@@ -144,6 +156,7 @@ async fn run_process(
     tx: &UnboundedSender<Msg>,
     proc: ProcSpec,
     fmt: crate::stream::StreamFmt,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new(&proc.bin);
     cmd.args(&proc.args)
@@ -172,15 +185,27 @@ async fn run_process(
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
-    let mut full = String::new();       // 累积 assistant 文本
-    let mut result_text: Option<String> = None; // 最终 result 文本
-    let mut stream_err: Option<String> = None;  // 流里的错误内容
-    let mut err_tail: Vec<String> = Vec::new(); // 保留最后几行 stderr 供报错
+    let mut full = String::new();
+    let mut result_text: Option<String> = None;
+    let mut stream_err: Option<String> = None;
+    let mut err_tail: Vec<String> = Vec::new();
     let mut out_reader = BufReader::new(stdout).lines();
     let mut err_reader = BufReader::new(stderr).lines();
 
+    // 先发一轮 init 标记,让 raw 视图能识别轮次(无论 claude/codex 都有效)
+    let _ = tx.send(Msg::AgentStdout {
+        name: spec.name.clone(),
+        line: "⟨init⟩ 新一轮".into(),
+    });
+
     loop {
         tokio::select! {
+            biased; // 优先检查取消
+            _ = cancel.cancelled() => {
+                // 取消:kill 子进程
+                let _ = child.kill().await;
+                anyhow::bail!("用户取消");
+            }
             line = out_reader.next_line() => {
                 match line? {
                     Some(l) => {
@@ -209,6 +234,11 @@ async fn run_process(
                     let _ = tx.send(Msg::AgentStdout { name: spec.name.clone(), line: format!("⟨err⟩ {clean}") });
                 }
             }
+        }
+        // 检查是否被取消(在 select 之后)
+        if cancel.is_cancelled() {
+            let _ = child.kill().await;
+            anyhow::bail!("用户取消");
         }
     }
     // 排空 stderr 剩余

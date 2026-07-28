@@ -19,6 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::Stdout;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio_util::sync::CancellationToken;
 
 /// 执行副作用的运行时环境(不含 Model,便于在借用 Model 的同时调用)。
 pub struct Runtime {
@@ -43,9 +44,9 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Command> {
             if m.status_hint.is_some() && m.tick >= m.status_hint_until {
                 m.status_hint = None;
             }
-            // pending_delete 窗口过期自动清
+            // pending_delete 窗口过期自动清(基于 Instant)
             if let Some((_, t0)) = m.pending_delete {
-                if m.tick.wrapping_sub(t0) >= 33 {
+                if t0.elapsed() >= std::time::Duration::from_secs(5) {
                     m.pending_delete = None;
                 }
             }
@@ -137,6 +138,13 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
             KeyCode::Char('c') => {
+                if m.working_count() > 0 {
+                    // 有 agent 在干活:取消所有 agent,不退出
+                    m.cancel = CancellationToken::new();
+                    m.status_hint = Some("已取消所有 agent".into());
+                    return vec![Command::CancelAgents];
+                }
+                // 无 agent 干活:直接退出
                 m.should_quit = true;
                 return vec![];
             }
@@ -607,8 +615,8 @@ fn derive_issue_name(first_msg: &str, issues: &[Issue], current: usize) -> Strin
     unreachable!()
 }
 
-/// pending_delete 的确认窗口(tick 数,一 tick ≈ 150ms,33 tick ≈ 5s)。
-const DELETE_CONFIRM_TICKS: u64 = 33;
+/// pending_delete 的确认窗口(秒)。
+const DELETE_CONFIRM_SECS: u64 = 5;
 
 /// Ctrl+W:关闭当前议题。空议题一键关;有内容先提示确认,窗口期内再按才真删。
 fn handle_close_issue(m: &mut Model) -> Vec<Command> {
@@ -622,14 +630,14 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     if has_content {
         // 二次确认逻辑
         match m.pending_delete {
-            Some((pidx, t0)) if pidx == idx && m.tick.wrapping_sub(t0) < DELETE_CONFIRM_TICKS => {
+            Some((pidx, t0)) if pidx == idx && t0.elapsed() < std::time::Duration::from_secs(DELETE_CONFIRM_SECS) => {
                 // 窗口期内再按,真删
                 m.pending_delete = None;
             }
             _ => {
                 // 首次或超窗:登记 pending,提示
                 let n = m.issues[idx].timeline.len();
-                m.pending_delete = Some((idx, m.tick));
+                m.pending_delete = Some((idx, std::time::Instant::now()));
                 let hint = format!(
                     "议题「{}」有 {n} 条消息;再按 ^W 确认删除(5s 内)",
                     m.issues[idx].name
@@ -685,6 +693,17 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             let dir = model.teamfly_dir.clone();
             let _ = crate::issue::delete_file(&dir, &issue);
         }
+        Command::CancelAgents => {
+            // 取消 token 已由 update 重置,所有正在运行的 agent 在下一次检查时会退出
+            for mem in &model.members {
+                if mem.state != AgentState::Idle {
+                    let _ = tx.send(Msg::AgentStdout {
+                        name: mem.name.clone(),
+                        line: "⟨系统⟩ agent 已被取消".into(),
+                    });
+                }
+            }
+        }
         Command::SpawnAgent {
             name,
             backend,
@@ -702,9 +721,10 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                 user_input,
                 work_dir: model.work_dir.clone(),
             };
+            let cancel = model.cancel.child_token();
             let tx = tx.clone();
             tokio::spawn(async move {
-                backend::run(spec, tx).await;
+                backend::run(spec, cancel, tx).await;
             });
         }
     }
@@ -863,6 +883,7 @@ mod e2e {
             status_hint_until: 0,
             pending_delete: None,
             show_help: false,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -977,7 +998,7 @@ mod e2e {
         assert_eq!(m.issues.len(), 2); // 未删
         assert!(m.pending_delete.is_some());
         assert!(m.status_hint.as_ref().unwrap().contains("再按"));
-        // 第二次:真删,返回 DeleteIssueFile Command
+        // 窗口内再按:真删
         let cmds = update(&mut m, Msg::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)));
         assert_eq!(m.issues.len(), 1);
         assert!(matches!(cmds.first(), Some(Command::DeleteIssueFile { .. })));
@@ -991,8 +1012,10 @@ mod e2e {
             ts: "t".into(), author: "我".into(), text: "x".into(), is_system: false,
         });
         ctrl(&mut m, 'w'); // 首次 → pending
-        // 时间流逝
-        m.tick = m.tick.wrapping_add(100);
+        // 时间流逝 6s(超过 5s 窗口)
+        if let Some((_, t0)) = &mut m.pending_delete {
+            *t0 = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        }
         ctrl(&mut m, 'w'); // 超窗,视为再次首次,又只提示
         assert_eq!(m.issues.len(), 2); // 未删
         assert!(m.pending_delete.is_some());

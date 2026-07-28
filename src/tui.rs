@@ -488,11 +488,11 @@ fn draw_hints(f: &mut Frame, area: Rect, m: &Model) {
 
     // pending_delete 未过期时,动态显示剩余秒(覆盖普通 hint)
     let dynamic_pending: Option<String> = m.pending_delete.and_then(|(idx, t0)| {
-        const WINDOW: u64 = 33; // 与 handle_close_issue 中一致
-        let elapsed = m.tick.wrapping_sub(t0);
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+        let elapsed = t0.elapsed();
         if elapsed < WINDOW && idx < m.issues.len() {
-            let remain_ticks = WINDOW - elapsed;
-            let remain_secs = (remain_ticks * 150) / 1000 + 1;
+            let remain = WINDOW.checked_sub(elapsed).unwrap_or_default();
+            let remain_secs = remain.as_secs() + 1;
             Some(format!(
                 "议题「{}」有 {} 条消息;再按 ^W 删除(剩 {}s)",
                 m.issues[idx].name,
