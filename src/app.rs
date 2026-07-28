@@ -94,13 +94,20 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
             return vec![];
         }
     }
-    // 帮助浮层打开时,任意键(除 ?/Esc)只关帮助,不做其他动作
+    // 帮助浮层打开时,? 切换关闭,Esc 关闭并回群聊,其他键关闭并传递
     if m.show_help {
-        if matches!(k.code, KeyCode::Char('?') | KeyCode::Esc) {
+        if matches!(k.code, KeyCode::Esc) {
             m.show_help = false;
+            m.selection = Selection::Chat;
+            m.scroll = 0;
+            return vec![];
         }
-        // 其他键忽略
-        return vec![];
+        if matches!(k.code, KeyCode::Char('?')) {
+            m.show_help = false;
+            return vec![];
+        }
+        // 其他键(退格、字母…)关闭帮助并继续处理
+        m.show_help = false;
     }
 
     // status_hint 会在下面被清:见「_tick 自动过期」;这里不再无条件清
