@@ -320,6 +320,23 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
 }
 
 fn draw_input(f: &mut Frame, area: Rect, m: &Model) {
+    // NewIssue 模式:输入议题名,标题反映
+    if m.input_mode == crate::model::InputMode::NewIssue {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                " 新建议题 · ⏎ 创建 · Esc 取消 ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+        let text = format!("# {}", m.input);
+        f.render_widget(Paragraph::new(text).block(block), area);
+        let cx = area.x + 3 + display_width(&m.input) as u16;
+        let cy = area.y + 1;
+        f.set_cursor_position((cx.min(area.x + area.width.saturating_sub(2)), cy));
+        return;
+    }
+
     // @ 补全建议(输入中最后一个 @token 的候选)
     let roster: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
     let sugg = crate::app::at_suggestions(&m.input, &roster);
@@ -343,7 +360,7 @@ fn draw_input(f: &mut Frame, area: Rect, m: &Model) {
 
 fn draw_hints(f: &mut Frame, area: Rect, m: &Model) {
     let hint = m.status_hint.clone().unwrap_or_else(|| {
-        "^1-9 切议题 · ↑↓ 选左栏 · ⏎ 发送/看TA · Esc 回群聊 · ^C 退出".to_string()
+        "^N 新议题 · ^1-9 切议题 · ↑↓ 选左栏 · ⏎ 发送/看TA · Esc 回群聊 · ^C 退出".to_string()
     });
     f.render_widget(
         Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),

@@ -106,6 +106,13 @@ pub enum Selection {
     Member(usize),
 }
 
+/// 输入框当前模式:普通聊天 / 新建议题。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    Chat,
+    NewIssue,
+}
+
 /// 全部应用状态。TEA 的 Model。
 pub struct Model {
     pub team_name: String,
@@ -117,6 +124,8 @@ pub struct Model {
     pub issues: Vec<Issue>,
     pub current_issue: usize,
     pub selection: Selection,
+    /// 输入框模式(默认 Chat;Ctrl+N 进入 NewIssue)
+    pub input_mode: InputMode,
     /// 输入框草稿（入 Model → 抗刷屏）
     pub input: String,
     /// 右区滚动偏移（0 = 贴底）
