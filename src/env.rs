@@ -96,13 +96,47 @@ pub fn user_mcp_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(home).join(".teamfly").join("mcp.json"))
 }
 
+/// 私密地写一个新文件:创建时就带 0600,不存在「先 0644 再 chmod」的可读窗口。
+/// env.toml / mcp.json 是要放 API key 的地方,不能落成默认的 0644 ——
+/// 同机任何用户都能 cat 走。
+pub fn write_private(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // 先写到同目录的临时文件再 rename:写一半失败不会把原文件截断成半截
+    let tmp = path.with_extension("tmp.new");
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("创建 {}", tmp.display()))?;
+        use std::io::Write;
+        f.write_all(content.as_bytes())
+            .with_context(|| format!("写入 {}", tmp.display()))?;
+        f.sync_all().ok();
+    }
+    // 临时文件已存在时 mode 不会重设,补一次(仅 unix)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("设置 {} 权限", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("替换 {}", path.display()))?;
+    Ok(())
+}
+
 /// 若用户级 env.toml 不存在,创建一个带注释的模板。返回是否新建。
 pub fn seed_user_env(path: &Path) -> Result<bool> {
     if path.exists() {
         return Ok(false);
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
     }
     let tmpl = r#"# teamfly 用户级 agent 环境变量(全局默认,所有项目共用)
 # 项目里可写 <工作目录>/.teamfly/env.toml 覆盖同名 key
@@ -123,8 +157,8 @@ pub fn seed_user_env(path: &Path) -> Result<bool> {
 # ANTHROPIC_BASE_URL   = "https://api.anthropic.com"
 # ANTHROPIC_AUTH_TOKEN = "${ANTHROPIC_AUTH_TOKEN}"
 "#;
-    std::fs::write(path, tmpl)
-        .with_context(|| format!("写入 {}", path.display()))?;
+    // 这个模板正文就在教用户把 token 填进来,所以从创建那一刻就得是 0600
+    write_private(path, tmpl)?;
     Ok(true)
 }
 
@@ -133,13 +167,9 @@ pub fn seed_user_mcp(path: &Path) -> Result<bool> {
     if path.exists() {
         return Ok(false);
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     // 只写空 mcpServers,新加 server 时把配置塞进这个对象即可
-    let tmpl = "{\n  \"mcpServers\": {}\n}\n";
-    std::fs::write(path, tmpl)
-        .with_context(|| format!("写入 {}", path.display()))?;
+    // (MCP server 配置里常带鉴权 header,一并按私密文件处理)
+    write_private(path, "{\n  \"mcpServers\": {}\n}\n")?;
     Ok(true)
 }
 

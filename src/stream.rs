@@ -26,6 +26,9 @@ pub struct StreamOutcome {
     /// 只展示,不判整轮失败 —— 重连成功后这一轮照样能出结果。
     /// 仅在整轮既无 result 又无正文时被当作兜底失败原因。
     pub warn: Option<String>,
+    /// 这一行是否表示 agent 动过工具(读写文件、跑命令)。
+    /// 重试前要看它:动过工具说明可能已经改了工作区,不能无脑把同一个 prompt 从头再跑一遍。
+    pub tool_used: bool,
 }
 
 /// 按格式分类一行。
@@ -36,18 +39,25 @@ pub fn classify(fmt: StreamFmt, line: &str) -> StreamOutcome {
     }
 }
 
+/// `parse_json` 的结果。`Done` 不是错误路径 —— 它装的是**已经算好的结果**
+/// (空行 → 空;非 JSON → 原样透出),调用方直接 return 就行。
+enum Parsed {
+    Json(serde_json::Value),
+    Done(StreamOutcome),
+}
+
 /// 解析 JSON 行的公共前处理:空行返回空,非 JSON 原样透出。
-fn parse_json(line: &str) -> Result<serde_json::Value, StreamOutcome> {
+fn parse_json(line: &str) -> Parsed {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return Err(StreamOutcome::default());
+        return Parsed::Done(StreamOutcome::default());
     }
     match serde_json::from_str(trimmed) {
-        Ok(v) => Ok(v),
+        Ok(v) => Parsed::Json(v),
         Err(_) => {
             let mut out = StreamOutcome::default();
             out.display.push(line.to_string());
-            Err(out)
+            Parsed::Done(out)
         }
     }
 }
@@ -59,8 +69,8 @@ fn parse_json(line: &str) -> Result<serde_json::Value, StreamOutcome> {
 ///   result                              — 整轮结束
 fn classify_claude(line: &str) -> StreamOutcome {
     let v = match parse_json(line) {
-        Ok(v) => v,
-        Err(out) => return out,
+        Parsed::Json(v) => v,
+        Parsed::Done(out) => return out,
     };
     let mut out = StreamOutcome::default();
     match v.get("type").and_then(|t| t.as_str()) {
@@ -91,6 +101,7 @@ fn classify_claude(line: &str) -> StreamOutcome {
                             let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                             let hint = tool_input_hint(blk.get("input"));
                             out.display.push(format!("🔧 {name}({hint})"));
+                            out.tool_used = true; // 可能已经改了工作区,重试要当心
                         }
                         // extended thinking 的中间推理:只展示,不进 text_delta
                         //(它不是给队友看的回复正文,混进 full 会污染汇报)
@@ -153,8 +164,8 @@ fn classify_claude(line: &str) -> StreamOutcome {
 ///                                                    重连成功后照常出结果,不能当整轮失败
 fn classify_codex(line: &str) -> StreamOutcome {
     let v = match parse_json(line) {
-        Ok(v) => v,
-        Err(out) => return out,
+        Parsed::Json(v) => v,
+        Parsed::Done(out) => return out,
     };
     let mut out = StreamOutcome::default();
     match v.get("type").and_then(|t| t.as_str()) {
@@ -201,6 +212,7 @@ fn classify_codex(line: &str) -> StreamOutcome {
                         .and_then(|c| c.as_str())
                         .unwrap_or("");
                     out.display.push(format!("🔧 {hint}"));
+                    out.tool_used = true;
                 }
                 // 错误项
                 "error" => {

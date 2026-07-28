@@ -84,17 +84,34 @@ pub fn parse_mentions(report: &str, roster: &[String], self_name: &str) -> Vec<S
 }
 
 /// 在 rest 的开头,找一个最长的、命中花名册的名字。
+///
+/// 三件事必须做对,否则 @ 要么不认要么乱认:
+/// 1. **跳过 Markdown 强调**:agent 很爱写 `@**DEV**`,原样匹配会因为开头是 `*` 而全不命中。
+/// 2. **ASCII 名字大小写不敏感**:默认团队叫 DEV/REV/TPM,agent 写 `@dev` 是常事。
+/// 3. **词尾边界**:纯 ASCII 名字后面不能紧跟字母数字,否则 `@REVIEW.md` 会命中 `REV`、
+///    `@DEVOPS` 会命中 `DEV`,凭空唤醒一个 agent 跑一整轮。
+///    中文名不做这个限制 —— 中文没有词间空格,`@小盾对下接口` 是正常写法。
 fn longest_roster_prefix(rest: &str, roster: &[String]) -> Option<String> {
-    let mut best: Option<String> = None;
+    // 跳过紧跟 @ 的 Markdown 强调符
+    let rest = rest.trim_start_matches(['*', '`', '_']);
+    let lower = rest.to_ascii_lowercase(); // ASCII 小写不改变字节长度,中文不受影响
+    let mut best: Option<&String> = None;
     for name in roster {
-        if rest.starts_with(name.as_str()) {
-            match &best {
-                Some(b) if b.chars().count() >= name.chars().count() => {}
-                _ => best = Some(name.clone()),
+        if !lower.starts_with(&name.to_ascii_lowercase()) {
+            continue;
+        }
+        // 纯 ASCII 名字要求词尾边界
+        if name.is_ascii() {
+            let next = rest[name.len()..].chars().next();
+            if next.is_some_and(|c| c.is_ascii_alphanumeric()) {
+                continue;
             }
         }
+        if best.is_none_or(|b| b.chars().count() < name.chars().count()) {
+            best = Some(name);
+        }
     }
-    best
+    best.cloned()
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -203,6 +220,41 @@ mod tests {
     fn report_for_chat_leaves_short_text_alone() {
         let out = report_for_chat("干完了 @小盾 对下接口", &["小盾".to_string()]);
         assert_eq!(out, "干完了 @小盾 对下接口");
+    }
+
+    #[test]
+    fn mentions_ascii_case_insensitive() {
+        // 默认团队叫 DEV/REV/TPM,agent 写小写是常事
+        let roster = vec!["DEV".to_string(), "REV".to_string(), "TPM".to_string()];
+        assert_eq!(parse_mentions("干完了 @dev 接手", &roster, "TPM"), vec!["DEV".to_string()]);
+        assert_eq!(parse_mentions("请 @Rev 复审", &roster, "TPM"), vec!["REV".to_string()]);
+    }
+
+    #[test]
+    fn mentions_skip_markdown_emphasis() {
+        let roster = vec!["DEV".to_string()];
+        assert_eq!(parse_mentions("@**DEV** 请实现", &roster, "TPM"), vec!["DEV".to_string()]);
+        assert_eq!(parse_mentions("@`DEV` 请实现", &roster, "TPM"), vec!["DEV".to_string()]);
+    }
+
+    #[test]
+    fn mentions_require_word_boundary_for_ascii_names() {
+        // 以前 @REVIEW.md 会命中 REV、@DEVOPS 会命中 DEV,凭空唤醒一个 agent
+        let roster = vec!["DEV".to_string(), "REV".to_string()];
+        assert!(parse_mentions("看 @REVIEW.md 里的说明", &roster, "TPM").is_empty());
+        assert!(parse_mentions("问下 @DEVOPS 团队", &roster, "TPM").is_empty());
+        // 标点紧跟仍算命中(这是正常写法)
+        assert_eq!(parse_mentions("@DEV, 你来", &roster, "TPM"), vec!["DEV".to_string()]);
+        assert_eq!(parse_mentions("交给 @DEV。", &roster, "TPM"), vec!["DEV".to_string()]);
+    }
+
+    #[test]
+    fn mentions_cjk_names_stay_permissive() {
+        // 中文没有词间空格,@小盾对下接口 是正常写法,不能因为边界规则把它判掉
+        assert_eq!(
+            parse_mentions("抽完了 @小盾对下接口", &roster(), "阿码"),
+            vec!["小盾".to_string()]
+        );
     }
 
     #[test]
