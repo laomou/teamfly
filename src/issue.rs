@@ -204,7 +204,7 @@ mod tests {
             emoji: "🛡".into(),
             backend: BackendKind::Claude,
             model: None,
-            worktree: true,
+            read_only: false,
             system_prompt: String::new(),
             state: AgentState::Idle,
             inbox: VecDeque::new(),

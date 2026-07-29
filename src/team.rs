@@ -16,12 +16,10 @@ struct AgentFront {
     backend: String,
     #[serde(default)]
     model: Option<String>,
-    /// 是否在独立 git worktree 里干活。默认 true。
-    #[serde(default = "default_true")]
-    worktree: bool,
+    /// 只读成员(主工作目录 + 无写权限),适合评审/调度。默认 false = 可写。
+    #[serde(default)]
+    read_only: bool,
 }
-
-fn default_true() -> bool { true }
 
 /// team.md 的 frontmatter。
 #[derive(Debug, serde::Deserialize, Default)]
@@ -142,7 +140,7 @@ pub fn load_team(dir: &Path) -> Result<Team> {
             emoji,
             backend,
             model: af.model,
-            worktree: af.worktree,
+            read_only: af.read_only,
             system_prompt: sp,
             state: AgentState::Idle,
             inbox: VecDeque::new(),
@@ -233,16 +231,19 @@ mod tests {
         assert_eq!(b, "你是老K");
     }
 
-    /// worktree 字段:显式 false / 显式 true / 省略(默认 true)。
-    /// 默认必须是 true —— 漏写的成员应当拿到隔离,而不是悄悄获得写主工作树的权限。
+    /// read_only 字段:显式 true / 显式 false / 省略(默认 false = 可写)。
+    ///
+    /// 默认必须是**可写** —— 漏写这个字段的成员是普通干活的成员,
+    /// 不该被静默降级成只读(那样它改不了文件,而汇报里看起来像正常干完了)。
+    /// 想要只读得显式声明。
     #[test]
-    fn worktree_field_defaults_to_true() {
+    fn read_only_field_defaults_to_writable() {
         let parse = |front: &str| -> bool {
-            serde_yaml::from_str::<AgentFront>(front).unwrap().worktree
+            serde_yaml::from_str::<AgentFront>(front).unwrap().read_only
         };
-        assert!(!parse("name: REV\nbackend: claude\nworktree: false"));
-        assert!(parse("name: DEV\nbackend: claude\nworktree: true"));
-        assert!(parse("name: DEV\nbackend: claude"), "省略时必须默认 true");
+        assert!(parse("name: REV\nbackend: claude\nread_only: true"));
+        assert!(!parse("name: DEV\nbackend: claude\nread_only: false"));
+        assert!(!parse("name: DEV\nbackend: claude"), "省略时必须默认可写");
     }
 
     #[test]

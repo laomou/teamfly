@@ -494,10 +494,10 @@ fn dispatch(
     // 同议题内的写手必须串行:一个议题共享一个 worktree,两个写手同时在里面
     // 改文件就会互相踩(而共享 worktree 正是接力能直接看到上游改动的前提)。
     // 只读成员(worktree: false,在主目录只读)不占这个位置,可以随时跑。
-    let writer_busy = m.members[i].worktree
+    let writer_busy = !m.members[i].read_only
         && m.members.iter().enumerate().any(|(j, other)| {
             j != i
-                && other.worktree
+                && !other.read_only
                 && other.state != AgentState::Idle
                 && other.working_issue == Some(issue_id)
         });
@@ -530,7 +530,7 @@ fn dispatch(
         env: m.agent_env.merged_for(mem.backend),
         system_prompt: mem.system_prompt.clone(),
         user_input,
-        worktree: mem.worktree,
+        read_only: mem.read_only,
     })
 }
 
@@ -909,9 +909,10 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             env,
             system_prompt,
             user_input,
-            worktree,
+            read_only,
         } => {
-            let (agent_dir, associated_branch) = if worktree {
+            // 只读成员在**主工作目录**里跑(无写权限);可写成员进议题的 worktree
+            let (agent_dir, associated_branch) = if !read_only {
                 let wt = crate::worktree::prepare(
                     &model.work_dir,
                     &model.teamfly_dir,
@@ -934,8 +935,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                 worktree: associated_branch.clone().map(|b| (agent_dir.clone(), b)),
                 work_dir: agent_dir,
                 mcp_config,
-                // 不用 worktree = 直接在用户主工作树里跑 → 必须只读
-                read_only: !worktree,
+                read_only,
             };
             let tx = tx.clone();
             let cancel = model.cancel.clone();
@@ -1105,7 +1105,7 @@ pub mod test_support {
             emoji: "👤".into(),
             backend: BackendKind::Claude,
             model: None,
-            worktree: true,
+            read_only: false,
             system_prompt: String::new(),
             state: AgentState::Working,
             inbox: std::collections::VecDeque::new(),
@@ -1632,7 +1632,7 @@ mod e2e {
         let mut m = min_model();
         let id = m.issues[0].id;
         // 老K 是只读成员(worktree: false),在主目录只读,不占 worktree
-        m.members[0].worktree = false;
+        m.members[0].read_only = true;
         m.members[0].state = AgentState::Working;
         m.members[0].working_issue = Some(id);
 
@@ -1675,7 +1675,7 @@ mod e2e {
             emoji: "👤".into(),
             backend,
             model: None,
-            worktree: true,
+            read_only: false,
             system_prompt: if role == "架构" { "架构".into() } else { String::new() },
             state: AgentState::Idle,
             inbox: VecDeque::new(),

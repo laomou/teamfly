@@ -45,8 +45,10 @@ pub struct Member {
     pub backend: BackendKind,
     pub model: Option<String>,
     pub system_prompt: String, // team 公共 + 个人人设 拼装后的最终 prompt
-    /// 是否在独立 git worktree 里干活。false 时直接在共用目录操作。
-    pub worktree: bool,
+    /// 只读成员:在**主工作目录**里干活且不给写权限(claude plan 模式 /
+    /// codex read-only sandbox)。适合评审、调度这类不该改文件的角色。
+    /// 默认 false = 可写,在议题的 worktree 里干活。
+    pub read_only: bool,
     // 运行时
     pub state: AgentState,
     /// 忙时/议题暂停时被 @，进这个待办队列
@@ -259,8 +261,8 @@ pub enum Command {
         env: std::collections::HashMap<String, String>,
         system_prompt: String,
         user_input: String, // 增量前情 + 本次指派
-        /// 是否在独立 git worktree 里干活
-        worktree: bool,
+        /// 只读成员:主目录 + 无写权限
+        read_only: bool,
     },
     /// 把一条群聊消息追加落盘
     PersistChat { issue: String, msg: ChatMsg },
