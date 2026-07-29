@@ -303,6 +303,9 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
 
     let mut cmds = Vec::new();
 
+    // id 在这一整段里都要用(改名、落盘、派活),而且改名不影响它 —— 提前取出来
+    let issue_id = m.cur_issue().id;
+
     // 自动取名:议题名是「议题N」这种自动生成的、且时间线为空(只可能有系统欢迎消息也算)
     // 用当前消息前 20 字符作新名字,把旧的 jsonl(如果存在)删掉
     let is_auto_name = m.cur_issue().name.starts_with("议题")
@@ -315,7 +318,7 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
             let old_name = std::mem::replace(&mut m.cur_issue_mut().name, new_name.clone());
             // 改名而不是删掉:旧文件里可能已经落了内容(比如自动改名前的
             // 「X 掉线」系统消息),直接删会把它永久丢掉,重启后就没了。
-            cmds.push(Command::RenameIssueFile { from: old_name, to: new_name });
+            cmds.push(Command::RenameIssueFile { issue_id, from: old_name, to: new_name });
         }
     }
 
@@ -329,14 +332,13 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
         is_system: false,
     };
     m.cur_issue_mut().timeline.push(msg.clone());
-    cmds.push(Command::PersistChat { issue: issue_name.clone(), msg });
+    cmds.push(Command::PersistChat { issue_id, issue: issue_name.clone(), msg });
 
     // 我指令:重置连锁深度、解除暂停
     m.cur_issue_mut().chain_depth = 0;
     m.cur_issue_mut().paused = false;
 
     // 解析 @ —— 不带 @ 则只是留言,不触发任何人
-    let issue_id = m.cur_issue().id;
     let roster: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
     let mentions = crate::router::parse_owner_mentions(&text, &roster);
     for name in mentions {
@@ -408,7 +410,7 @@ fn handle_agent_done(
         }
         let msg = ChatMsg { ts: now_ts(), author: "系统".into(), text, is_system: true };
         m.issues[idx].timeline.push(msg.clone());
-        cmds.push(Command::PersistChat { issue: issue_name.clone(), msg });
+        cmds.push(Command::PersistChat { issue_id, issue: issue_name.clone(), msg });
         // 尝试处理该成员排队的下一条
         cmds.extend(drain_after_done(m, &name));
         return cmds;
@@ -441,7 +443,7 @@ fn handle_agent_done(
 
     let msg = ChatMsg { ts: now_ts(), author: name.clone(), text: chat_text, is_system: false };
     m.issues[idx].timeline.push(msg.clone());
-    cmds.push(Command::PersistChat { issue: issue_name.clone(), msg });
+    cmds.push(Command::PersistChat { issue_id, issue: issue_name.clone(), msg });
 
     // 防乒乓:连锁深度 +1
     let new_depth = depth_when_started + 1;
@@ -452,7 +454,7 @@ fn handle_agent_done(
         );
         let smsg = ChatMsg { ts: now_ts(), author: "系统".into(), text, is_system: true };
         m.issues[idx].timeline.push(smsg.clone());
-        cmds.push(Command::PersistChat { issue: issue_name, msg: smsg });
+        cmds.push(Command::PersistChat { issue_id, issue: issue_name, msg: smsg });
         // 这一轮解析出的 @ 同样不能丢:议题已 paused,dispatch 会把它们入队,
         // 等用户按 ^P 再放出来。以前这里直接 return,接力链无声蒸发,
         // 而系统消息还在教用户「按 Ctrl+P 恢复」—— 按了也只会得到「已恢复」。
@@ -855,7 +857,7 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     // 会把别的议题里用户还没采纳的改动一起干掉。
     crate::worktree::remove_issue(&m.work_dir, &m.teamfly_dir, removed.id);
     set_hint(m, format!("已关闭议题:{}", removed.name), 5);
-    vec![Command::DeleteIssueFile { issue: removed.name }]
+    vec![Command::DeleteIssueFile { issue_id: removed.id, issue: removed.name }]
 }
 
 /// 根据当前输入,算出 @ 补全建议(正在输入的最后一个 @token)。
@@ -882,21 +884,21 @@ pub fn at_suggestions(input: &str, roster: &[String]) -> Vec<String> {
 
 fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
     match cmd {
-        Command::PersistChat { issue, msg } => {
+        Command::PersistChat { issue_id, issue, msg } => {
             let dir = model.teamfly_dir.clone();
-            if let Err(e) = crate::issue::append_chat(&dir, &issue, &msg) {
+            if let Err(e) = crate::issue::append_chat(&dir, issue_id, &issue, &msg) {
                 let _ = tx.send(Msg::IoError { detail: format!("{e:#}") });
             }
         }
-        Command::DeleteIssueFile { issue } => {
+        Command::DeleteIssueFile { issue_id, issue } => {
             let dir = model.teamfly_dir.clone();
-            if let Err(e) = crate::issue::delete_file(&dir, &issue) {
+            if let Err(e) = crate::issue::delete_file(&dir, issue_id, &issue) {
                 let _ = tx.send(Msg::IoError { detail: format!("{e:#}") });
             }
         }
-        Command::RenameIssueFile { from, to } => {
+        Command::RenameIssueFile { issue_id, from, to } => {
             let dir = model.teamfly_dir.clone();
-            if let Err(e) = crate::issue::rename_file(&dir, &from, &to) {
+            if let Err(e) = crate::issue::rename_file(&dir, issue_id, &from, &to) {
                 let _ = tx.send(Msg::IoError { detail: format!("{e:#}") });
             }
         }
@@ -1578,7 +1580,7 @@ mod e2e {
         let cmds = key_cmds(&mut m, KeyCode::Enter);
         // 必须是改名而不是删掉 —— 删掉会把已落盘的掉线记录永久丢掉
         assert!(
-            cmds.iter().any(|c| matches!(c, Command::RenameIssueFile { from, to }
+            cmds.iter().any(|c| matches!(c, Command::RenameIssueFile { from, to, .. }
                 if from == "议题2" && to == "开始正式干活")),
             "自动改名应发 RenameIssueFile,实际是 {cmds:?}"
         );

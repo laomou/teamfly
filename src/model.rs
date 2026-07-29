@@ -134,6 +134,22 @@ pub struct Issue {
 
 static NEXT_ISSUE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// 用一个已知 id 造议题（从盘上恢复时用），并把计数器推到它之后。
+///
+/// id 必须跨重启稳定：worktree 目录 `worktrees/<id>/` 和分支 `teamfly/issue-<id>`
+/// 都按它命名。要是重启后重排，议题会去找不属于它的 worktree ——
+/// 自己的改动成孤儿，还可能复用到别的议题留下的那个，两边改动混在一起。
+pub fn issue_with_id(id: u64, name: impl Into<String>) -> Issue {
+    NEXT_ISSUE_ID.fetch_max(id + 1, std::sync::atomic::Ordering::Relaxed);
+    Issue {
+        id,
+        name: name.into(),
+        timeline: Vec::new(),
+        chain_depth: 0,
+        paused: false,
+    }
+}
+
 impl Issue {
     pub fn new(name: impl Into<String>) -> Self {
         Issue {
@@ -264,10 +280,10 @@ pub enum Command {
         /// 只读成员:主目录 + 无写权限
         read_only: bool,
     },
-    /// 把一条群聊消息追加落盘
-    PersistChat { issue: String, msg: ChatMsg },
-    /// 删除议题的落盘文件 .teamfly/issues/<名>.jsonl(关闭议题时)
-    DeleteIssueFile { issue: String },
+    /// 把一条群聊消息追加落盘。带 id:文件名是 <id>-<名字>.jsonl
+    PersistChat { issue_id: u64, issue: String, msg: ChatMsg },
+    /// 删除议题的落盘文件(关闭议题时)
+    DeleteIssueFile { issue_id: u64, issue: String },
     /// 议题自动改名时,把落盘文件一起改名(保住已经落进去的内容)
-    RenameIssueFile { from: String, to: String },
+    RenameIssueFile { issue_id: u64, from: String, to: String },
 }

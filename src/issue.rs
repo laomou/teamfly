@@ -10,15 +10,27 @@ pub fn issues_dir(teamfly_dir: &Path) -> PathBuf {
     teamfly_dir.join("issues")
 }
 
-fn issue_path(teamfly_dir: &Path, name: &str) -> PathBuf {
-    issues_dir(teamfly_dir).join(format!("{name}.jsonl"))
+/// 落盘文件名:`<id>-<名字>.jsonl`。
+///
+/// 名字里带 id 是为了让 id **跨重启稳定** —— worktree 目录和分支都按 id 命名,
+/// 重启后重排的话议题就会去找不属于它的 worktree。顺带也解决了改名要 rename
+/// 文件、以及只差大小写的两个议题撞同一个文件的问题(id 不同,文件就不同)。
+fn issue_path(teamfly_dir: &Path, id: u64, name: &str) -> PathBuf {
+    issues_dir(teamfly_dir).join(format!("{id}-{name}.jsonl"))
+}
+
+/// 从文件名解析 `(id, 名字)`。旧格式(无 `<id>-` 前缀)返回 None。
+fn parse_stem(stem: &str) -> Option<(u64, String)> {
+    let (id_part, name) = stem.split_once('-')?;
+    let id: u64 = id_part.parse().ok()?;
+    Some((id, name.to_string()))
 }
 
 /// 追加一条群聊消息到落盘文件。
-pub fn append_chat(teamfly_dir: &Path, issue_name: &str, msg: &ChatMsg) -> Result<()> {
+pub fn append_chat(teamfly_dir: &Path, id: u64, issue_name: &str, msg: &ChatMsg) -> Result<()> {
     let dir = issues_dir(teamfly_dir);
     std::fs::create_dir_all(&dir)?;
-    let path = issue_path(teamfly_dir, issue_name);
+    let path = issue_path(teamfly_dir, id, issue_name);
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -37,12 +49,12 @@ pub fn append_chat(teamfly_dir: &Path, issue_name: &str, msg: &ChatMsg) -> Resul
 
 /// 议题改名时把落盘文件一起改名。源文件不存在视为成功(还没落过盘)。
 /// 目标已存在则不覆盖 —— 那是另一个议题的历史,宁可留下孤儿也别冲掉它。
-pub fn rename_file(teamfly_dir: &Path, from: &str, to: &str) -> Result<()> {
-    let src = issue_path(teamfly_dir, from);
+pub fn rename_file(teamfly_dir: &Path, id: u64, from: &str, to: &str) -> Result<()> {
+    let src = issue_path(teamfly_dir, id, from);
     if !src.exists() {
         return Ok(());
     }
-    let dst = issue_path(teamfly_dir, to);
+    let dst = issue_path(teamfly_dir, id, to);
     if dst.exists() {
         anyhow::bail!(
             "{} 已存在,不覆盖(旧文件 {} 保留待人工处理)",
@@ -56,8 +68,8 @@ pub fn rename_file(teamfly_dir: &Path, from: &str, to: &str) -> Result<()> {
 }
 
 /// 删除议题的落盘文件(关闭议题时);文件不存在视为成功。
-pub fn delete_file(teamfly_dir: &Path, issue_name: &str) -> Result<()> {
-    let path = issue_path(teamfly_dir, issue_name);
+pub fn delete_file(teamfly_dir: &Path, id: u64, issue_name: &str) -> Result<()> {
+    let path = issue_path(teamfly_dir, id, issue_name);
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("删除 {}", path.display()))?;
     }
@@ -81,12 +93,23 @@ pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> 
     files.sort();
 
     let mut issues = Vec::new();
+    // 旧格式(文件名无 <id>- 前缀)按加载顺序补发新 id,并改名到新格式,
+    // 这样下次启动就稳定了。
+    let mut legacy: Vec<(PathBuf, String)> = Vec::new();
     for path in files {
-        let name = path
+        let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("issue")
             .to_string();
+        let (id, name) = match parse_stem(&stem) {
+            Some(v) => v,
+            None => {
+                // 旧格式:先记下来,读完内容后统一迁移
+                legacy.push((path.clone(), stem.clone()));
+                (0, stem.clone())
+            }
+        };
         // 按字节读 + lossy 转换:掉电/被 kill 时 jsonl 尾部常留半截甚至非法字节,
         // 以前 read_to_string 的 ? 会一路冒泡到 main,整个项目再也进不去 TUI,
         // 而且不告诉你是哪个文件。单行损坏本来就是跳过,这里保持一致。
@@ -99,7 +122,11 @@ pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> 
                 continue;
             }
         };
-        let mut issue = Issue::new(name);
+        let mut issue = if id == 0 {
+            crate::model::Issue::new(name.clone()) // 旧格式:发个新 id
+        } else {
+            crate::model::issue_with_id(id, name.clone())
+        };
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -110,6 +137,20 @@ pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> 
             }
         }
         issues.push(issue);
+    }
+
+    // 把旧格式文件迁到 <id>-<名字>.jsonl。迁移失败只警告,不影响本次运行
+    //(内存里已经读进来了),但下次启动它还是会拿到新 id。
+    for (old_path, name) in legacy {
+        if let Some(issue) = issues.iter().find(|i| i.name == name) {
+            let new_path = issue_path(teamfly_dir, issue.id, &name);
+            if let Err(e) = std::fs::rename(&old_path, &new_path) {
+                warns.push(format!(
+                    "议题文件 {} 迁移到新命名失败({e});重启后 id 可能变",
+                    old_path.display()
+                ));
+            }
+        }
     }
     Ok((issues, warns))
 }
@@ -224,6 +265,62 @@ mod tests {
             text: text.into(),
             is_system: false,
         }
+    }
+
+    #[test]
+    fn parse_stem_splits_id_and_name() {
+        assert_eq!(parse_stem("3-改登录"), Some((3, "改登录".to_string())));
+        assert_eq!(parse_stem("12-fix-the-bug"), Some((12, "fix-the-bug".to_string())));
+        // 旧格式(无 id 前缀)
+        assert_eq!(parse_stem("改登录"), None);
+        assert_eq!(parse_stem("not-a-number"), None);
+    }
+
+    /// id 必须跨重启稳定 —— worktree 目录和分支都按它命名。
+    ///
+    /// 以前 id 不落盘、文件按名字存,重启后 id 从 1 重排:议题会去找不属于它的
+    /// worktree(自己的改动成孤儿),甚至复用到别的议题留下的那个,两边改动混一起。
+    #[test]
+    fn ids_survive_restart_and_legacy_files_migrate() {
+        let dir = std::env::temp_dir().join(format!("tf_id_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(issues_dir(&dir)).unwrap();
+
+        // 新格式:id 写在文件名里
+        append_chat(&dir, 7, "改登录", &msg("我", "A")).unwrap();
+        append_chat(&dir, 9, "查bug", &msg("我", "B")).unwrap();
+        // 旧格式:没有 id 前缀
+        std::fs::write(
+            issues_dir(&dir).join("老议题.jsonl"),
+            format!("{}\n", serde_json::to_string(&msg("我", "C")).unwrap()),
+        )
+        .unwrap();
+
+        let (issues, _warns) = load_all_issues(&dir).unwrap();
+        let by_name = |n: &str| issues.iter().find(|i| i.name == n).expect(n).id;
+
+        // 新格式的 id 必须原样读回来,不能重排
+        assert_eq!(by_name("改登录"), 7);
+        assert_eq!(by_name("查bug"), 9);
+
+        // 旧格式补了个新 id,而且必须避开已用的(不能撞上 7 或 9)
+        let legacy_id = by_name("老议题");
+        assert!(legacy_id != 7 && legacy_id != 9, "补的 id 撞了: {legacy_id}");
+
+        // 旧文件已迁到新命名,下次启动就稳定了
+        assert!(
+            issues_dir(&dir).join(format!("{legacy_id}-老议题.jsonl")).exists(),
+            "旧格式文件没被迁移"
+        );
+        assert!(!issues_dir(&dir).join("老议题.jsonl").exists());
+
+        // 再加载一次:所有 id 都不变
+        let (again, _) = load_all_issues(&dir).unwrap();
+        for i in &issues {
+            let same = again.iter().find(|x| x.name == i.name).unwrap();
+            assert_eq!(same.id, i.id, "{} 的 id 重启后变了", i.name);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
