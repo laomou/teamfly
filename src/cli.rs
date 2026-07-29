@@ -247,9 +247,12 @@ fn prompt_secret(label: &str, default: &str) -> Result<String> {
 /// 组装初始 Model。
 pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, Vec<String>)> {
     let work_dir = dir
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("."));
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let work_dir = match work_dir.canonicalize() {
+        Ok(d) if d.is_dir() => d,
+        Ok(d) => bail!("不是目录: {}", d.display()),
+        Err(e) => bail!("路径无效: {} ({e})", work_dir.display()),
+    };
 
     let teamfly_dir = work_dir.join(".teamfly");
     std::fs::create_dir_all(&teamfly_dir)?;
