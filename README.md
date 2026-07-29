@@ -9,9 +9,6 @@
 ```bash
 cargo build --release
 
-# 一次性配置全局凭证(交互输入 BASE_URL / KEY,写 ~/.teamfly/env.toml)
-./target/release/teamfly init
-
 # 在工作目录里开干(缺省用内置 default 队:TPM + DEV + REV)
 ./target/release/teamfly work [工作目录] [--team <团队名>]
 ```
@@ -32,14 +29,13 @@ cargo build --release
 default/
 ├─ team.md            # 队名 + 全员规矩 + 团队职责 + 任务流转(拼进每个 agent)
 └─ agents/
-   ├─ TPM.md          # frontmatter(name/role/emoji/backend/model/read_only) + 调度职责
+   ├─ TPM.md          # frontmatter(name/role/emoji/backend/read_only) + 调度职责
    ├─ DEV.md          # 实现与测试
    └─ REV.md          # 只做代码评审
 ```
 
 - **agent md** 只写单一职责(我是谁、做什么);**team.md** 写团队职责和任务流转(谁完成后交给谁),改流程只改一处。
 - `backend` 二选一:`claude`(claude CLI,stream-json)/ `codex`(codex CLI,JSONL)。
-- `model` 可选;不写则由 env.toml 的 `ANTHROPIC_MODEL`(codex 成员是 `OPENAI_MODEL`)或继承环境决定。
 - `read_only` 可选(默认 `false` = 可写)。写 `read_only: true` 的成员在**主工作目录**里跑且**真的没有写权限**
   (claude 走 `--permission-mode plan`,codex 走 `--sandbox read-only`),适合评审、调度这类不该改文件的角色。
   内置队里 TPM/REV 是只读,DEV 可写。
@@ -47,12 +43,8 @@ default/
 
 ## 配置(env.toml / mcp.json)
 
-两级,**不合并**——项目级存在就只用项目级,否则用用户级:
-
-| 文件 | 用户级 | 项目级 |
-|---|---|---|
-| `env.toml` | `~/.teamfly/env.toml` | `<工作目录>/.teamfly/env.toml` |
-| `mcp.json` | `~/.teamfly/mcp.json` | `<工作目录>/.teamfly/mcp.json` |
+都放在工作目录的 `.teamfly/` 下:`env.toml`(注入给 agent 的环境变量)和
+`mcp.json`(MCP server 配置)。两个都是可选的,不存在就什么都不注入。
 
 `env.toml` 按 backend 分段,值支持 `${VAR}` 引用 shell 环境变量:
 
@@ -66,8 +58,8 @@ ANTHROPIC_MODEL      = "claude-opus-4-6"
 OPENAI_API_KEY = "${OPENAI_API_KEY}"
 ```
 
-模型优先级:**frontmatter `model:` > env.toml 的 `ANTHROPIC_MODEL` / `OPENAI_MODEL` > 继承环境**。
-(注入哪个变量取决于成员的 backend:claude → `ANTHROPIC_MODEL`,codex → `OPENAI_MODEL`。)
+模型由 `ANTHROPIC_MODEL`(claude 成员)/ `OPENAI_MODEL`(codex 成员)决定;
+`env.toml` 里没写就继承你 shell 里的同名变量。
 
 ## 工作机制
 
@@ -113,7 +105,7 @@ OPENAI_API_KEY = "${OPENAI_API_KEY}"
 cargo test
 ```
 
-纯函数单测(汇报提炼/@ 解析/剥 ANSI/env 展开与分段/claude+codex 事件解析)+ 键盘操作与议题增删测试,共 77 项。
+纯函数单测(汇报提炼/@ 解析/剥 ANSI/env 展开与分段/claude+codex 事件解析)+ 键盘操作与议题增删测试。
 
 ## 已知边界
 

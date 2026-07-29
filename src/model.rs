@@ -12,14 +12,6 @@ pub enum AgentState {
 }
 
 impl AgentState {
-    #[allow(dead_code)] // 供未来紧凑视图使用
-    pub fn glyph(&self) -> &'static str {
-        match self {
-            AgentState::Idle => "💤",
-            AgentState::Thinking => "💭",
-            AgentState::Working => "⚙",
-        }
-    }
     pub fn label(&self) -> &'static str {
         match self {
             AgentState::Idle => "摸鱼",
@@ -43,7 +35,6 @@ pub struct Member {
     pub role: String,
     pub emoji: String,
     pub backend: BackendKind,
-    pub model: Option<String>,
     pub system_prompt: String, // team 公共 + 个人人设 拼装后的最终 prompt
     /// 只读成员:在**主工作目录**里干活且不给写权限(claude plan 模式 /
     /// codex read-only sandbox)。适合评审、调度这类不该改文件的角色。
@@ -174,7 +165,6 @@ pub struct Model {
     pub team_name: String,
     pub work_dir: std::path::PathBuf,
     pub teamfly_dir: std::path::PathBuf,
-    /// agent 环境变量集合(全局 + 按 backend 分段;来自 .teamfly/env.toml)
     pub members: Vec<Member>,
     pub issues: Vec<Issue>,
     pub current_issue: usize,
@@ -276,7 +266,6 @@ pub enum Command {
         /// 派活时的团队代号,原样回投
         gen: u64,
         backend: BackendKind,
-        model: Option<String>,
         system_prompt: String,
         user_input: String, // 增量前情 + 本次指派
         /// 只读成员:主目录 + 无写权限

@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// issues 目录:<teamfly_dir>/issues
-pub fn issues_dir(teamfly_dir: &Path) -> PathBuf {
+fn issues_dir(teamfly_dir: &Path) -> PathBuf {
     teamfly_dir.join("issues")
 }
 
@@ -244,7 +244,6 @@ mod tests {
             role: "安全".into(),
             emoji: "🛡".into(),
             backend: BackendKind::Claude,
-            model: None,
             read_only: false,
             system_prompt: String::new(),
             state: AgentState::Idle,

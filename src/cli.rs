@@ -1,4 +1,4 @@
-//! CLI:teamfly work [工作目录] [--team <团队名字>] / teamfly init
+//! CLI:teamfly work [工作目录] [--team <团队名字>] —— 组装初始 Model。
 
 use crate::model::{Issue, Model, Selection};
 use crate::team;
@@ -147,7 +147,7 @@ fn check_instance_lock(teamfly_dir: &std::path::Path) -> Option<String> {
             }
         }
     }
-    // 写入自己的 pid
+
     let _ = std::fs::write(&lock, format!("{}", std::process::id()));
     None
 }

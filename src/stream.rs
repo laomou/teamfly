@@ -241,7 +241,7 @@ fn classify_codex(line: &str) -> StreamOutcome {
 }
 
 /// 从 tool_use 的 input 里取一个简短提示(文件路径 / 命令 / query)。
-pub fn tool_input_hint(input: Option<&serde_json::Value>) -> String {
+fn tool_input_hint(input: Option<&serde_json::Value>) -> String {
     let Some(obj) = input.and_then(|i| i.as_object()) else {
         return String::new();
     };
