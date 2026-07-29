@@ -101,7 +101,9 @@ fn classify_claude(line: &str) -> StreamOutcome {
                             let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                             let hint = tool_input_hint(blk.get("input"));
                             out.display.push(format!("🔧 {name}({hint})"));
-                            out.tool_used = true; // 可能已经改了工作区,重试要当心
+                            if !is_readonly_tool(name) {
+                                out.tool_used = true;
+                            }
                         }
                         // extended thinking 的中间推理:只展示,不进 text_delta
                         //(它不是给队友看的回复正文,混进 full 会污染汇报)
@@ -295,6 +297,17 @@ fn summarize(s: &str, max: usize) -> String {
     let mut r: String = one.chars().take(max).collect();
     r.push('…');
     r
+}
+
+/// 只读工具:不改工作区,重试时无需带「先核对现状」的提醒。
+/// 宁可漏判(把只读的当成写了 → 多提醒一句,无害),不可误判(把写工具当成只读 → 重试重复副作用)。
+fn is_readonly_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "Read" | "Grep" | "Glob" | "WebFetch" | "WebSearch"
+            | "TaskList" | "TaskGet" | "CronList"
+            | "ListFiles" | "SearchFiles" | "ReadFile" | "GetFile"
+    )
 }
 
 #[cfg(test)]
