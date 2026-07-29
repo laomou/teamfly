@@ -232,6 +232,18 @@ mod tests {
         assert_eq!(b, "你是老K");
     }
 
+    /// worktree 字段:显式 false / 显式 true / 省略(默认 true)。
+    /// 默认必须是 true —— 漏写的成员应当拿到隔离,而不是悄悄获得写主工作树的权限。
+    #[test]
+    fn worktree_field_defaults_to_true() {
+        let parse = |front: &str| -> bool {
+            serde_yaml::from_str::<AgentFront>(front).unwrap().worktree
+        };
+        assert!(!parse("name: REV\nbackend: claude\nworktree: false"));
+        assert!(parse("name: DEV\nbackend: claude\nworktree: true"));
+        assert!(parse("name: DEV\nbackend: claude"), "省略时必须默认 true");
+    }
+
     #[test]
     fn split_frontmatter_none() {
         let (f, b) = split_frontmatter("just body");
