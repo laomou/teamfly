@@ -422,12 +422,17 @@ fn handle_agent_done(
 
     // 用了 worktree 就附上分支名和改动摘要。这里用的是**派活时回投**的路径,
     // 不是去磁盘上按时间猜 —— 猜会拿到别轮甚至别的 agent 的 worktree。
+    //
+    // `upstream_branch` 会写进给接力者的指派里 —— 接力者在自己的 worktree 里,
+    // 不显式告诉它上游分支名和怎么用,它就得靠 git branch -a 瞎找(碰运气才成)。
+    let mut upstream_branch: Option<String> = None;
     if let Some((wt_dir, branch)) = &worktree {
         if wt_dir.exists() {
             // 一点改动都没有(纯查询类任务)→ 直接回收,别留个完整 checkout 占磁盘
             if crate::worktree::drop_if_untouched(&m.work_dir, wt_dir, branch) {
                 // 什么都不追加:没改动就没什么可让用户采纳的
             } else {
+                upstream_branch = Some(branch.clone());
                 let summary = crate::worktree::change_summary(wt_dir, &m.work_dir, branch);
                 chat_text.push_str(&format!("\n📂 {branch} — {summary}"));
             }
@@ -452,7 +457,7 @@ fn handle_agent_done(
         // 等用户按 ^P 再放出来。以前这里直接 return,接力链无声蒸发,
         // 而系统消息还在教用户「按 Ctrl+P 恢复」—— 按了也只会得到「已恢复」。
         for target in mentions {
-            let assignment = format!("[来自 {name}] {report}");
+            let assignment = handoff_text(&name, &report, upstream_branch.as_deref());
             if let Some(c) = dispatch(m, issue_id, &target, assignment, new_depth) {
                 cmds.push(c);
             }
@@ -463,7 +468,7 @@ fn handle_agent_done(
 
     // 解析出的 @ 逐个派活(投递用**完整**汇报,不能把截断版喂给下游)
     for target in mentions {
-        let assignment = format!("[来自 {name}] {report}");
+        let assignment = handoff_text(&name, &report, upstream_branch.as_deref());
         if let Some(c) = dispatch(m, issue_id, &target, assignment, new_depth) {
             cmds.push(c);
         }
@@ -472,6 +477,24 @@ fn handle_agent_done(
     // 该成员自己的排队任务
     cmds.extend(drain_inbox(m, &name));
     cmds
+}
+
+/// 拼给接力者的指派文本。
+///
+/// 上游用了 worktree 的话必须**显式**告诉接力者分支名和该怎么用 ——
+/// 接力者在自己的 worktree 里,初始内容是主分支的旧代码。不说的话它只能靠
+/// `git branch -a` 瞎猜,猜到算运气好,猜不到就在旧代码上做决策(评审一份
+/// 不存在的代码、在没改过的文件上继续改)。
+fn handoff_text(from: &str, report: &str, upstream_branch: Option<&str>) -> String {
+    let base = format!("[来自 {from}] {report}");
+    match upstream_branch {
+        Some(b) => format!(
+            "{base}\n\n[上游改动] {from} 的改动已提交在分支 `{b}`。\
+你现在在自己的 worktree 里,看到的还是改动前的代码 —— \
+先 `git merge {b}` 把它并进来(要看差异用 `git diff HEAD {b}`),再开始你这一轮的工作。"
+        ),
+        None => base,
+    }
 }
 
 /// 派活给某成员。议题暂停或成员忙 → 入队;闲则起进程。返回 SpawnAgent 命令(如需)。
@@ -1557,6 +1580,23 @@ mod e2e {
         assert_eq!(m.members[1].inbox.len(), crate::model::INBOX_CAP);
         // 丢活必须有提示
         assert!(m.status_hint.as_ref().unwrap().contains("待办已满"));
+    }
+
+    #[test]
+    fn handoff_tells_downstream_where_upstream_changes_are() {
+        // 没有 worktree(fallback 模式):就是普通指派
+        let plain = handoff_text("DEV", "改完了 @REV", None);
+        assert_eq!(plain, "[来自 DEV] 改完了 @REV");
+        assert!(!plain.contains("git merge"));
+
+        // 有 worktree:必须明确给出分支名和用法 —— 接力者在自己的 worktree 里,
+        // 看到的是旧代码,不说它就只能瞎猜
+        let with_wt = handoff_text("DEV", "改完了 @REV", Some("teamfly/DEV/abc1234"));
+        assert!(with_wt.contains("teamfly/DEV/abc1234"));
+        assert!(with_wt.contains("git merge teamfly/DEV/abc1234"));
+        assert!(with_wt.contains("看到的还是改动前的代码"));
+        // 原汇报内容不能丢
+        assert!(with_wt.contains("改完了 @REV"));
     }
 
     #[test]
