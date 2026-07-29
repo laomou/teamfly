@@ -223,6 +223,9 @@ pub enum Msg {
         issue: u64,
         /// 派活时的团队代号。与当前 team_gen 不符则整条结果作废
         gen: u64,
+        /// 这一轮用的 worktree (目录, 分支)。fallback 到主目录时为 None。
+        /// 由派活时决定并原样回投 —— 不能事后去磁盘上猜,那样会拿到别轮的。
+        worktree: Option<(std::path::PathBuf, String)>,
         /// 整轮 raw 汇总（用于兜底提取汇报）
         full_output: String,
         ok: bool,

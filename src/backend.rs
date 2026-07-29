@@ -24,6 +24,8 @@ pub struct RunSpec {
     pub work_dir: PathBuf,
     /// 预解析好的 MCP 配置文件路径(查的是主 work_dir,不是 worktree)
     pub mcp_config: Option<String>,
+    /// 这一轮的 worktree (目录, 分支);fallback 时为 None。原样回投给 AgentDone。
+    pub worktree: Option<(PathBuf, String)>,
 }
 
 /// 重试前追加给 agent 的提醒。上一次尝试已经动过工具(可能改了文件、跑过命令),
@@ -40,6 +42,7 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
     let name = spec.name.clone();
     let issue = spec.issue;
     let gen = spec.gen;
+    let worktree = spec.worktree.clone();
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     // 之前的尝试有没有动过工具 —— 决定重试时要不要带上核对提醒
@@ -51,6 +54,7 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
                 name,
                 issue,
                 gen,
+                worktree: worktree.clone(),
                 full_output: String::new(),
                 ok: false,
                 err: Some(crate::model::CANCELLED.into()),
@@ -96,6 +100,7 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
                     name,
                     issue,
                     gen,
+                    worktree: worktree.clone(),
                     full_output: full,
                     ok: true,
                     err: None,
@@ -110,6 +115,7 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
                         name,
                         issue,
                         gen,
+                        worktree: worktree.clone(),
                         full_output: String::new(),
                         ok: false,
                         err: Some(crate::model::CANCELLED.into()),
@@ -148,6 +154,7 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
         name,
         issue,
         gen,
+        worktree,
         full_output: String::new(),
         ok: false,
         err: Some(format!("重试 {MAX_ATTEMPTS} 次仍失败:{last_err}{tail}")),

@@ -324,14 +324,23 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
     if let Some(warn) = check_instance_lock(&model.teamfly_dir) {
         warns.push(warn);
     }
-    // 列出上次残留的 worktree(崩溃/被杀时来不及清理)
-    let stale = crate::worktree::list_stale(&model.teamfly_dir);
-    if !stale.is_empty() {
+    // 上次残留的 worktree(崩溃/被杀时来不及清理)
+    let stale = crate::worktree::count_stale(&model.teamfly_dir);
+    if stale > 0 {
         warns.push(format!(
-            "有 {} 个残留的 agent worktree(.teamfly/worktrees/{}…),可用 /drop 清理",
-            stale.len(),
-            stale[0]
+            "有 {stale} 个 agent worktree 留在 .teamfly/worktrees/,可用 /drop <名> 清理"
         ));
+    }
+    // agent 在 worktree 里 commit 需要 git 身份;没配的话它一提交就失败,
+    // 而改动只留在工作区,用户很难看出发生了什么
+    if crate::worktree::missing_git_identity(&model.work_dir) {
+        warns.push(
+            "git 没配 user.name / user.email,agent 在 worktree 里 commit 会失败".into(),
+        );
+    }
+    // .teamfly/ 里有 API key,必须确保它被 git 忽略
+    if crate::worktree::ensure_teamfly_ignored(&model.work_dir) {
+        warns.push(".teamfly/ 未被忽略,已自动加进 .gitignore(里面有 API key)".into());
     }
 
     Ok((model, warns))
