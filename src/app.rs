@@ -78,8 +78,8 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Command> {
             }
             vec![]
         }
-        Msg::AgentDone { name, issue, gen, full_output, ok, err } => {
-            handle_agent_done(m, name, issue, gen, full_output, ok, err)
+        Msg::AgentDone { name, issue, gen, worktree, full_output, ok, err } => {
+            handle_agent_done(m, name, issue, gen, worktree, full_output, ok, err)
         }
         Msg::IoError { detail } => {
             // 落盘失败必须让用户看见 —— 否则他会以为历史都保住了
@@ -352,11 +352,13 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
 ///
 /// `issue_id` 是派活时绑定的议题。**不能**用「当前选中议题」—— agent 干一轮要几十秒到几分钟,
 /// 这期间用户很可能切了 tab 甚至关掉原议题,那样汇报会写进别人的时间线和 jsonl。
+#[allow(clippy::too_many_arguments)] // 都是 AgentDone 的字段,拆结构体反而更绕
 fn handle_agent_done(
     m: &mut Model,
     name: String,
     issue_id: u64,
     gen: u64,
+    worktree: Option<(std::path::PathBuf, String)>,
     full_output: String,
     ok: bool,
     err: Option<String>,
@@ -411,11 +413,12 @@ fn handle_agent_done(
     // 群聊里展示/落盘的是截断版(若真截断了会标注派给了谁)
     let mut chat_text = crate::router::report_for_chat(&report, &mentions);
 
-    // 如果用了 worktree，附上分支名和 diff 摘要，让用户知道改动在哪
-    if let Some((wt_dir, branch)) = crate::worktree::latest_for(&m.teamfly_dir, &name) {
+    // 用了 worktree 就附上分支名和改动摘要。这里用的是**派活时回投**的路径,
+    // 不是去磁盘上按时间猜 —— 猜会拿到别轮甚至别的 agent 的 worktree。
+    if let Some((wt_dir, branch)) = &worktree {
         if wt_dir.exists() {
-            let summary = crate::worktree::diff_summary(&m.work_dir, &branch);
-            chat_text.push_str(&format!("\n📂 分支 {branch} ({summary})"));
+            let summary = crate::worktree::change_summary(wt_dir, &m.work_dir, branch);
+            chat_text.push_str(&format!("\n📂 {branch} — {summary}"));
         }
     }
 
@@ -615,8 +618,13 @@ fn handle_slash(m: &mut Model, slash: crate::slash::Slash) -> Vec<Command> {
             vec![]
         }
         Slash::Drop { name } => {
-            crate::worktree::remove_agent(&m.work_dir, &m.teamfly_dir, &name);
-            set_hint(m, format!("已丢弃 {name} 的所有 worktree 和分支"), 8);
+            let id = m.cur_issue().id;
+            let n = crate::worktree::remove_agent(&m.work_dir, &m.teamfly_dir, id, &name);
+            if n == 0 {
+                set_hint(m, format!("{name} 在当前议题没有 worktree"), 5);
+            } else {
+                set_hint(m, format!("已丢弃 {name} 的 {n} 个 worktree 和对应分支"), 8);
+            }
             vec![]
         }
         Slash::Unknown { text } => {
@@ -792,8 +800,9 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     for mem in &mut m.members {
         mem.last_seen.remove(&removed.id);
     }
-    // 关议题时把所有 worktree + 分支一起清掉
-    crate::worktree::remove_all(&m.work_dir, &m.teamfly_dir);
+    // 关议题时只清掉**这个议题**的 worktree。以前是删全部,
+    // 会把别的议题里用户还没采纳的改动一起干掉。
+    crate::worktree::remove_issue(&m.work_dir, &m.teamfly_dir, removed.id);
     set_hint(m, format!("已关闭议题:{}", removed.name), 5);
     vec![Command::DeleteIssueFile { issue: removed.name }]
 }
@@ -855,6 +864,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             let wt = crate::worktree::prepare(
                 &model.work_dir,
                 &model.teamfly_dir,
+                issue,
                 &name,
             );
             let mcp_config = resolve_mcp_config(&model.work_dir);
@@ -867,6 +877,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                 env,
                 system_prompt,
                 user_input,
+                worktree: wt.branch.clone().map(|b| (wt.agent_dir.clone(), b)),
                 work_dir: wt.agent_dir,
                 mcp_config,
             };
@@ -1099,6 +1110,7 @@ mod e2e {
                 name: name.into(),
                 issue,
                 gen: 0,
+                worktree: None,
                 full_output: output.into(),
                 ok: true,
                 err: None,
@@ -1379,6 +1391,7 @@ mod e2e {
                 name: "老K".into(),
                 issue: id,
                 gen: 0,
+                worktree: None,
                 full_output: "旧团队的汇报 @阿码 接手".into(),
                 ok: true,
                 err: None,
@@ -1430,7 +1443,7 @@ mod e2e {
 
         // 交卷后确实不会再起进程
         let cmds = update(&mut m, Msg::AgentDone {
-            name: "老K".into(), issue: id, gen: 0,
+            name: "老K".into(), issue: id, gen: 0, worktree: None,
             full_output: String::new(), ok: false,
             err: Some(crate::model::CANCELLED.into()),
         });
@@ -1450,7 +1463,7 @@ mod e2e {
 
         // 成员空闲后交卷触发 drain
         let cmds = update(&mut m, Msg::AgentDone {
-            name: "老K".into(), issue: b, gen: 0,
+            name: "老K".into(), issue: b, gen: 0, worktree: None,
             full_output: "干完了".into(), ok: true, err: None,
         });
 
