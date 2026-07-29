@@ -792,8 +792,7 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     for mem in &mut m.members {
         mem.last_seen.remove(&removed.id);
     }
-    // 关议题时把属于它的所有 worktree + 分支一起清掉
-    let member_names: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
+    // 关议题时把所有 worktree + 分支一起清掉
     crate::worktree::remove_all(&m.work_dir, &m.teamfly_dir);
     set_hint(m, format!("已关闭议题:{}", removed.name), 5);
     vec![Command::DeleteIssueFile { issue: removed.name }]
@@ -856,7 +855,6 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             let wt = crate::worktree::prepare(
                 &model.work_dir,
                 &model.teamfly_dir,
-                issue,
                 &name,
             );
             let mcp_config = resolve_mcp_config(&model.work_dir);
@@ -956,14 +954,11 @@ async fn run_loop(
     loop {
         tokio::select! {
             maybe_ev = events.next() => {
-                match maybe_ev {
-                    Some(Ok(ev)) => {
-                        if let Some(msg) = translate_event(ev, &model) {
-                            let cmds = update(&mut model, msg);
-                            for c in cmds { rt.exec(&model, c); }
-                        }
+                if let Some(Ok(ev)) = maybe_ev {
+                    if let Some(msg) = translate_event(ev, &model) {
+                        let cmds = update(&mut model, msg);
+                        for c in cmds { rt.exec(&model, c); }
                     }
-                    Some(Err(_)) | None => {}
                 }
             }
             maybe_msg = rx.recv() => {

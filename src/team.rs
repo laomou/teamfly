@@ -39,7 +39,7 @@ fn split_frontmatter(content: &str) -> (String, String) {
             let front = &rest[..end];
             let body_start = end + "\n---".len();
             let body = rest[body_start..]
-                .trim_start_matches(|c| c == '\r' || c == '\n')
+                .trim_start_matches(['\r', '\n'])
                 .to_string();
             // front 可能以换行开头
             return (front.trim_start_matches(['\r', '\n']).to_string(), body);

@@ -13,8 +13,6 @@ pub struct WorktreeResult {
     /// agent 应该在这个目录里干活。
     /// 如果 worktree 建成功了就是 worktree 路径;否则是主 work_dir(fallback)。
     pub agent_dir: PathBuf,
-    /// 分支名(如果建了的话)
-    pub branch: Option<String>,
 }
 
 /// 为 agent 准备 worktree。如果已存在则复用(在上一轮的基础上继续)。
@@ -23,12 +21,10 @@ pub struct WorktreeResult {
 pub fn prepare(
     work_dir: &Path,
     teamfly_dir: &Path,
-    issue_id: u64,
     agent_name: &str,
 ) -> WorktreeResult {
     let fallback = WorktreeResult {
         agent_dir: work_dir.to_path_buf(),
-        branch: None,
     };
 
     // 非 git 仓库 → fallback
@@ -42,10 +38,7 @@ pub fn prepare(
 
     // 同名 worktree 已存在(极少见:同一 agent 在同一 commit 上连续被派两次活)→ 复用
     if wt_dir.exists() {
-        return WorktreeResult {
-            agent_dir: wt_dir,
-            branch: Some(branch),
-        };
+        return WorktreeResult { agent_dir: wt_dir };
     }
 
     // 确保分支存在(不存在则基于 HEAD 创建)
@@ -66,10 +59,7 @@ pub fn prepare(
         .output();
 
     match out {
-        Ok(o) if o.status.success() => WorktreeResult {
-            agent_dir: wt_dir,
-            branch: Some(branch),
-        },
+        Ok(o) if o.status.success() => WorktreeResult { agent_dir: wt_dir },
         Ok(o) => {
             eprintln!(
                 "git worktree add 失败: {}",
@@ -186,7 +176,7 @@ pub fn latest_for(teamfly_dir: &Path, agent_name: &str) -> Option<(PathBuf, Stri
                 if name.starts_with(&prefix) && e.path().is_dir() {
                     // 取最新的(按名字排序,hash 不保证时间序,用修改时间)
                     let p = e.path();
-                    if latest.as_ref().map_or(true, |prev| {
+                    if latest.as_ref().is_none_or(|prev| {
                         p.metadata().and_then(|m| m.modified()).ok()
                             > prev.metadata().and_then(|m| m.modified()).ok()
                     }) {
