@@ -1,7 +1,7 @@
 //! Agent worktree 隔离：每个 agent 每个议题一个独立 worktree + 分支。
 //!
-//! 分支命名：`teamfly/<issue_id>/<agent_name>`
-//! worktree 路径：`<teamfly_dir>/worktrees/<issue_id>-<agent_name>/`
+//! 分支命名：`teamfly/<agent_name>/<short_commit_hash>`
+//! worktree 路径：`<teamfly_dir>/worktrees/<agent_name>-<short_hash>/`
 //!
 //! 非 git 仓库时整个机制跳过，退回共用 work_dir 的老行为。
 
@@ -36,10 +36,11 @@ pub fn prepare(
         return fallback;
     }
 
-    let branch = format!("teamfly/{issue_id}/{agent_name}");
-    let wt_dir = worktree_path(teamfly_dir, issue_id, agent_name);
+    let short_hash = get_short_hash(work_dir);
+    let branch = format!("teamfly/{agent_name}/{short_hash}");
+    let wt_dir = worktree_path_with_hash(teamfly_dir, agent_name, &short_hash);
 
-    // worktree 已存在 → 复用(上次的改动还在里面，agent 可以在上面继续)
+    // 同名 worktree 已存在(极少见:同一 agent 在同一 commit 上连续被派两次活)→ 复用
     if wt_dir.exists() {
         return WorktreeResult {
             agent_dir: wt_dir,
@@ -83,34 +84,81 @@ pub fn prepare(
     }
 }
 
-/// worktree 目录路径。
-pub fn worktree_path(teamfly_dir: &Path, issue_id: u64, agent_name: &str) -> PathBuf {
+/// worktree 目录路径(带 hash 版,用于新建)。
+pub fn worktree_path_with_hash(teamfly_dir: &Path, agent_name: &str, hash: &str) -> PathBuf {
     teamfly_dir
         .join("worktrees")
-        .join(format!("{issue_id}-{agent_name}"))
+        .join(format!("{agent_name}-{hash}"))
 }
 
-/// 删除某个 agent 在某议题的 worktree + 分支。
-pub fn remove(work_dir: &Path, teamfly_dir: &Path, issue_id: u64, agent_name: &str) {
-    let wt_dir = worktree_path(teamfly_dir, issue_id, agent_name);
+/// 删除指定的 worktree 目录 + 对应分支。
+fn remove_dir(work_dir: &Path, wt_dir: &Path) {
     if wt_dir.exists() {
+        let branch = read_worktree_branch(wt_dir);
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force"])
-            .arg(&wt_dir)
+            .arg(wt_dir)
             .current_dir(work_dir)
             .output();
+        if let Some(b) = branch {
+            let _ = Command::new("git")
+                .args(["branch", "-D", &b])
+                .current_dir(work_dir)
+                .output();
+        }
     }
-    let branch = format!("teamfly/{issue_id}/{agent_name}");
-    let _ = Command::new("git")
-        .args(["branch", "-D", &branch])
-        .current_dir(work_dir)
-        .output();
 }
 
-/// 删除某个议题的所有 worktree + 分支(关闭议题时调用)。
-pub fn remove_issue(work_dir: &Path, teamfly_dir: &Path, issue_id: u64, members: &[String]) {
-    for name in members {
-        remove(work_dir, teamfly_dir, issue_id, name);
+/// 删除某个 agent 的所有 worktree(按名字前缀匹配)。
+pub fn remove_agent(work_dir: &Path, teamfly_dir: &Path, agent_name: &str) {
+    let dir = teamfly_dir.join("worktrees");
+    let prefix = format!("{agent_name}-");
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                if name.starts_with(&prefix) && e.path().is_dir() {
+                    remove_dir(work_dir, &e.path());
+                }
+            }
+        }
+    }
+}
+
+/// 删除所有 worktree(关闭议题时)。
+pub fn remove_all(work_dir: &Path, teamfly_dir: &Path) {
+    let dir = teamfly_dir.join("worktrees");
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            if e.path().is_dir() {
+                remove_dir(work_dir, &e.path());
+            }
+        }
+    }
+}
+
+/// 读取 worktree 里当前所在的分支名。
+fn read_worktree_branch(wt_dir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(wt_dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if b.is_empty() || b == "HEAD" { None } else { Some(b) }
+}
+
+/// 获取 HEAD 的短 hash(用于分支命名)。
+fn get_short_hash(work_dir: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(work_dir)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => "unknown".to_string(),
     }
 }
 
@@ -125,6 +173,32 @@ pub fn list_stale(teamfly_dir: &Path) -> Vec<String> {
         .filter(|e| e.path().is_dir())
         .filter_map(|e| e.file_name().into_string().ok())
         .collect()
+}
+
+/// 找到某个 agent 最新的 worktree 目录和分支名(用于汇报时显示)。
+pub fn latest_for(teamfly_dir: &Path, agent_name: &str) -> Option<(PathBuf, String)> {
+    let dir = teamfly_dir.join("worktrees");
+    let prefix = format!("{agent_name}-");
+    let mut latest: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                if name.starts_with(&prefix) && e.path().is_dir() {
+                    // 取最新的(按名字排序,hash 不保证时间序,用修改时间)
+                    let p = e.path();
+                    if latest.as_ref().map_or(true, |prev| {
+                        p.metadata().and_then(|m| m.modified()).ok()
+                            > prev.metadata().and_then(|m| m.modified()).ok()
+                    }) {
+                        latest = Some(p);
+                    }
+                }
+            }
+        }
+    }
+    let wt_dir = latest?;
+    let branch = read_worktree_branch(&wt_dir)?;
+    Some((wt_dir, branch))
 }
 
 /// 获取 worktree 里相对于基准的 diff 摘要(几个文件改了)。

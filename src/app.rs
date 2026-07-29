@@ -412,11 +412,11 @@ fn handle_agent_done(
     let mut chat_text = crate::router::report_for_chat(&report, &mentions);
 
     // 如果用了 worktree，附上分支名和 diff 摘要，让用户知道改动在哪
-    let branch = format!("teamfly/{issue_id}/{name}");
-    let wt = crate::worktree::worktree_path(&m.teamfly_dir, issue_id, &name);
-    if wt.exists() {
-        let summary = crate::worktree::diff_summary(&m.work_dir, &branch);
-        chat_text.push_str(&format!("\n📂 分支 {branch} ({summary})"));
+    if let Some((wt_dir, branch)) = crate::worktree::latest_for(&m.teamfly_dir, &name) {
+        if wt_dir.exists() {
+            let summary = crate::worktree::diff_summary(&m.work_dir, &branch);
+            chat_text.push_str(&format!("\n📂 分支 {branch} ({summary})"));
+        }
     }
 
     let msg = ChatMsg { ts: now_ts(), author: name.clone(), text: chat_text, is_system: false };
@@ -615,15 +615,8 @@ fn handle_slash(m: &mut Model, slash: crate::slash::Slash) -> Vec<Command> {
             vec![]
         }
         Slash::Drop { name } => {
-            let issue_id = m.cur_issue().id;
-            let branch = format!("teamfly/{issue_id}/{name}");
-            let wt = crate::worktree::worktree_path(&m.teamfly_dir, issue_id, &name);
-            if !wt.exists() {
-                set_hint(m, format!("{name} 在当前议题没有 worktree"), 5);
-                return vec![];
-            }
-            crate::worktree::remove(&m.work_dir, &m.teamfly_dir, issue_id, &name);
-            set_hint(m, format!("已丢弃 {name} 的改动(分支 {branch} 已删)"), 8);
+            crate::worktree::remove_agent(&m.work_dir, &m.teamfly_dir, &name);
+            set_hint(m, format!("已丢弃 {name} 的所有 worktree 和分支"), 8);
             vec![]
         }
         Slash::Unknown { text } => {
@@ -801,7 +794,7 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     }
     // 关议题时把属于它的所有 worktree + 分支一起清掉
     let member_names: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
-    crate::worktree::remove_issue(&m.work_dir, &m.teamfly_dir, removed.id, &member_names);
+    crate::worktree::remove_all(&m.work_dir, &m.teamfly_dir);
     set_hint(m, format!("已关闭议题:{}", removed.name), 5);
     vec![Command::DeleteIssueFile { issue: removed.name }]
 }
