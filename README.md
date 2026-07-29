@@ -90,7 +90,9 @@ OPENAI_API_KEY = "${OPENAI_API_KEY}"
 
 - 同议题内的接力(TPM → DEV → REV)共享这个工作树,下游直接看得到上游改的文件,不需要合分支。
 - 交卷时汇报里会附一行 `📂 teamfly/issue-3 — 已提交 2 files changed … · 未提交 …`。
-- 采纳:`git merge teamfly/issue-3`。丢弃:`/drop`(或直接不理它)。整个议题一个字都没改过时 worktree 会被自动回收。
+- 这就是仓库里一个普通分支,怎么处理随你:`git push origin teamfly/issue-3` 推上去开 MR/PR、
+  `git merge` 本地合、`git cherry-pick` 只挑一部分、或者 `git diff main..teamfly/issue-3` 先看看。
+- 丢弃:`/drop`(或直接不理它)。整个议题一个字都没改过时 worktree 会被自动回收。
 - 关闭议题(`^W`)会连带删掉它的 worktree 和分支。
 
 ## 架构
