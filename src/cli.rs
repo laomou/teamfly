@@ -23,233 +23,17 @@ pub enum Cmd {
         #[arg(long)]
         team: Option<String>,
     },
-    /// 交互式配置用户级 ~/.teamfly/env.toml(输入 BASE_URL / KEY)
-    Init,
-}
-
-/// 交互式初始化用户级配置:问 claude/codex 的 BASE_URL 和 KEY,写 ~/.teamfly/env.toml。
-///
-/// 会**读取现有文件里的值当默认值**。以前是无条件全量重写,用户手写的
-/// `[codex]` 段、ANTHROPIC_MODEL 之类会在再跑一次 init 后静默消失,
-/// 而提示语「直接回车跳过」又让人以为跳过 = 保留原值。
-pub fn init() -> Result<()> {
-    let path = crate::env::user_env_path()
-        .ok_or_else(|| anyhow::anyhow!("无法确定 ~/.teamfly 路径(HOME 未设?)"))?;
-
-    println!("配置 teamfly 用户级环境变量 → {}", path.display());
-
-    // 读现有配置作默认值
-    let existing = read_existing_env(&path);
-    if !existing.is_empty() {
-        println!("(已读到现有配置,回车即保留方括号里的原值)");
-    }
-    println!("(密钥输入不回显;回车跳过某项)\n");
-
-    let cur = |section: &str, key: &str| -> String {
-        existing
-            .get(&format!("{section}.{key}"))
-            .cloned()
-            .unwrap_or_default()
-    };
-
-    println!("── claude backend ──");
-    let anthropic_base = prompt_line(
-        "ANTHROPIC_BASE_URL",
-        &or_default(cur("claude", "ANTHROPIC_BASE_URL"), "https://api.anthropic.com"),
-    )?;
-    let anthropic_token = prompt_secret("ANTHROPIC_AUTH_TOKEN", &cur("claude", "ANTHROPIC_AUTH_TOKEN"))?;
-
-    println!("\n── codex backend(可跳过)──");
-    let openai_base = prompt_line("OPENAI_BASE_URL", &cur("codex", "OPENAI_BASE_URL"))?;
-    let openai_key = prompt_secret("OPENAI_API_KEY", &cur("codex", "OPENAI_API_KEY"))?;
-
-    // 在**现有 toml 树上原地改**这四个 key,再整棵序列化回去。
-    //
-    // 以前是手拼字符串 `K = "{v}"`:值里含 `"` 或 `\` 就写出非法 TOML,
-    // 下次 teamfly 在 env::load 就 bail,TUI 根本进不去;而且只认识
-    // claude/codex/顶层标量三处,别的段、嵌套表、数组一律被静默删掉。
-    // 交给 toml crate 序列化则转义和结构都不用自己操心。
-    let mut table: toml::Table = match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_default(),
-        Err(_) => toml::Table::new(),
-    };
-    set_or_remove(&mut table, "claude", "ANTHROPIC_BASE_URL", &anthropic_base);
-    set_or_remove(&mut table, "claude", "ANTHROPIC_AUTH_TOKEN", &anthropic_token);
-    set_or_remove(&mut table, "codex", "OPENAI_BASE_URL", &openai_base);
-    set_or_remove(&mut table, "codex", "OPENAI_API_KEY", &openai_key);
-
-    // 清掉空段(比如 codex 全跳过时),免得留一行光秃秃的 [codex]
-    table.retain(|_, v| !matches!(v.as_table(), Some(t) if t.is_empty()));
-
-    let body = toml::to_string_pretty(&table)?;
-    let out = format!(
-        "# teamfly 用户级 agent 环境变量(teamfly init 生成/更新)\n\
-         # 注意:项目里若有 <工作目录>/.teamfly/env.toml,它会**整体顶替**本文件,\n\
-         # 不是逐 key 覆盖 —— 项目级里没写的 key(比如 token)不会从这里继承。\n\n{body}"
-    );
-
-    // 原子 + 0600 写入(不再「先 0644 再 chmod」留可读窗口)
-    crate::env::write_private(&path, &out)?;
-    println!("\n✓ 已写入 {}(权限 0600)", path.display());
-
-    // 顺手建 ~/.teamfly/mcp.json 骨架(不存在才建)
-    if let Some(mcp) = crate::env::user_mcp_path() {
-        if crate::env::seed_user_mcp(&mcp).unwrap_or(false) {
-            println!("✓ 已建 MCP 骨架 {}(需要接 MCP 时在这里加)", mcp.display());
-        }
-    }
-    Ok(())
-}
-
-/// 往 `[section]` 里写一个 key;值为空则删掉这个 key(而不是写空串)。
-/// 段不存在会新建;段存在但不是表(用户写歪了)则不动,免得把它的内容冲掉。
-fn set_or_remove(table: &mut toml::Table, section: &str, key: &str, value: &str) {
-    let entry = table
-        .entry(section.to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let Some(sub) = entry.as_table_mut() else { return };
-    if value.is_empty() {
-        sub.remove(key);
-    } else {
-        sub.insert(key.to_string(), toml::Value::String(value.to_string()));
-    }
-}
-
-fn or_default(v: String, fallback: &str) -> String {
-    if v.is_empty() { fallback.to_string() } else { v }
-}
-
-/// 读现有 env.toml,拉平成 "段.key" → 值(顶层 key 的段名为空串)。
-/// 解析失败就当没有 —— 但要明说,别让用户以为原值被保留了。
-fn read_existing_env(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
-    let mut out = std::collections::BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return out;
-    };
-    let table: toml::Table = match toml::from_str(&text) {
-        Ok(t) => t,
-        Err(e) => {
-            println!("⚠ 现有 {} 解析失败({e});这次将按空配置重写,原文件内容会丢失。", path.display());
-            return out;
-        }
-    };
-    for (k, v) in table {
-        match v {
-            toml::Value::Table(sub) => {
-                for (sk, sv) in sub {
-                    if let Some(s) = scalar(&sv) {
-                        out.insert(format!("{k}.{sk}"), s);
-                    }
-                }
-            }
-            other => {
-                if let Some(s) = scalar(&other) {
-                    out.insert(format!(".{k}"), s);
-                }
-            }
-        }
-    }
-    out
-}
-
-fn scalar(v: &toml::Value) -> Option<String> {
-    match v {
-        toml::Value::String(s) => Some(s.clone()),
-        toml::Value::Integer(i) => Some(i.to_string()),
-        toml::Value::Boolean(b) => Some(b.to_string()),
-        toml::Value::Float(f) => Some(f.to_string()),
-        _ => None,
-    }
-}
-
-fn prompt_line(label: &str, default: &str) -> Result<String> {
-    prompt_line_inner(label, default, false)
-}
-
-/// 按行读,但**不回显默认值** —— 用于密钥的非交互回退路径。
-/// 直接把旧 key 打在提示里等于又泄露一次(会进 stdout / 日志 / CI 输出)。
-fn prompt_line_secret(label: &str, default: &str) -> Result<String> {
-    prompt_line_inner(label, default, true)
-}
-
-fn prompt_line_inner(label: &str, default: &str, hide_default: bool) -> Result<String> {
-    use std::io::Write;
-    if default.is_empty() {
-        print!("{label}: ");
-    } else if hide_default {
-        print!("{label} [已有值,回车保留]: ");
-    } else {
-        print!("{label} [{default}]: ");
-    }
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let v = line.trim().to_string();
-    Ok(if v.is_empty() { default.to_string() } else { v })
-}
-
-/// 读一个密钥:不回显。
-///
-/// 以前用普通 read_line,key 会原样打在屏幕上并留在 scrollback 里 ——
-/// 在 tmux/screen 里跑(这是个 TUI 工具,很常见)就进了它的缓冲区,
-/// 开了 pipe-pane / script / asciinema 录制的话直接落进明文日志。
-fn prompt_secret(label: &str, default: &str) -> Result<String> {
-    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    use std::io::{IsTerminal, Write};
-
-    // 非交互(管道/脚本喂 stdin):既没法关回显,也不存在 scrollback 泄露,
-    // 退回按行读。否则 raw mode 会直接报 os error 6,整个 init 都跑不起来。
-    if !std::io::stdin().is_terminal() {
-        return prompt_line_secret(label, default);
-    }
-
-    let masked = if default.is_empty() {
-        String::new()
-    } else {
-        " [已有值,回车保留]".to_string()
-    };
-    print!("{label}{masked}: ");
-    std::io::stdout().flush()?;
-
-    // raw mode 起不来(比如被重定向)也退回按行读,别让 init 整个失败
-    if crossterm::terminal::enable_raw_mode().is_err() {
-        return prompt_line_secret(label, default);
-    }
-    let mut buf = String::new();
-    let result = loop {
-        match event::read() {
-            Ok(Event::Key(k)) => match k.code {
-                KeyCode::Enter => break Ok(()),
-                KeyCode::Backspace => {
-                    buf.pop();
-                }
-                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    break Err(anyhow::anyhow!("已取消"));
-                }
-                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    buf.clear();
-                }
-                KeyCode::Char(c) => buf.push(c),
-                _ => {}
-            },
-            Ok(_) => {}
-            Err(e) => break Err(e.into()),
-        }
-    };
-    crossterm::terminal::disable_raw_mode()?; // 无论成败都恢复,别把终端留在 raw
-    println!();
-    result?;
-
-    let v = buf.trim().to_string();
-    Ok(if v.is_empty() { default.to_string() } else { v })
 }
 
 /// 组装初始 Model。
 pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, Vec<String>)> {
     let work_dir = dir
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("."));
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let work_dir = match work_dir.canonicalize() {
+        Ok(d) if d.is_dir() => d,
+        Ok(d) => bail!("不是目录: {}", d.display()),
+        Err(e) => bail!("路径无效: {} ({e})", work_dir.display()),
+    };
 
     let teamfly_dir = work_dir.join(".teamfly");
     std::fs::create_dir_all(&teamfly_dir)?;
@@ -257,17 +41,10 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
     // 首次运行:播种内置默认团队到 .teamfly/teams/default(已存在则不动)
     crate::builtin::seed_default(&teamfly_dir)?;
 
-    // 加载 agent 环境变量(.teamfly/env.toml,可选)
-    let agent_env = crate::env::load(&teamfly_dir)?;
-
     // 团队来源优先级:--team > 唯一/default 团队
     let team_dir = resolve_team_dir(team_arg, &teamfly_dir)?;
     let team = team::load_team(&team_dir)?;
     let mut warns = team::preflight(&team);
-    // env.toml 里未展开的 ${VAR}
-    for name in &agent_env.unresolved {
-        warns.push(format!("env.toml 里 ${{{name}}} 未定义,将按字面量传给 agent"));
-    }
 
     // 恢复落盘的议题;没有则建一个默认议题
     let (mut issues, issue_warns) = crate::issue::load_all_issues(&teamfly_dir)?;
@@ -300,7 +77,6 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
         team_name: team.name,
         work_dir,
         teamfly_dir,
-        agent_env,
         members: team.members,
         issues,
         current_issue: 0,
@@ -343,6 +119,8 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
             "git 没配 user.name / user.email,agent 在 worktree 里 commit 会失败".into(),
         );
     }
+    // codex 的 provider 配置(codex 自己管理,不需要 teamfly 插手)
+
     // .teamfly/ 里有 API key,必须确保它被 git 忽略
     if crate::worktree::ensure_teamfly_ignored(&model.work_dir) {
         warns.push(".teamfly/ 未被忽略,已自动加进 .gitignore(里面有 API key)".into());

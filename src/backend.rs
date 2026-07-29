@@ -17,8 +17,6 @@ pub struct RunSpec {
     pub gen: u64,
     pub backend: BackendKind,
     pub model: Option<String>,
-    /// 注入到子进程的环境变量(来自 .teamfly/env.toml,全队共享)
-    pub env: std::collections::HashMap<String, String>,
     pub system_prompt: String,
     pub user_input: String,
     pub work_dir: PathBuf,
@@ -184,7 +182,7 @@ fn claude_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         "--append-system-prompt".to_string(),
         spec.system_prompt.clone(),
     ];
-    // 模型不走 --model,改由 env ANTHROPIC_MODEL 接管(见 run_process 里的注入逻辑)
+    // 模型不走 --model,改由 env 变量注入(见 run_process 里的 cmd.env)
     // MCP 配置已在 spawn 时从主 work_dir 解析好(worktree 里没有 .teamfly/)
     if let Some(mcp) = &spec.mcp_config {
         args.push("--mcp-config".into());
@@ -217,22 +215,26 @@ pub fn resolve_mcp_config(work_dir: &std::path::Path) -> Option<String> {
 
 /// 构造 codex CLI 非交互命令(JSONL 事件流 + 跳过 git/sandbox 检查)。
 fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
-    // codex 无「追加系统 prompt」的稳定 flag,把系统 prompt 前置进输入。
     let combined = format!("{}\n\n{}", spec.system_prompt, user_input);
     let mut args = vec![
         "exec".to_string(),
         "--json".to_string(),                // JSONL 事件流
         "--skip-git-repo-check".to_string(), // 不要求工作目录是 git 库
     ];
+    // codex 的 provider 配置(codex 自己管理,不需要 teamfly 插手)
+
     if spec.read_only {
-        // 只读成员直接在用户主工作树里跑,必须禁写(和 claude 的 plan 模式对齐)
         args.push("--sandbox".to_string());
         args.push("read-only".to_string());
     } else {
-        args.push("--dangerously-bypass-approvals-and-sandbox".to_string()); // 无拍板
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
+
+    if let Some(m) = &spec.model {
+        args.push("--model".to_string());
+        args.push(m.clone());
     }
     args.push(combined);
-    // 模型不走 --model,改由 env 接管
     ProcSpec {
         bin: "codex".into(),
         args,
@@ -263,11 +265,7 @@ async fn run_process(
         // 这些 agent 跑的是 bypassPermissions,留下来会继续改工作区。
         .kill_on_drop(true);
 
-    // 模型不走 --model,改由 env 注入
-    // 优先级:继承值 < env.toml(spec.env) < frontmatter model(最高,cmd.env 最后覆盖)
-    // 先注入 env.toml
-    cmd.envs(&spec.env);
-    // 再覆盖 frontmatter model(若指定)
+    // 环境变量直接继承自父进程;frontmatter model 通过 cmd.env 覆盖(若指定)
     if let Some(m) = &spec.model {
         let env_key = match spec.backend {
             BackendKind::Claude => "ANTHROPIC_MODEL",
@@ -390,7 +388,6 @@ fn push_tail(tail: &mut Vec<String>, line: &str) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,7 +400,6 @@ mod tests {
             gen: 0,
             backend,
             model: None,
-            env: std::collections::HashMap::new(),
             system_prompt: "sp".into(),
             user_input: "ui".into(),
             work_dir: PathBuf::from("/tmp"),
