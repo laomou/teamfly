@@ -175,7 +175,6 @@ pub struct Model {
     pub work_dir: std::path::PathBuf,
     pub teamfly_dir: std::path::PathBuf,
     /// agent 环境变量集合(全局 + 按 backend 分段;来自 .teamfly/env.toml)
-    pub agent_env: crate::env::AgentEnv,
     pub members: Vec<Member>,
     pub issues: Vec<Issue>,
     pub current_issue: usize,
@@ -278,7 +277,6 @@ pub enum Command {
         gen: u64,
         backend: BackendKind,
         model: Option<String>,
-        env: std::collections::HashMap<String, String>,
         system_prompt: String,
         user_input: String, // 增量前情 + 本次指派
         /// 只读成员:主目录 + 无写权限

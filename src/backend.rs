@@ -17,8 +17,6 @@ pub struct RunSpec {
     pub gen: u64,
     pub backend: BackendKind,
     pub model: Option<String>,
-    /// 注入到子进程的环境变量(来自 .teamfly/env.toml,全队共享)
-    pub env: std::collections::HashMap<String, String>,
     pub system_prompt: String,
     pub user_input: String,
     pub work_dir: PathBuf,
@@ -268,10 +266,8 @@ async fn run_process(
         .kill_on_drop(true);
 
     // 模型不走 --model,改由 env 注入
-    // 优先级:继承值 < env.toml(spec.env) < frontmatter model(最高,cmd.env 最后覆盖)
-    // 先注入 env.toml
-    cmd.envs(&spec.env);
-    // 再覆盖 frontmatter model(若指定)
+    // 环境变量直接继承自父进程,不需要 teamfly 注入
+    // frontmatter model 覆盖(若指定)
     if let Some(m) = &spec.model {
         let env_key = match spec.backend {
             BackendKind::Claude => "ANTHROPIC_MODEL",
@@ -406,7 +402,6 @@ mod tests {
             gen: 0,
             backend,
             model: None,
-            env: std::collections::HashMap::new(),
             system_prompt: "sp".into(),
             user_input: "ui".into(),
             work_dir: PathBuf::from("/tmp"),
