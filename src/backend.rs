@@ -182,7 +182,7 @@ fn claude_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         "--append-system-prompt".to_string(),
         spec.system_prompt.clone(),
     ];
-    // 模型不走 --model,改由 env ANTHROPIC_MODEL 接管(见 run_process 里的注入逻辑)
+    // 模型不走 --model,改由 env 变量注入(见 run_process 里的 cmd.env)
     // MCP 配置已在 spawn 时从主 work_dir 解析好(worktree 里没有 .teamfly/)
     if let Some(mcp) = &spec.mcp_config {
         args.push("--mcp-config".into());
@@ -265,9 +265,7 @@ async fn run_process(
         // 这些 agent 跑的是 bypassPermissions,留下来会继续改工作区。
         .kill_on_drop(true);
 
-    // 模型不走 --model,改由 env 注入
-    // 环境变量直接继承自父进程,不需要 teamfly 注入
-    // frontmatter model 覆盖(若指定)
+    // 环境变量直接继承自父进程;frontmatter model 通过 cmd.env 覆盖(若指定)
     if let Some(m) = &spec.model {
         let env_key = match spec.backend {
             BackendKind::Claude => "ANTHROPIC_MODEL",
