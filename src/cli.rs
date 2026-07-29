@@ -331,6 +331,10 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
             "有 {stale} 个 agent worktree 留在 .teamfly/worktrees/,可用 /drop <名> 清理"
         ));
     }
+    // 非 git 仓库:worktree 隔离不可用,退回到共用模式
+    if !model.work_dir.join(".git").exists() {
+        warns.push("工作目录不是 git 仓库,agent 之间不隔离,并发写文件可能冲突".into());
+    }
     // agent 在 worktree 里 commit 需要 git 身份;没配的话它一提交就失败,
     // 而改动只留在工作区,用户很难看出发生了什么
     if crate::worktree::missing_git_identity(&model.work_dir) {

@@ -94,7 +94,7 @@ fn pick_free_branch(work_dir: &Path, agent_name: &str, short_hash: &str) -> Stri
     if !branch_exists(work_dir, &base) {
         return base;
     }
-    for n in 2..1000 {
+    for n in 2..20 {
         let cand = format!("{base}-{n}");
         if !branch_exists(work_dir, &cand) {
             return cand;
@@ -138,6 +138,9 @@ fn enforce_cap(work_dir: &Path, teamfly_dir: &Path, issue_id: u64) {
         return;
     }
     for old in &existing[..existing.len() - keep] {
+        if let Some(name) = old.file_name().and_then(|n| n.to_str()) {
+            eprintln!("teamfly: worktree 已达上限({WORKTREE_CAP}),删最旧的 {name}");
+        }
         remove_dir(work_dir, old);
     }
 }
@@ -368,9 +371,15 @@ pub fn ensure_teamfly_ignored(work_dir: &Path) -> bool {
     if ignored {
         return false;
     }
-    // 追加到项目 .gitignore
+    // 追加到项目 .gitignore。但先检查是否已有 .teamfly/ 规则
+    // (包括被否定规则覆盖的情况 —— 用户自己配了 !.teamfly/ 说明他有意要追踪它,
+    //  teamfly 不该替用户改这个配置)。
     let path = work_dir.join(".gitignore");
-    let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == ".teamfly/") {
+        return false; // 已有规则,不管是否被否定,都不动
+    }
+    let mut content = existing;
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
