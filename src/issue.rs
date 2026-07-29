@@ -76,8 +76,7 @@ pub fn delete_file(teamfly_dir: &Path, id: u64, issue_name: &str) -> Result<()> 
     Ok(())
 }
 
-/// 从盘上重放所有 issue(重开恢复 tab 与时间线)。
-/// 读回落盘的议题。第二个返回值是需要提示给用户的告警(读不了的文件等) ——
+/// 读回落盘的议题(重开恢复 tab 与时间线)。第二个返回值是需要提示给用户的告警(读不了的文件等) ——
 /// 这些必须进 TUI 的预检消息,不能只往 stderr 打(马上就进备用屏了)。
 pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> {
     let dir = issues_dir(teamfly_dir);

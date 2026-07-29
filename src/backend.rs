@@ -177,7 +177,7 @@ fn claude_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         "--permission-mode".to_string(),
         mode.to_string(),
         "--disallowedTools".to_string(),
-        "AskUserQuestion".to_string(), // 无拍板:禁 agent 反问
+        "AskUserQuestion".to_string(), // 禁 agent 反问(没有人在终端那头等着答)
         "--append-system-prompt".to_string(),
         spec.system_prompt.clone(),
     ];
@@ -219,8 +219,6 @@ fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         "--json".to_string(),                // JSONL 事件流
         "--skip-git-repo-check".to_string(), // 不要求工作目录是 git 库
     ];
-    // codex 的 provider 配置(codex 自己管理,不需要 teamfly 插手)
-
     if spec.read_only {
         args.push("--sandbox".to_string());
         args.push("read-only".to_string());

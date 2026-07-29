@@ -127,8 +127,6 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
         m.show_help = false;
     }
 
-    // status_hint 会在下面被清:见「_tick 自动过期」;这里不再无条件清
-
     // Alt+数字:切议题(比 Ctrl+数字 兼容性好——不少终端根本不发 Ctrl+数字)
     if k.modifiers.contains(KeyModifiers::ALT) {
         if let KeyCode::Char(c) = k.code {
@@ -312,7 +310,7 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
     let issue_id = m.cur_issue().id;
 
     // 自动取名:议题名是「议题N」这种自动生成的、且时间线为空(只可能有系统欢迎消息也算)
-    // 用当前消息前 20 字符作新名字,把旧的 jsonl(如果存在)删掉
+    // 用当前消息前 20 字符作新名字,已落盘的 jsonl 一起改名
     let is_auto_name = m.cur_issue().name.starts_with("议题")
         && m.cur_issue().name[6..].chars().all(|c| c.is_ascii_digit())
         || m.cur_issue().name == "默认议题";
@@ -500,7 +498,7 @@ fn dispatch(
 
     // 同议题内的写手必须串行:一个议题共享一个 worktree,两个写手同时在里面
     // 改文件就会互相踩(而共享 worktree 正是接力能直接看到上游改动的前提)。
-    // 只读成员(worktree: false,在主目录只读)不占这个位置,可以随时跑。
+    // 只读成员(read_only: true,在主目录只读)不占这个位置,可以随时跑。
     let writer_busy = !m.members[i].read_only
         && m.members.iter().enumerate().any(|(j, other)| {
             j != i
@@ -577,7 +575,6 @@ fn drain_inbox(m: &mut Model, name: &str) -> Vec<Command> {
     }
 }
 
-/// 把所有成员 inbox 队头能派的活都放出来(Ctrl+P 恢复暂停后用)。
 /// 某成员交卷后放行排队的活。
 ///
 /// 不能只 drain 它自己的队列:写手交卷会腾出**这个议题的 worktree 位置**,
@@ -611,7 +608,6 @@ fn now_ts() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
-/// 生成一个未占用的议题名:议题2、议题3…(默认议题算 1 号)。
 /// 生成一个未占用的议题名:议题2、议题3…(默认议题算 1 号)。
 pub fn next_issue_name(issues: &[Issue]) -> String {
     let existing: std::collections::HashSet<&str> = issues.iter().map(|i| i.name.as_str()).collect();
@@ -1221,7 +1217,7 @@ mod e2e {
         // BS(0x08) 也应删除
         key(&mut m, KeyCode::Char('\u{8}'));
         assert_eq!(m.input, "");
-        // Ctrl+U 清空(Ctrl+H 已让位给帮助的传统语义,不再删字符)
+        // Ctrl+U 清空输入行
         for c in "xy".chars() { key(&mut m, KeyCode::Char(c)); }
         ctrl(&mut m, 'u');
         assert_eq!(m.input, "");
@@ -1613,7 +1609,7 @@ mod e2e {
     fn writers_in_same_issue_are_serialized() {
         let mut m = min_model();
         let id = m.issues[0].id;
-        // 三个成员都是写手(min_model 默认 worktree=true)
+        // 三个成员都是写手(min_model 默认 read_only: false)
         // 老K 正在为这个议题干活
         m.members[0].state = AgentState::Working;
         m.members[0].working_issue = Some(id);
@@ -1635,7 +1631,7 @@ mod e2e {
     fn readonly_members_do_not_block_writers() {
         let mut m = min_model();
         let id = m.issues[0].id;
-        // 老K 是只读成员(worktree: false),在主目录只读,不占 worktree
+        // 老K 是只读成员(read_only: true),在主目录只读,不占 worktree
         m.members[0].read_only = true;
         m.members[0].state = AgentState::Working;
         m.members[0].working_issue = Some(id);

@@ -41,25 +41,26 @@ default/
   内置队里 TPM/REV 是只读,DEV 可写。
 - 内置 `default` 队(TPM/DEV/REV)首次运行自动播种到工作目录的 `.teamfly/teams/default/`；旧的未修改 `team.md` / `QE.md` 会自动迁移(`DEV.md` 不迁移,想拿新版人设请自行删掉它再启动)。
 
-## 配置(env.toml / mcp.json)
+## 凭证与模型
 
-都放在工作目录的 `.teamfly/` 下:`env.toml`(注入给 agent 的环境变量)和
-`mcp.json`(MCP server 配置)。两个都是可选的,不存在就什么都不注入。
+teamfly **不管这些** —— agent 子进程直接继承你 shell 里的环境变量,
+`claude` / `codex` 各自读自己那套配置:
 
-`env.toml` 按 backend 分段,值支持 `${VAR}` 引用 shell 环境变量:
+```bash
+export ANTHROPIC_BASE_URL=https://api.anthropic.com
+export ANTHROPIC_AUTH_TOKEN=...
+export ANTHROPIC_MODEL=claude-opus-4-6      # 模型也走环境变量
 
-```toml
-[claude]
-ANTHROPIC_BASE_URL   = "https://api.anthropic.com"
-ANTHROPIC_AUTH_TOKEN = "${ANTHROPIC_AUTH_TOKEN}"
-ANTHROPIC_MODEL      = "claude-opus-4-6"
-
-[codex]
-OPENAI_API_KEY = "${OPENAI_API_KEY}"
+export OPENAI_API_KEY=...                   # codex 成员
 ```
 
-模型由 `ANTHROPIC_MODEL`(claude 成员)/ `OPENAI_MODEL`(codex 成员)决定;
-`env.toml` 里没写就继承你 shell 里的同名变量。
+中转站、模型选择、鉴权方式想怎么配就怎么配,和你平时直接用 `claude` / `codex`
+命令行时完全一样,teamfly 不在中间插一层。
+
+## MCP
+
+工作目录下的 `.teamfly/mcp.json` 存在时会作为 `--mcp-config` 传给 agent,
+不存在就不传。
 
 ## 工作机制
 
@@ -89,15 +90,15 @@ OPENAI_API_KEY = "${OPENAI_API_KEY}"
 - 关闭议题(`^W`)**不动分支** —— 关掉只是「不看了」,不销毁工作成果;worktree 目录只在没有
   未提交改动时才收掉,有未提交改动就一并留着并在提示里说明。
 - 启动时若发现 `.teamfly/` 没被 git 忽略,teamfly 会**自动往项目 `.gitignore` 追加一条 `.teamfly/`**
-  并在预检里告知 —— 因为 `.teamfly/env.toml` 里放的是 API key,不忽略的话 agent 一句 `git add -A`
-  就把密钥提交进历史了。你的 `.gitignore` 里已经有 `.teamfly/` 规则(哪怕被 `!.teamfly/` 否定)时不会动它。
+  并在预检里告知 —— 因为 `.teamfly/` 下有议题历史和 `mcp.json`(可能含鉴权 header),不忽略的话
+  agent 一句 `git add -A` 就把它们提交进去了。你的 `.gitignore` 里已经有 `.teamfly/` 规则(哪怕被 `!.teamfly/` 否定)时不会动它。
 - 工作目录不是 git 库时整套隔离不可用,退回所有 agent 共用工作目录(启动时会警告)。
 
 ## 架构
 
 手写 TEA-like:单一 `Model` + `Msg` 枚举 + 集中 `update` + `view`。tokio 所有并发事件源汇成一条 `mpsc<Msg>`,主循环逐条喂 `update`,无锁无竞态。副作用由 `update` 返回 `Command`、runtime 执行后回投 `Msg`。
 
-模块:`cli` · `team` · `backend` · `stream` · `router` · `issue` · `env` · `builtin` · `slash` · `tui` · `app` · `model`。
+模块:`cli` · `team` · `backend` · `stream` · `router` · `issue` · `builtin` · `slash` · `tui` · `app` · `model`。
 
 ## 测试
 
@@ -105,7 +106,7 @@ OPENAI_API_KEY = "${OPENAI_API_KEY}"
 cargo test
 ```
 
-纯函数单测(汇报提炼/@ 解析/剥 ANSI/env 展开与分段/claude+codex 事件解析)+ 键盘操作与议题增删测试。
+纯函数单测(汇报提炼/@ 解析/剥 ANSI/claude+codex 事件解析)+ 键盘操作与议题增删测试。
 
 ## 已知边界
 
