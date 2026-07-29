@@ -328,7 +328,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
     let stale = crate::worktree::count_stale(&model.teamfly_dir);
     if stale > 0 {
         warns.push(format!(
-            "有 {stale} 个 agent worktree 留在 .teamfly/worktrees/,可用 /drop <名> 清理"
+            "有 {stale} 个 agent worktree 留在 .teamfly/worktrees/(对应 teamfly/issue-* 分支)"
         ));
     }
     // 非 git 仓库:worktree 隔离不可用,退回到共用模式
