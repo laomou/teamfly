@@ -92,8 +92,9 @@ OPENAI_API_KEY = "${OPENAI_API_KEY}"
 - 交卷时汇报里会附一行 `📂 teamfly/issue-3 — 已提交 2 files changed … · 未提交 …`。
 - 这就是仓库里一个普通分支,怎么处理随你:`git push origin teamfly/issue-3` 推上去开 MR/PR、
   `git merge` 本地合、`git cherry-pick` 只挑一部分、或者 `git diff main..teamfly/issue-3` 先看看。
-- 丢弃:`/drop`(或直接不理它)。整个议题一个字都没改过时 worktree 会被自动回收。
-- 关闭议题(`^W`)会连带删掉它的 worktree 和分支。
+- 丢弃:`git branch -D teamfly/issue-3`(或直接不理它)。整个议题一个字都没改过时 worktree 会被自动回收。
+- 关闭议题(`^W`)**不动分支** —— 关掉只是「不看了」,不销毁工作成果;worktree 目录只在没有
+  未提交改动时才收掉,有未提交改动就一并留着并在提示里说明。
 
 ## 架构
 

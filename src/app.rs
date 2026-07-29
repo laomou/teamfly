@@ -670,18 +670,8 @@ fn handle_slash(m: &mut Model, slash: crate::slash::Slash) -> Vec<Command> {
             }
             vec![]
         }
-        Slash::Drop { name } => {
-            let id = m.cur_issue().id;
-            let n = usize::from(crate::worktree::remove_issue(&m.work_dir, &m.teamfly_dir, id));
-            if n == 0 {
-                set_hint(m, format!("{name} 在当前议题没有 worktree"), 5);
-            } else {
-                set_hint(m, format!("已丢弃 {name} 的 {n} 个 worktree 和对应分支"), 8);
-            }
-            vec![]
-        }
         Slash::Unknown { text } => {
-            set_hint(m, format!("未知斜杠命令:{text}(试试 /team <名> / /drop <名>)"), 5);
+            set_hint(m, format!("未知斜杠命令:{text}(只有 /team <名>)"), 5);
             vec![]
         }
     }
@@ -853,10 +843,19 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     for mem in &mut m.members {
         mem.last_seen.remove(&removed.id);
     }
-    // 关议题时只清掉**这个议题**的 worktree。以前是删全部,
-    // 会把别的议题里用户还没采纳的改动一起干掉。
-    crate::worktree::remove_issue(&m.work_dir, &m.teamfly_dir, removed.id);
-    set_hint(m, format!("已关闭议题:{}", removed.name), 5);
+    // 关议题**不动分支** —— 关掉只是「我不看了」,不该销毁工作成果。
+    // 分支留着,用户随时可以 push 开 MR / merge / 以后再删(`/drop`)。
+    // 目录只在干净时收掉;有未提交改动就一并留着并告知。
+    let branch = crate::worktree::issue_branch(removed.id);
+    let (_, dirty) = crate::worktree::release_issue(&m.work_dir, &m.teamfly_dir, removed.id);
+    let tail = if dirty {
+        format!("(分支 {branch} 和它的 worktree 都留着,里面有未提交的改动)")
+    } else if crate::worktree::branch_exists(&m.work_dir, &branch) {
+        format!("(分支 {branch} 留着;不要了就 git branch -D 它)")
+    } else {
+        String::new()
+    };
+    set_hint(m, format!("已关闭议题:{}{tail}", removed.name), 8);
     vec![Command::DeleteIssueFile { issue_id: removed.id, issue: removed.name }]
 }
 
