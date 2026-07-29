@@ -315,6 +315,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
         status_hint: None,
         status_hint_until: 0,
         pending_delete: None,
+        pending_delete_note: String::new(),
         show_help: false,
         cancel: tokio_util::sync::CancellationToken::new(),
         team_gen: 0,
