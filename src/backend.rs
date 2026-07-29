@@ -217,22 +217,44 @@ pub fn resolve_mcp_config(work_dir: &std::path::Path) -> Option<String> {
 
 /// 构造 codex CLI 非交互命令(JSONL 事件流 + 跳过 git/sandbox 检查)。
 fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
-    // codex 无「追加系统 prompt」的稳定 flag,把系统 prompt 前置进输入。
     let combined = format!("{}\n\n{}", spec.system_prompt, user_input);
     let mut args = vec![
         "exec".to_string(),
         "--json".to_string(),                // JSONL 事件流
         "--skip-git-repo-check".to_string(), // 不要求工作目录是 git 库
     ];
+
+    // 选用 teamfly 的 provider(已在 ~/.codex/config.toml 里定义了 _tf provider)。
+    // 用户没配 codex 时这条 -c 会被忽略,退回 codex 默认 provider。
+    // 检查 _tf provider 是否真的存在(在 ~/.codex/config.toml 里)
+    // 不存在就不加,codex 用自己的默认 provider
+    static CODEX_HAS_TF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let has_tf = CODEX_HAS_TF.get_or_init(|| {
+        let codex_home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")));
+        let Some(cfg) = codex_home.map(|p| p.join("config.toml")) else { return false };
+        let Ok(text) = std::fs::read_to_string(&cfg) else { return false };
+        let Ok(table) = text.parse::<toml::Table>() else { return false };
+        table.get("model_providers").and_then(|v| v.as_table()).is_some_and(|p| p.contains_key("_tf"))
+    });
+    if *has_tf {
+        args.push("-c".to_string());
+        args.push("model_provider=_tf".to_string());
+    }
+
     if spec.read_only {
-        // 只读成员直接在用户主工作树里跑,必须禁写(和 claude 的 plan 模式对齐)
         args.push("--sandbox".to_string());
         args.push("read-only".to_string());
     } else {
-        args.push("--dangerously-bypass-approvals-and-sandbox".to_string()); // 无拍板
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
+
+    if let Some(m) = &spec.model {
+        args.push("--model".to_string());
+        args.push(m.clone());
     }
     args.push(combined);
-    // 模型不走 --model,改由 env 接管
     ProcSpec {
         bin: "codex".into(),
         args,

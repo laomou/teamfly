@@ -24,7 +24,7 @@
 use crate::model::BackendKind;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// backend 段名。
 const SECTION_KEYS: &[&str] = &["claude", "codex"];
@@ -161,6 +161,93 @@ pub fn seed_user_env(path: &Path) -> Result<bool> {
 "#;
     // 这个模板正文就在教用户把 token 填进来,所以从创建那一刻就得是 0600
     write_private(path, tmpl)?;
+    Ok(true)
+}
+
+/// 确保 ~/.codex/config.toml 里有 _tf provider。
+///
+/// 用户配了 OPENAI_BASE_URL 但 codex 不认识它,需要写一个 provider 定义进去。
+/// 写到 ~/.codex/config.toml(不是项目配置),一劳永逸,codex 自己就能用。
+pub fn seed_codex_provider(teamfly_dir: &Path) -> Result<bool> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            Some(PathBuf::from(home).join(".codex"))
+        });
+    let Some(codex_cfg) = codex_home.map(|p| p.join("config.toml")) else {
+        return Ok(false);
+    };
+
+    // 读项目级的 env.toml 取 BASE_URL
+    let project_env = teamfly_dir.join("env.toml");
+    let mut base_url = String::new();
+    if let Ok(text) = std::fs::read_to_string(&project_env) {
+        if let Ok(table) = text.parse::<toml::Table>() {
+            if let Some(codex_tbl) = table.get("codex").and_then(|v| v.as_table()) {
+                if let Some(url) = codex_tbl.get("OPENAI_BASE_URL").and_then(|v| v.as_str()) {
+                    base_url = url.to_string();
+                }
+            }
+        }
+    }
+    // 回退到用户级
+    if base_url.is_empty() {
+        if let Some(user_path) = user_env_path() {
+            if let Ok(text) = std::fs::read_to_string(&user_path) {
+                if let Ok(table) = text.parse::<toml::Table>() {
+                    if let Some(codex_tbl) = table.get("codex").and_then(|v| v.as_table()) {
+                        if let Some(url) = codex_tbl.get("OPENAI_BASE_URL").and_then(|v| v.as_str()) {
+                            base_url = url.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if base_url.is_empty() {
+        return Ok(false);
+    }
+
+    // normalize: 补 /v1 后缀
+    if !base_url.ends_with("/v1") {
+        if base_url.ends_with('/') {
+            base_url.push_str("v1");
+        } else {
+            base_url.push_str("/v1");
+        }
+    }
+
+    // 读现有 codex config,合并 _tf provider
+    let mut cfg: toml::Table = match std::fs::read_to_string(&codex_cfg) {
+        Ok(text) => toml::from_str(&text).unwrap_or_default(),
+        Err(_) => toml::Table::new(),
+    };
+
+    // 已经有 _tf 了 → 不动
+    if let Some(providers) = cfg.get("model_providers").and_then(|v| v.as_table()) {
+        if providers.contains_key("_tf") {
+            return Ok(false);
+        }
+    }
+
+    // 加 _tf provider
+    let mut provider = toml::Table::new();
+    provider.insert("name".into(), toml::Value::String("AgentFly".into()));
+    provider.insert("base_url".into(), toml::Value::String(base_url));
+    provider.insert("env_key".into(), toml::Value::String("OPENAI_API_KEY".into()));
+    provider.insert("wire_api".into(), toml::Value::String("responses".into()));
+
+    cfg.entry("model_providers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .unwrap()
+        .insert("_tf".to_string(), toml::Value::Table(provider));
+
+    // 写回去
+    // 这里不写 0600,codex config.toml 不含明文 key(key 从 env 拿)
+    std::fs::write(&codex_cfg, toml::to_string_pretty(&cfg).unwrap())
+        .with_context(|| format!("写入 {}", codex_cfg.display()))?;
     Ok(true)
 }
 
