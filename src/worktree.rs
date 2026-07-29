@@ -34,7 +34,7 @@ pub fn issue_branch(issue_id: u64) -> String {
 }
 
 /// 议题的 worktree 目录。
-pub fn issue_dir(teamfly_dir: &Path, issue_id: u64) -> PathBuf {
+fn issue_dir(teamfly_dir: &Path, issue_id: u64) -> PathBuf {
     teamfly_dir.join("worktrees").join(issue_id.to_string())
 }
 
@@ -137,9 +137,9 @@ pub fn release_issue(work_dir: &Path, teamfly_dir: &Path, issue_id: u64) -> (boo
     (removed, false)
 }
 
-/// 彻底删掉某议题的 worktree **和分支**（`/drop` —— 用户明确表示不要了）。
+/// 彻底删掉某议题的 worktree **和分支**（改动确认无价值时才用）。
 /// 返回是否真删了。
-pub fn remove_issue(work_dir: &Path, teamfly_dir: &Path, issue_id: u64) -> bool {
+fn remove_issue(work_dir: &Path, teamfly_dir: &Path, issue_id: u64) -> bool {
     let wt_dir = issue_dir(teamfly_dir, issue_id);
     if !wt_dir.exists() {
         return false;
@@ -277,7 +277,7 @@ pub fn missing_git_identity(work_dir: &Path) -> bool {
 
 /// 确保 `.teamfly/` 被 git 忽略。返回是否新写入了规则。
 ///
-/// `.teamfly/env.toml` 里放的是 API key。用户项目没 ignore 它的话,
+/// `.teamfly/` 下有议题历史和 `mcp.json`(可能带鉴权 header)。没 ignore 的话,
 /// 它会以未跟踪文件出现在 `git status` 里,agent 一句 `git add -A`
 /// 就把密钥提交进历史了(fallback 模式下 agent 就在主目录干活)。
 pub fn ensure_teamfly_ignored(work_dir: &Path) -> bool {

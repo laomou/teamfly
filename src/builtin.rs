@@ -77,7 +77,6 @@ pub fn seed_default(teamfly_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 返回是否真的做了迁移。
 fn migrate_legacy_default(root: &Path) -> Result<()> {
     let team_path = root.join("team.md");
     replace_if_unmodified(&team_path, LEGACY_TEAM, FILES[0].1)?;

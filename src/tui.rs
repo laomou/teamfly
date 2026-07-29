@@ -509,7 +509,7 @@ fn draw_input(f: &mut Frame, area: Rect, m: &Model) {
     let text = format!("> {}", m.input);
     f.render_widget(Paragraph::new(text).block(block), area);
     // 光标
-    let cx = area.x + 3 + display_width(&m.input) as u16;
+    let cx = area.x + 3 + str_cols(&m.input) as u16;
     let cy = area.y + 1;
     f.set_cursor_position((cx.min(area.x + area.width.saturating_sub(2)), cy));
 }
@@ -527,7 +527,7 @@ fn draw_hints(f: &mut Frame, area: Rect, m: &Model) {
 
     // pending_delete 未过期时,动态显示剩余秒(覆盖普通 hint)
     let dynamic_pending: Option<String> = m.pending_delete.and_then(|(idx, t0)| {
-        const WINDOW: u64 = 33; // 与 handle_close_issue 中一致
+        const WINDOW: u64 = crate::app::DELETE_CONFIRM_TICKS;
         let elapsed = m.tick.wrapping_sub(t0);
         if elapsed < WINDOW && idx < m.issues.len() {
             let remain_ticks = WINDOW - elapsed;
@@ -659,13 +659,6 @@ fn str_cols(s: &str) -> usize {
     s.width()
 }
 
-fn display_width(s: &str) -> usize {
-    // 粗略:CJK 记 2 宽,其余 1
-    s.chars()
-        .map(|c| if (c as u32) > 0x1100 { 2 } else { 1 })
-        .sum()
-}
-
 fn wrap_text(s: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![s.to_string()];
@@ -694,6 +687,17 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 输入行光标必须按**终端实际列宽**算,不能用「码点 > 0x1100 就算 2 列」的启发式。
+    /// 那个启发式把 `…`/`①` 算成 2 列、把带变体选择符的 emoji 算成 4 列,
+    /// 用户一打这些字符光标就飘到字的右边去。
+    #[test]
+    fn cursor_uses_real_terminal_width() {
+        assert_eq!(str_cols("你好"), 4);   // CJK 确实是 2 列
+        assert_eq!(str_cols("…"), 1);      // 启发式会说 2
+        assert_eq!(str_cols("①"), 1);      // 启发式会说 2
+        assert_eq!(str_cols("🛡\u{FE0F}"), 2); // 启发式会说 4(变体选择符也被算成 2)
+    }
 
     /// 极小终端不能 panic。
     ///

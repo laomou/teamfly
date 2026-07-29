@@ -20,6 +20,11 @@ use ratatui::Terminal;
 use std::io::Stdout;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+/// pending_delete 的确认窗口(tick 数,一 tick ≈ 150ms,33 tick ≈ 5s)。
+/// tui.rs 的倒计时显示共用这个值 —— 两边不一致的话,提示的剩余秒数
+/// 会和真正的过期时刻对不上。
+pub const DELETE_CONFIRM_TICKS: u64 = 33;
+
 /// 执行副作用的运行时环境(不含 Model,便于在借用 Model 的同时调用)。
 pub struct Runtime {
     tx: UnboundedSender<Msg>,
@@ -45,7 +50,7 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Command> {
             }
             // pending_delete 窗口过期自动清
             if let Some((_, t0)) = m.pending_delete {
-                if m.tick.wrapping_sub(t0) >= 33 {
+                if m.tick.wrapping_sub(t0) >= DELETE_CONFIRM_TICKS {
                     m.pending_delete = None;
                 }
             }
@@ -121,8 +126,6 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
         // 其他键(退格、字母…)关闭帮助并继续处理
         m.show_help = false;
     }
-
-    // status_hint 会在下面被清:见「_tick 自动过期」;这里不再无条件清
 
     // Alt+数字:切议题(比 Ctrl+数字 兼容性好——不少终端根本不发 Ctrl+数字)
     if k.modifiers.contains(KeyModifiers::ALT) {
@@ -307,7 +310,7 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
     let issue_id = m.cur_issue().id;
 
     // 自动取名:议题名是「议题N」这种自动生成的、且时间线为空(只可能有系统欢迎消息也算)
-    // 用当前消息前 20 字符作新名字,把旧的 jsonl(如果存在)删掉
+    // 用当前消息前 20 字符作新名字,已落盘的 jsonl 一起改名
     let is_auto_name = m.cur_issue().name.starts_with("议题")
         && m.cur_issue().name[6..].chars().all(|c| c.is_ascii_digit())
         || m.cur_issue().name == "默认议题";
@@ -495,7 +498,7 @@ fn dispatch(
 
     // 同议题内的写手必须串行:一个议题共享一个 worktree,两个写手同时在里面
     // 改文件就会互相踩(而共享 worktree 正是接力能直接看到上游改动的前提)。
-    // 只读成员(worktree: false,在主目录只读)不占这个位置,可以随时跑。
+    // 只读成员(read_only: true,在主目录只读)不占这个位置,可以随时跑。
     let writer_busy = !m.members[i].read_only
         && m.members.iter().enumerate().any(|(j, other)| {
             j != i
@@ -528,7 +531,6 @@ fn dispatch(
         issue: issue_id,
         gen: m.team_gen,
         backend: mem.backend,
-        model: mem.model.clone(),
         system_prompt: mem.system_prompt.clone(),
         user_input,
         read_only: mem.read_only,
@@ -573,7 +575,6 @@ fn drain_inbox(m: &mut Model, name: &str) -> Vec<Command> {
     }
 }
 
-/// 把所有成员 inbox 队头能派的活都放出来(Ctrl+P 恢复暂停后用)。
 /// 某成员交卷后放行排队的活。
 ///
 /// 不能只 drain 它自己的队列:写手交卷会腾出**这个议题的 worktree 位置**,
@@ -607,7 +608,6 @@ fn now_ts() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
-/// 生成一个未占用的议题名:议题2、议题3…(默认议题算 1 号)。
 /// 生成一个未占用的议题名:议题2、议题3…(默认议题算 1 号)。
 pub fn next_issue_name(issues: &[Issue]) -> String {
     let existing: std::collections::HashSet<&str> = issues.iter().map(|i| i.name.as_str()).collect();
@@ -796,8 +796,6 @@ fn derive_issue_name(first_msg: &str, issues: &[Issue], current: usize) -> Strin
     unreachable!()
 }
 
-/// pending_delete 的确认窗口(tick 数,一 tick ≈ 150ms,33 tick ≈ 5s)。
-const DELETE_CONFIRM_TICKS: u64 = 33;
 
 /// Ctrl+W:关闭当前议题。空议题一键关;有内容先提示确认,窗口期内再按才真删。
 fn handle_close_issue(m: &mut Model) -> Vec<Command> {
@@ -850,7 +848,7 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
         mem.last_seen.remove(&removed.id);
     }
     // 关议题**不动分支** —— 关掉只是「我不看了」,不该销毁工作成果。
-    // 分支留着,用户随时可以 push 开 MR / merge / 以后再删(`/drop`)。
+    // 分支留着,用户随时可以 push 开 MR / merge / 以后再删。
     // 目录只在干净时收掉;有未提交改动就一并留着并告知。
     let branch = crate::worktree::issue_branch(removed.id);
     let (_, dirty) = crate::worktree::release_issue(&m.work_dir, &m.teamfly_dir, removed.id);
@@ -912,7 +910,6 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             issue,
             gen,
             backend,
-            model: mdl,
             system_prompt,
             user_input,
             read_only,
@@ -934,8 +931,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                 issue,
                 gen,
                 backend,
-                model: mdl,
-                system_prompt,
+                    system_prompt,
                 user_input,
                 worktree: associated_branch.clone().map(|b| (agent_dir.clone(), b)),
                 work_dir: agent_dir,
@@ -1109,7 +1105,6 @@ pub mod test_support {
             role: "角色".into(),
             emoji: "👤".into(),
             backend: BackendKind::Claude,
-            model: None,
             read_only: false,
             system_prompt: String::new(),
             state: AgentState::Working,
@@ -1222,7 +1217,7 @@ mod e2e {
         // BS(0x08) 也应删除
         key(&mut m, KeyCode::Char('\u{8}'));
         assert_eq!(m.input, "");
-        // Ctrl+U 清空(Ctrl+H 已让位给帮助的传统语义,不再删字符)
+        // Ctrl+U 清空输入行
         for c in "xy".chars() { key(&mut m, KeyCode::Char(c)); }
         ctrl(&mut m, 'u');
         assert_eq!(m.input, "");
@@ -1614,7 +1609,7 @@ mod e2e {
     fn writers_in_same_issue_are_serialized() {
         let mut m = min_model();
         let id = m.issues[0].id;
-        // 三个成员都是写手(min_model 默认 worktree=true)
+        // 三个成员都是写手(min_model 默认 read_only: false)
         // 老K 正在为这个议题干活
         m.members[0].state = AgentState::Working;
         m.members[0].working_issue = Some(id);
@@ -1636,7 +1631,7 @@ mod e2e {
     fn readonly_members_do_not_block_writers() {
         let mut m = min_model();
         let id = m.issues[0].id;
-        // 老K 是只读成员(worktree: false),在主目录只读,不占 worktree
+        // 老K 是只读成员(read_only: true),在主目录只读,不占 worktree
         m.members[0].read_only = true;
         m.members[0].state = AgentState::Working;
         m.members[0].working_issue = Some(id);
@@ -1679,7 +1674,6 @@ mod e2e {
             role: role.into(),
             emoji: "👤".into(),
             backend,
-            model: None,
             read_only: false,
             system_prompt: if role == "架构" { "架构".into() } else { String::new() },
             state: AgentState::Idle,

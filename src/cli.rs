@@ -1,4 +1,4 @@
-//! CLI:teamfly work [工作目录] [--team <团队名字>] / teamfly init
+//! CLI:teamfly work [工作目录] [--team <团队名字>] —— 组装初始 Model。
 
 use crate::model::{Issue, Model, Selection};
 use crate::team;
@@ -119,11 +119,9 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
             "git 没配 user.name / user.email,agent 在 worktree 里 commit 会失败".into(),
         );
     }
-    // codex 的 provider 配置(codex 自己管理,不需要 teamfly 插手)
-
     // .teamfly/ 里有 API key,必须确保它被 git 忽略
     if crate::worktree::ensure_teamfly_ignored(&model.work_dir) {
-        warns.push(".teamfly/ 未被忽略,已自动加进 .gitignore(里面有 API key)".into());
+        warns.push(".teamfly/ 未被忽略,已自动加进 .gitignore(里面有议题历史和 MCP 配置)".into());
     }
 
     Ok((model, warns))
@@ -139,7 +137,7 @@ fn check_instance_lock(teamfly_dir: &std::path::Path) -> Option<String> {
             // pid 还活着?
             let alive = std::path::Path::new(&format!("/proc/{pid}")).is_dir();
             if alive && pid != std::process::id() {
-                // 写入自己的 pid(追加者模式:两边都知道对方在)
+                // 覆盖成自己的 pid:追加者模式,两边都知道对方在
                 let _ = std::fs::write(&lock, format!("{}", std::process::id()));
                 return Some(format!(
                     "另一个 teamfly (pid {pid}) 正在用这个目录,两边的议题历史可能互相覆盖,建议只开一个"
@@ -147,7 +145,7 @@ fn check_instance_lock(teamfly_dir: &std::path::Path) -> Option<String> {
             }
         }
     }
-    // 写入自己的 pid
+
     let _ = std::fs::write(&lock, format!("{}", std::process::id()));
     None
 }

@@ -16,7 +16,6 @@ pub struct RunSpec {
     /// 派活时的团队代号,原样回投给 AgentDone
     pub gen: u64,
     pub backend: BackendKind,
-    pub model: Option<String>,
     pub system_prompt: String,
     pub user_input: String,
     pub work_dir: PathBuf,
@@ -178,11 +177,10 @@ fn claude_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         "--permission-mode".to_string(),
         mode.to_string(),
         "--disallowedTools".to_string(),
-        "AskUserQuestion".to_string(), // 无拍板:禁 agent 反问
+        "AskUserQuestion".to_string(), // 禁 agent 反问(没有人在终端那头等着答)
         "--append-system-prompt".to_string(),
         spec.system_prompt.clone(),
     ];
-    // 模型不走 --model,改由 env 变量注入(见 run_process 里的 cmd.env)
     // MCP 配置已在 spawn 时从主 work_dir 解析好(worktree 里没有 .teamfly/)
     if let Some(mcp) = &spec.mcp_config {
         args.push("--mcp-config".into());
@@ -221,8 +219,6 @@ fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         "--json".to_string(),                // JSONL 事件流
         "--skip-git-repo-check".to_string(), // 不要求工作目录是 git 库
     ];
-    // codex 的 provider 配置(codex 自己管理,不需要 teamfly 插手)
-
     if spec.read_only {
         args.push("--sandbox".to_string());
         args.push("read-only".to_string());
@@ -230,10 +226,6 @@ fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     }
 
-    if let Some(m) = &spec.model {
-        args.push("--model".to_string());
-        args.push(m.clone());
-    }
     args.push(combined);
     ProcSpec {
         bin: "codex".into(),
@@ -265,14 +257,6 @@ async fn run_process(
         // 这些 agent 跑的是 bypassPermissions,留下来会继续改工作区。
         .kill_on_drop(true);
 
-    // 环境变量直接继承自父进程;frontmatter model 通过 cmd.env 覆盖(若指定)
-    if let Some(m) = &spec.model {
-        let env_key = match spec.backend {
-            BackendKind::Claude => "ANTHROPIC_MODEL",
-            BackendKind::Codex => "OPENAI_MODEL",
-        };
-        cmd.env(env_key, m);
-    }
 
     let mut child = cmd
         .spawn()
@@ -399,7 +383,6 @@ mod tests {
             issue: 1,
             gen: 0,
             backend,
-            model: None,
             system_prompt: "sp".into(),
             user_input: "ui".into(),
             work_dir: PathBuf::from("/tmp"),
