@@ -26,7 +26,7 @@ pub struct RunSpec {
     pub mcp_config: Option<String>,
     /// 这一轮的 worktree (目录, 分支);fallback 时为 None。原样回投给 AgentDone。
     pub worktree: Option<(PathBuf, String)>,
-    /// 只读:不给写权限。用于 `worktree: false` 的成员 ——
+    /// 只读:不给写权限。用于 `read_only: true` 的成员 ——
     /// 它们直接在**用户的主工作树**里跑,一旦能写就会污染用户工作区
     /// (最典型的是照着接力说明去 `git merge` 上游分支,把改动并进用户主分支,
     ///  绕掉「改动不自动进主分支、用户审批才 merge」这个核心保证)。
@@ -413,7 +413,7 @@ mod tests {
         }
     }
 
-    /// `worktree: false` 的成员直接在**用户主工作树**里跑,必须只读。
+    /// `read_only: true` 的成员直接在**用户主工作树**里跑,必须真的没有写权限。
     /// 一旦能写,它照着接力说明去 `git merge` 上游分支就会把改动并进用户主分支,
     /// 绕掉「改动不自动进主分支、用户审批才 merge」这个核心保证。
     #[test]
