@@ -819,12 +819,19 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
             _ => {
                 // 首次或超窗:登记 pending,提示
                 let n = m.issues[idx].timeline.len();
+                let id = m.issues[idx].id;
+                let name = m.issues[idx].name.clone();
                 m.pending_delete = Some((idx, m.tick));
-                let hint = format!(
-                    "议题「{}」有 {n} 条消息;再按 ^W 确认删除(5s 内)",
-                    m.issues[idx].name
-                );
-                set_hint(m, hint, 5);
+                // 说清 agent 的改动不会跟着一起没 —— 分支保留,只有聊天记录被删。
+                // 这里算好存进 Model:倒计时提示每帧重画,不能每帧 fork 一个 git 进程。
+                let branch = crate::worktree::issue_branch(id);
+                m.pending_delete_note = if crate::worktree::branch_exists(&m.work_dir, &branch) {
+                    format!("(改动留在 {branch})")
+                } else {
+                    String::new()
+                };
+                let note = m.pending_delete_note.clone();
+                set_hint(m, format!("议题「{name}」有 {n} 条消息{note};再按 ^W 确认删除"), 6);
                 return vec![];
             }
         }
@@ -1134,6 +1141,7 @@ pub mod test_support {
             status_hint: None,
             status_hint_until: 0,
             pending_delete: None,
+            pending_delete_note: String::new(),
             show_help: false,
             cancel: tokio_util::sync::CancellationToken::new(),
             team_gen: 0,
@@ -1199,6 +1207,7 @@ mod e2e {
             status_hint: None,
             status_hint_until: 0,
             pending_delete: None,
+            pending_delete_note: String::new(),
             show_help: false,
             cancel: tokio_util::sync::CancellationToken::new(),
             team_gen: 0,

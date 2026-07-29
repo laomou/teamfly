@@ -533,9 +533,10 @@ fn draw_hints(f: &mut Frame, area: Rect, m: &Model) {
             let remain_ticks = WINDOW - elapsed;
             let remain_secs = (remain_ticks * 150) / 1000 + 1;
             Some(format!(
-                "议题「{}」有 {} 条消息;再按 ^W 删除(剩 {}s)",
+                "议题「{}」有 {} 条消息{};再按 ^W 删除(剩 {}s)",
                 m.issues[idx].name,
                 m.issues[idx].timeline.len(),
+                m.pending_delete_note,
                 remain_secs
             ))
         } else {

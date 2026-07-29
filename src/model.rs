@@ -196,6 +196,10 @@ pub struct Model {
     pub status_hint_until: u64,
     /// 待删除议题的确认状态:(议题索引, 按下时的 tick)。5s(约 33 tick)内再按 Ctrl+W 才真删。
     pub pending_delete: Option<(usize, u64)>,
+    /// 二次确认时附带的「agent 改动会保留在哪个分支」说明。
+    /// 在 update 里算好(要跑 git 查分支是否存在),渲染层只负责显示 ——
+    /// 倒计时提示每帧重画,不能每帧 fork 一个 git 进程。
+    pub pending_delete_note: String,
     /// 是否显示帮助浮层(? 键切换)
     pub show_help: bool,
     /// 取消令牌:Ctrl+C / 退出时用它掐掉所有在跑的 agent 子进程。
