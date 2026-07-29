@@ -872,14 +872,17 @@ pub async fn run(model: Model) -> Result<()> {
 
     let (tx, rx) = unbounded_channel::<Msg>();
     let rt = Runtime::new(tx.clone());
-    // model 会被移进 run_loop,先把取消令牌取出来
+    // model 会被移进 run_loop,先把需要的东西取出来
     let cancel = model.cancel.clone();
+    let lock_path = model.teamfly_dir.join("teamfly.lock");
 
     let res = run_loop(&mut terminal, model, rt, tx, rx).await;
 
     // 退出前掐掉所有在跑的 agent。不然它们会变成孤儿,继续用 bypass 权限改工作区,
     // 而用户已经看不到任何界面了。
     cancel.cancel();
+    // 清掉实例锁(崩溃/panic 时 lock 留着也没事,下次启动会检测到 pid 已死并覆盖)
+    let _ = std::fs::remove_file(lock_path);
 
     // 清理:一律尽力而为,不用 ? 提前 return ——
     // 一旦中途 return,后面的 LeaveAlternateScreen/show_cursor 就不会执行,
@@ -956,28 +959,44 @@ fn translate_event(ev: Event, model: &Model) -> Option<Msg> {
     match ev {
         Event::Key(k) => Some(Msg::Key(k)),
         Event::Mouse(me) => {
-            if let MouseEventKind::Down(MouseButton::Left) = me.kind {
-                // tab 栏在 y=1(顶部品牌+tab 栏共 3 行,其中中间那行是内容)
-                if me.row == 1 {
-                    // 简化:tab 行上任何点击都当作「切议题」的鼠标操作:
-                    //   点在议题名区域 = 尝试命中(暂只支持整体切下一个/上一个)
-                    //   点在 [+ 新议题] = 新建
-                    // 精确热区需要跨层信息,这里先把 [+ 新议题] 大致识别为"点得比较靠右"
-                    return Some(Msg::MouseTabClick { col: me.column });
-                }
-                // 左栏点击(品牌角占 3 行,左栏内容从 y=3 起)
-                const BODY_TOP: u16 = 3;
-                if me.column < 20 && me.row >= BODY_TOP {
-                    let rel = me.row - BODY_TOP;
-                    if rel == 2 {
-                        return Some(Msg::Select(Selection::Chat));
-                    } else if rel >= 4 {
-                        let idx = ((rel - 4) / 2) as usize;
-                        if idx < model.members.len() {
-                            return Some(Msg::Select(Selection::Member(idx)));
+            match me.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // tab 栏在 y=1(顶部品牌+tab 栏共 3 行,其中中间那行是内容)
+                    if me.row == 1 {
+                        return Some(Msg::MouseTabClick { col: me.column });
+                    }
+                    // 左栏点击(品牌角占 3 行,左栏内容从 y=3 起)
+                    const BODY_TOP: u16 = 3;
+                    if me.column < 20 && me.row >= BODY_TOP {
+                        let rel = me.row - BODY_TOP;
+                        if rel == 2 {
+                            return Some(Msg::Select(Selection::Chat));
+                        } else if rel >= 4 {
+                            let idx = ((rel - 4) / 2) as usize;
+                            if idx < model.members.len() {
+                                return Some(Msg::Select(Selection::Member(idx)));
+                            }
                         }
                     }
                 }
+                // 鼠标滚轮:只在右侧时间线区域生效(左栏不滚、raw 视图是实时追底流不滚)
+                MouseEventKind::ScrollUp
+                    if model.selection == Selection::Chat && me.column >= 20 =>
+                {
+                    return Some(Msg::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::PageUp,
+                        KeyModifiers::empty(),
+                    )));
+                }
+                MouseEventKind::ScrollDown
+                    if model.selection == Selection::Chat && me.column >= 20 =>
+                {
+                    return Some(Msg::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::PageDown,
+                        KeyModifiers::empty(),
+                    )));
+                }
+                _ => {}
             }
             None
         }

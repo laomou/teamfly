@@ -285,7 +285,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
             .map(|m| format!("@{}", m.name))
             .collect();
         let welcome = format!(
-            "欢迎!输入框打字发言,带 @名字 才会派活。 成员:{} · 按 ? 看帮助",
+            "欢迎!@名字 派活,不带 @ 只是留言。成员:{} · ? 帮助",
             member_hints.join(" · ")
         );
         issues[0].timeline.push(crate::model::ChatMsg {
@@ -321,7 +321,35 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
         team_gen: 0,
     };
 
+    // 多实例检测:写一个 pid 文件,若已有别的活进程在用,警告(不阻止)
+    if let Some(warn) = check_instance_lock(&model.teamfly_dir) {
+        warns.push(warn);
+    }
+
     Ok((model, warns))
+}
+
+/// 写 `.teamfly/teamfly.lock`(内容是 pid),返回 Some(warn) 若已有活进程持锁。
+/// 崩溃留下的陈旧锁(pid 不存在)会被直接覆盖,不会挡住用户。
+fn check_instance_lock(teamfly_dir: &std::path::Path) -> Option<String> {
+    let lock = teamfly_dir.join("teamfly.lock");
+    // 检查已有锁
+    if let Ok(content) = std::fs::read_to_string(&lock) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            // pid 还活着?
+            let alive = std::path::Path::new(&format!("/proc/{pid}")).is_dir();
+            if alive && pid != std::process::id() {
+                // 写入自己的 pid(追加者模式:两边都知道对方在)
+                let _ = std::fs::write(&lock, format!("{}", std::process::id()));
+                return Some(format!(
+                    "另一个 teamfly (pid {pid}) 正在用这个目录,两边的议题历史可能互相覆盖,建议只开一个"
+                ));
+            }
+        }
+    }
+    // 写入自己的 pid
+    let _ = std::fs::write(&lock, format!("{}", std::process::id()));
+    None
 }
 
 fn resolve_team_dir(team_arg: Option<String>, teamfly_dir: &std::path::Path) -> Result<PathBuf> {
