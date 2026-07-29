@@ -55,16 +55,19 @@ const FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// 播种默认团队:目录不存在则完整播种;目录已存在但个别文件缺失,则补上缺失的。
-/// 已存在的文件不覆盖(尊重用户改动)。从旧 DEV/QE 默认团队升级时，
-/// 未修改的内置 team.md/QE.md 会自动迁移为 TPM/DEV/REV。
+/// 播种默认团队。
+///
+/// **只在目录完整时不动**;任何一个内置文件缺失都重新补上。
+/// 这是默认团队,用户想自定义应该复制一份改名,而不是在 default 上删文件。
+///
+/// 例外:旧 DEV/QE 默认团队迁移时同理补齐新角色。
 pub fn seed_default(teamfly_dir: &Path) -> Result<()> {
     let root = teamfly_dir.join("teams").join(DEFAULT_TEAM);
     migrate_legacy_default(&root)?;
     for (rel, content) in FILES {
         let path = root.join(rel);
         if path.exists() {
-            continue; // 已存在,不动
+            continue;
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -74,6 +77,7 @@ pub fn seed_default(teamfly_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 返回是否真的做了迁移。
 fn migrate_legacy_default(root: &Path) -> Result<()> {
     let team_path = root.join("team.md");
     replace_if_unmodified(&team_path, LEGACY_TEAM, FILES[0].1)?;
@@ -96,16 +100,17 @@ fn migrate_legacy_default(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn replace_if_unmodified(path: &Path, old: &str, new: &str) -> Result<()> {
+/// 内容与 `old` 逐字节相同(= 用户没改过)才替换成 `new`。返回是否替换了。
+fn replace_if_unmodified(path: &Path, old: &str, new: &str) -> Result<bool> {
     match std::fs::read_to_string(path) {
         Ok(content) if content == old => {
             std::fs::write(path, new).with_context(|| format!("迁移 {}", path.display()))?;
+            Ok(true)
         }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).with_context(|| format!("读取 {}", path.display())),
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("读取 {}", path.display())),
     }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -145,12 +145,30 @@ pub fn load_team(dir: &Path) -> Result<Team> {
         });
     }
 
-    // 名字唯一性
+    // 名字唯一性。**大小写不敏感**地比:@ 匹配对 ASCII 名字是大小写不敏感的,
+    // 所以 `DEV` 和 `dev` 同时在册时 `@dev` 永远只命中靠前那个,
+    // 另一个成员永久无法被 @ 且没有任何告警。
     for i in 0..members.len() {
         for j in (i + 1)..members.len() {
-            if members[i].name == members[j].name {
-                bail!("重名群友: {}", members[i].name);
+            if members[i].name.eq_ignore_ascii_case(&members[j].name) {
+                bail!(
+                    "重名群友: {} 与 {}(@ 匹配不区分 ASCII 大小写)",
+                    members[i].name,
+                    members[j].name
+                );
             }
+        }
+    }
+    // 名字必须能被 @ 出来
+    for m in &members {
+        if m.name.trim().is_empty() {
+            bail!("有成员的 name 是空的");
+        }
+        if m.name.chars().any(|c| c.is_whitespace() || c == '@') {
+            bail!(
+                "成员名不能含空白或 @:{:?}(否则 @ 派活匹配不到它)",
+                m.name
+            );
         }
     }
 
