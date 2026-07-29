@@ -512,6 +512,7 @@ fn dispatch(
         env: m.agent_env.merged_for(mem.backend),
         system_prompt: mem.system_prompt.clone(),
         user_input,
+        worktree: mem.worktree,
     })
 }
 
@@ -870,15 +871,19 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             env,
             system_prompt,
             user_input,
+            worktree,
         } => {
-            // 每个 agent 每个议题一个隔离 worktree + 分支，互不冲突。
-            // 非 git 仓库时 fallback 到共用 work_dir（和以前一样）。
-            let wt = crate::worktree::prepare(
-                &model.work_dir,
-                &model.teamfly_dir,
-                issue,
-                &name,
-            );
+            let (agent_dir, associated_branch) = if worktree {
+                let wt = crate::worktree::prepare(
+                    &model.work_dir,
+                    &model.teamfly_dir,
+                    issue,
+                    &name,
+                );
+                (wt.agent_dir, wt.branch)
+            } else {
+                (model.work_dir.clone(), None)
+            };
             let mcp_config = resolve_mcp_config(&model.work_dir);
             let spec = RunSpec {
                 name,
@@ -889,8 +894,8 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                 env,
                 system_prompt,
                 user_input,
-                worktree: wt.branch.clone().map(|b| (wt.agent_dir.clone(), b)),
-                work_dir: wt.agent_dir,
+                worktree: associated_branch.clone().map(|b| (agent_dir.clone(), b)),
+                work_dir: agent_dir,
                 mcp_config,
             };
             let tx = tx.clone();
@@ -1061,6 +1066,7 @@ pub mod test_support {
             emoji: "👤".into(),
             backend: BackendKind::Claude,
             model: None,
+            worktree: true,
             system_prompt: String::new(),
             state: AgentState::Working,
             inbox: std::collections::VecDeque::new(),
@@ -1574,6 +1580,7 @@ mod e2e {
             emoji: "👤".into(),
             backend,
             model: None,
+            worktree: true,
             system_prompt: if role == "架构" { "架构".into() } else { String::new() },
             state: AgentState::Idle,
             inbox: VecDeque::new(),
