@@ -897,6 +897,8 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                 worktree: associated_branch.clone().map(|b| (agent_dir.clone(), b)),
                 work_dir: agent_dir,
                 mcp_config,
+                // 不用 worktree = 直接在用户主工作树里跑 → 必须只读
+                read_only: !worktree,
             };
             let tx = tx.clone();
             let cancel = model.cancel.clone();

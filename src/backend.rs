@@ -26,6 +26,11 @@ pub struct RunSpec {
     pub mcp_config: Option<String>,
     /// 这一轮的 worktree (目录, 分支);fallback 时为 None。原样回投给 AgentDone。
     pub worktree: Option<(PathBuf, String)>,
+    /// 只读:不给写权限。用于 `worktree: false` 的成员 ——
+    /// 它们直接在**用户的主工作树**里跑,一旦能写就会污染用户工作区
+    /// (最典型的是照着接力说明去 `git merge` 上游分支,把改动并进用户主分支,
+    ///  绕掉「改动不自动进主分支、用户审批才 merge」这个核心保证)。
+    pub read_only: bool,
 }
 
 /// 重试前追加给 agent 的提醒。上一次尝试已经动过工具(可能改了文件、跑过命令),
@@ -163,13 +168,17 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
 
 /// 构造 claude CLI 命令(headless stream-json + bypass 权限 + 禁反问 + 追加系统 prompt)。
 fn claude_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
+    // 只读成员用 plan 模式:实测它挡得住写(连 Bash 里的 shell 重定向也挡),
+    // 但读文件、跑 git diff / git log 都正常 —— 正好是评审/调度需要的。
+    // 只禁 Edit/Write 是挡不住的:agent 会直接用 Bash 写进去(实测验证过)。
+    let mode = if spec.read_only { "plan" } else { "bypassPermissions" };
     let mut args = vec![
         "--print".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(), // stream-json 必需
         "--permission-mode".to_string(),
-        "bypassPermissions".to_string(),
+        mode.to_string(),
         "--disallowedTools".to_string(),
         "AskUserQuestion".to_string(), // 无拍板:禁 agent 反问
         "--append-system-prompt".to_string(),
@@ -210,13 +219,19 @@ pub fn resolve_mcp_config(work_dir: &std::path::Path) -> Option<String> {
 fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
     // codex 无「追加系统 prompt」的稳定 flag,把系统 prompt 前置进输入。
     let combined = format!("{}\n\n{}", spec.system_prompt, user_input);
-    let args = vec![
+    let mut args = vec![
         "exec".to_string(),
-        "--json".to_string(),                              // JSONL 事件流
-        "--skip-git-repo-check".to_string(),               // 不要求工作目录是 git 库
-        "--dangerously-bypass-approvals-and-sandbox".to_string(), // 无拍板,和 claude 对齐
-        combined,
+        "--json".to_string(),                // JSONL 事件流
+        "--skip-git-repo-check".to_string(), // 不要求工作目录是 git 库
     ];
+    if spec.read_only {
+        // 只读成员直接在用户主工作树里跑,必须禁写(和 claude 的 plan 模式对齐)
+        args.push("--sandbox".to_string());
+        args.push("read-only".to_string());
+    } else {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string()); // 无拍板
+    }
+    args.push(combined);
     // 模型不走 --model,改由 env 接管
     ProcSpec {
         bin: "codex".into(),
@@ -375,3 +390,55 @@ fn push_tail(tail: &mut Vec<String>, line: &str) {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::BackendKind;
+
+    fn spec(read_only: bool, backend: BackendKind) -> RunSpec {
+        RunSpec {
+            name: "X".into(),
+            issue: 1,
+            gen: 0,
+            backend,
+            model: None,
+            env: std::collections::HashMap::new(),
+            system_prompt: "sp".into(),
+            user_input: "ui".into(),
+            work_dir: PathBuf::from("/tmp"),
+            mcp_config: None,
+            worktree: None,
+            read_only,
+        }
+    }
+
+    /// `worktree: false` 的成员直接在**用户主工作树**里跑,必须只读。
+    /// 一旦能写,它照着接力说明去 `git merge` 上游分支就会把改动并进用户主分支,
+    /// 绕掉「改动不自动进主分支、用户审批才 merge」这个核心保证。
+    #[test]
+    fn read_only_member_gets_no_write_permission() {
+        let ro = claude_cmd(&spec(true, BackendKind::Claude), "ui");
+        assert!(ro.args.contains(&"plan".to_string()), "只读成员该用 plan 模式");
+        assert!(
+            !ro.args.contains(&"bypassPermissions".to_string()),
+            "只读成员不能拿到 bypassPermissions"
+        );
+
+        let rw = claude_cmd(&spec(false, BackendKind::Claude), "ui");
+        assert!(rw.args.contains(&"bypassPermissions".to_string()), "写成员照旧全权");
+        assert!(!rw.args.contains(&"plan".to_string()));
+    }
+
+    /// codex 侧要对齐:只读用 --sandbox read-only,不给 bypass。
+    #[test]
+    fn read_only_member_codex_is_sandboxed() {
+        let ro = codex_cmd(&spec(true, BackendKind::Codex), "ui");
+        assert!(ro.args.contains(&"read-only".to_string()));
+        assert!(!ro.args.iter().any(|a| a.contains("dangerously-bypass")));
+
+        let rw = codex_cmd(&spec(false, BackendKind::Codex), "ui");
+        assert!(rw.args.iter().any(|a| a.contains("dangerously-bypass")));
+        assert!(!rw.args.contains(&"read-only".to_string()));
+    }
+}
