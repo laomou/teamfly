@@ -160,11 +160,6 @@ pub struct Model {
     pub input: String,
     /// 右区滚动偏移（0 = 贴底）
     pub scroll: u16,
-    /// 上一帧渲染时算出的「最多能往上滚多少行」。
-    /// 由渲染层回填(内容高度只有画的时候才知道),主循环每帧用它夹一下 `scroll`。
-    /// 否则在不满一屏的内容上连按 PageUp 会把 scroll 累到很大,
-    /// 之后内容变长时视图就钉死在顶部,新消息永远看不到。
-    pub scroll_max: std::cell::Cell<u16>,
     /// spinner 动画帧
     pub tick: u64,
     /// 是否请求退出

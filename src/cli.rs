@@ -307,7 +307,6 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
         selection: Selection::Chat,
         input: String::new(),
         scroll: 0,
-        scroll_max: std::cell::Cell::new(0),
         tick: 0,
         should_quit: false,
         // TPM 星型调度:用户→TPM→DEV→TPM→REV→TPM→… 一个需求轻松 6-8 跳,

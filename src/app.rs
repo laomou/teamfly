@@ -923,7 +923,8 @@ async fn run_loop(
     });
 
     // 首帧
-    terminal.draw(|f| tui::draw(f, &model))?;
+    let mut draw_info = tui::DrawInfo::default();
+    terminal.draw(|f| tui::draw(f, &model, &mut draw_info))?;
 
     loop {
         tokio::select! {
@@ -949,11 +950,8 @@ async fn run_loop(
         if model.should_quit {
             break;
         }
-        terminal.draw(|f| tui::draw(f, &model))?;
-        // 渲染时才知道内容有多高,顺手把用户的滚动量夹回可达范围。
-        // 不夹的话:在不满一屏的内容上连按 PageUp 会把 scroll 累到很大,
-        // 之后内容变长,视图就钉死在顶部,新消息永远看不到。
-        model.scroll = model.scroll.min(model.scroll_max.get());
+        terminal.draw(|f| tui::draw(f, &model, &mut draw_info))?;
+        model.scroll = model.scroll.min(draw_info.scroll_max);
     }
     Ok(())
 }
@@ -1040,7 +1038,6 @@ pub mod test_support {
             selection: Selection::Chat,
             input: String::new(),
             scroll: 0,
-            scroll_max: std::cell::Cell::new(0),
             tick: 0,
             should_quit: false,
             max_chain_depth: 12,
@@ -1105,7 +1102,6 @@ mod e2e {
             selection: Selection::Chat,
             input: String::new(),
             scroll: 0,
-            scroll_max: std::cell::Cell::new(0),
             tick: 0,
             should_quit: false,
             max_chain_depth: 12,

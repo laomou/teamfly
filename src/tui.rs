@@ -1,5 +1,5 @@
 //! TUI 渲染:全屏四区 —— 顶部议题 tab / 左栏(#群聊+成员) / 右区(时间线 or raw 流) / 底部输入 + 快捷键条。
-//! 纯渲染,读 Model 画 UI,不改状态。
+//! 纯渲染,读 Model 画 UI,不改状态。渲染层算出的度量(如内容高度)通过 DrawInfo 返回给主循环。
 
 use crate::model::{AgentState, Model, Selection};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -9,6 +9,14 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 const SPINNER: [&str; 4] = ["⣾", "⣽", "⣻", "⢿"];
+
+/// 渲染层产出的度量,由主循环消费。保持 Model 是纯数据,渲染不回写。
+#[derive(Debug, Default)]
+pub struct DrawInfo {
+    /// 右区内容在当前宽度下最多能往上滚多少行。
+    /// 主循环用它夹 `model.scroll`,防止在短内容上连按 PageUp 把视图钉死在顶部。
+    pub scroll_max: u16,
+}
 
 /// 把一个「内缩 1 行 1 列」的子区域裁到 `area` 内部。
 ///
@@ -27,7 +35,7 @@ fn inset(area: Rect, dx: u16, dy: u16, shrink_w: u16) -> Rect {
     )
 }
 
-pub fn draw(f: &mut Frame, m: &Model) {
+pub fn draw(f: &mut Frame, m: &Model, info: &mut DrawInfo) {
     // 顶行(高 3):品牌角 | 议题标签栏  ——  下方:左栏 | 右列
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -62,7 +70,7 @@ pub fn draw(f: &mut Frame, m: &Model) {
         ])
         .split(body[1]);
 
-    draw_main(f, right[0], m);
+    draw_main(f, right[0], m, info);
     draw_input(f, right[1], m);
     draw_hints(f, right[2], m);
 
@@ -316,7 +324,7 @@ fn state_color(s: AgentState) -> Color {
 /// 这里的内容全是中文,所以宽度不够就换成纯 ASCII 的提示,不把内容喂进去。
 const MIN_CONTENT_W: u16 = 4;
 
-fn draw_main(f: &mut Frame, area: Rect, m: &Model) {
+fn draw_main(f: &mut Frame, area: Rect, m: &Model, info: &mut DrawInfo) {
     if area.width < MIN_CONTENT_W || area.height == 0 {
         // 只画 ASCII,避免双宽字符再踩上面那个坑
         f.render_widget(
@@ -326,12 +334,12 @@ fn draw_main(f: &mut Frame, area: Rect, m: &Model) {
         return;
     }
     match m.selection {
-        Selection::Chat => draw_timeline(f, area, m),
-        Selection::Member(i) => draw_agent_raw(f, area, m, i),
+        Selection::Chat => draw_timeline(f, area, m, info),
+        Selection::Member(i) => draw_agent_raw(f, area, m, i, info),
     }
 }
 
-fn draw_timeline(f: &mut Frame, area: Rect, m: &Model) {
+fn draw_timeline(f: &mut Frame, area: Rect, m: &Model, info: &mut DrawInfo) {
     let issue = m.cur_issue();
     let width = area.width.saturating_sub(1) as usize;
     let mut lines: Vec<Line> = Vec::new();
@@ -404,7 +412,7 @@ fn draw_timeline(f: &mut Frame, area: Rect, m: &Model) {
         lines = padded;
     }
     let total = wrapped_height(&lines, area.width);
-    m.scroll_max.set(total.saturating_sub(area.height));
+    info.scroll_max = total.saturating_sub(area.height);
     let scroll = bottom_scroll(total, area.height, m.scroll);
     f.render_widget(
         Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll, 0)),
@@ -412,7 +420,7 @@ fn draw_timeline(f: &mut Frame, area: Rect, m: &Model) {
     );
 }
 
-fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
+fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut DrawInfo) {
     let mem = &m.members[idx];
     let mut lines: Vec<Line> = Vec::new();
     let mut seen_init = false;
@@ -474,7 +482,7 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
         }
     }
     let total = wrapped_height(&lines, area.width);
-    m.scroll_max.set(total.saturating_sub(area.height));
+    info.scroll_max = total.saturating_sub(area.height);
     let scroll = bottom_scroll(total, area.height, m.scroll);
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
@@ -697,7 +705,7 @@ mod tests {
             let mut term =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             let m = crate::app::test_support::tiny_model();
-            term.draw(|f| draw(f, &m))
+            term.draw(|f| draw(f, &m, &mut DrawInfo::default()))
                 .unwrap_or_else(|e| panic!("{w}x{h} 渲染失败: {e}"));
         }
     }
@@ -712,7 +720,7 @@ mod tests {
         let mut m = crate::app::test_support::tiny_model();
         m.show_help = true;
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
-        term.draw(|f| draw(f, &m)).unwrap();
+        term.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
         let buf = term.backend().buffer().clone();
         let screen: String = (0..H)
             .map(|y| (0..W).map(|x| buf[(x, y)].symbol()).collect::<String>())
@@ -744,7 +752,7 @@ mod tests {
                 });
                 let mut term =
                     ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-                term.draw(|f| draw(f, &m))
+                term.draw(|f| draw(f, &m, &mut DrawInfo::default()))
                     .unwrap_or_else(|e| panic!("{w}x{h} 渲染失败: {e}"));
             }
         }
