@@ -223,10 +223,7 @@ fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         "--json".to_string(),                // JSONL 事件流
         "--skip-git-repo-check".to_string(), // 不要求工作目录是 git 库
     ];
-    // _tf provider 已写入 ~/.codex/config.toml,但用户可能有自己的默认 provider,
-    // 所以显式选它。
-    args.push("-c".to_string());
-    args.push("model_provider=_tf".to_string());
+    // _tf 已写入 ~/.codex/config.toml 并设为默认 provider,codex 直接用。
 
     if spec.read_only {
         args.push("--sandbox".to_string());

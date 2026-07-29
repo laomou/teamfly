@@ -243,9 +243,10 @@ pub fn seed_codex_provider(teamfly_dir: &Path) -> Result<bool> {
         .as_table_mut()
         .unwrap()
         .insert("_tf".to_string(), toml::Value::Table(provider));
-    // 不设默认 model_provider —— 用户可能已有自己的 provider(比如 stepcode)。
-    // 加了 _tf 定义后,codex_cmd 可以用 -c model_provider=_tf 来选它,
-    // 不影响用户已有的默认配置。
+    // 默认用 _tf
+    cfg.insert("model_provider".to_string(), toml::Value::String("_tf".to_string()));
+    // 默认用 _tf。用户配了 OPENAI_BASE_URL 说明他想用这个中转站,
+    // 不需要再手动切 provider。不想用就改回 model_provider = "stepcode" 或删掉。
 
     // 写回去
     // 这里不写 0600,codex config.toml 不含明文 key(key 从 env 拿)
