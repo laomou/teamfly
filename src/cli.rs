@@ -119,10 +119,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
             "git 没配 user.name / user.email,agent 在 worktree 里 commit 会失败".into(),
         );
     }
-    // 如果环境变量里有 OPENAI_BASE_URL,确保 ~/.codex/config.toml 里有 _tf provider
-    if let Ok(true) = crate::env::seed_codex_provider() {
-        warns.push("已为 codex 配置中转站 provider(_tf),每次 codex 启动都可用".into());
-    }
+    // codex 的 provider 配置(codex 自己管理,不需要 teamfly 插手)
 
     // .teamfly/ 里有 API key,必须确保它被 git 忽略
     if crate::worktree::ensure_teamfly_ignored(&model.work_dir) {

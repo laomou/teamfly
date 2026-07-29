@@ -221,7 +221,7 @@ fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         "--json".to_string(),                // JSONL 事件流
         "--skip-git-repo-check".to_string(), // 不要求工作目录是 git 库
     ];
-    // _tf 已写入 ~/.codex/config.toml 并设为默认 provider,codex 直接用。
+    // codex 的 provider 配置(codex 自己管理,不需要 teamfly 插手)
 
     if spec.read_only {
         args.push("--sandbox".to_string());

@@ -2,7 +2,6 @@ mod app;
 mod backend;
 mod builtin;
 mod cli;
-mod env;
 mod issue;
 mod model;
 mod router;
