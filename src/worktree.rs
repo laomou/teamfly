@@ -38,18 +38,23 @@ pub fn prepare(work_dir: &Path, teamfly_dir: &Path, issue_id: u64, agent_name: &
     }
 
     let short_hash = get_short_hash(work_dir);
-    let branch = format!("teamfly/{agent_name}/{short_hash}");
     let wt_dir = issue_dir(teamfly_dir, issue_id).join(format!("{agent_name}-{short_hash}"));
 
-    // 同一 agent 在同一 commit 上又被派了一轮 → 复用(改动接着攒)
+    // 同一 agent 在同一 commit 上又被派了一轮(同议题)→ 复用,改动接着攒
     if wt_dir.exists() {
-        return WorktreeResult { agent_dir: wt_dir, branch: Some(branch) };
+        if let Some(b) = read_worktree_branch(&wt_dir) {
+            return WorktreeResult { agent_dir: wt_dir, branch: Some(b) };
+        }
     }
+
+    // 挑一个没被占用的分支名。同一 agent 在**不同议题**里从同一 commit 分叉时
+    // 会撞名 —— 不处理的话 worktree add 会失败或 checkout 到别议题那个分支上,
+    // 两个议题的改动混进同一个分支。撞了就加 -2 / -3 后缀。
+    let branch = pick_free_branch(work_dir, agent_name, &short_hash);
 
     // 先腾地方,再建新的
     enforce_cap(work_dir, teamfly_dir, issue_id);
 
-    // 分支可能已存在(同 commit 上跑过) —— 已存在时 branch 命令会失败,无所谓
     let _ = Command::new("git")
         .args(["branch", "--no-track", &branch, "HEAD"])
         .current_dir(work_dir)
@@ -81,6 +86,30 @@ pub fn prepare(work_dir: &Path, teamfly_dir: &Path, issue_id: u64, agent_name: &
 /// 某个议题的 worktree 根目录。
 fn issue_dir(teamfly_dir: &Path, issue_id: u64) -> PathBuf {
     teamfly_dir.join("worktrees").join(issue_id.to_string())
+}
+
+/// 挑一个还没被占用的分支名:`teamfly/<agent>/<hash>`,撞了就 `-2`、`-3`…
+fn pick_free_branch(work_dir: &Path, agent_name: &str, short_hash: &str) -> String {
+    let base = format!("teamfly/{agent_name}/{short_hash}");
+    if !branch_exists(work_dir, &base) {
+        return base;
+    }
+    for n in 2..1000 {
+        let cand = format!("{base}-{n}");
+        if !branch_exists(work_dir, &cand) {
+            return cand;
+        }
+    }
+    base // 理论上到不了
+}
+
+fn branch_exists(work_dir: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .current_dir(work_dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// 列出某议题下所有 worktree 目录，按修改时间从旧到新。
@@ -204,6 +233,50 @@ pub fn count_stale(teamfly_dir: &Path) -> usize {
                 .unwrap_or(0)
         })
         .sum()
+}
+
+/// worktree 里一点改动都没有?(既没 commit、也没改工作区、也没新增文件)
+///
+/// 纯查询类任务(「看一下 X」「解释一下 Y」)很常见,它们不该留下一个
+/// 完整 checkout 占着磁盘,交卷时直接删掉。
+fn is_untouched(wt_dir: &Path, work_dir: &Path, branch: &str) -> bool {
+    // 有 commit?
+    let committed = last_stat_line(
+        Command::new("git")
+            .args(["diff", "--shortstat", &format!("HEAD...{branch}")])
+            .current_dir(work_dir),
+    );
+    if committed.is_some() {
+        return false;
+    }
+    // 工作区有改动?(含 staged)
+    if last_stat_line(
+        Command::new("git")
+            .args(["diff", "--shortstat", "HEAD"])
+            .current_dir(wt_dir),
+    )
+    .is_some()
+    {
+        return false;
+    }
+    // 有新增未跟踪文件?
+    let untracked = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(wt_dir)
+        .output()
+        .ok()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    !untracked
+}
+
+/// 交卷后回收:worktree 里没有任何改动就删掉它和分支。返回是否删了。
+pub fn drop_if_untouched(work_dir: &Path, wt_dir: &Path, branch: &str) -> bool {
+    if !wt_dir.exists() || !is_untouched(wt_dir, work_dir, branch) {
+        return false;
+    }
+    remove_dir(work_dir, wt_dir);
+    true
 }
 
 /// worktree 里改了什么。
