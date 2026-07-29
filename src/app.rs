@@ -339,11 +339,25 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
     let issue_id = m.cur_issue().id;
     let roster: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
     let mentions = crate::router::parse_owner_mentions(&text, &roster);
-    for name in mentions {
+    for name in &mentions {
         let assignment = format!("[我] {text}");
-        if let Some(c) = dispatch(m, issue_id, &name, assignment, 0) {
+        if let Some(c) = dispatch(m, issue_id, name, assignment, 0) {
             cmds.push(c);
         }
+    }
+    // 一条消息里 @多人 = **同时**开工,不是按顺序。
+    // 用户很自然会写「@DEV 改X,完成后 @REV 评审」期望顺序执行,
+    // 实际两个人一起被叫起来,REV 看到的是还没改的代码,白烧一轮。
+    // 不静默丢掉他打的 @(那样更难排查),而是当场说清语义。
+    if mentions.len() > 1 {
+        set_hint(
+            m,
+            format!(
+                "已同时叫 {}(一条消息里的多个 @ 会一起开工);想按顺序就分几条发",
+                mentions.join(" · ")
+            ),
+            10,
+        );
     }
     cmds
 }
@@ -1597,6 +1611,42 @@ mod e2e {
         assert!(with_wt.contains("看到的还是改动前的代码"));
         // 原汇报内容不能丢
         assert!(with_wt.contains("改完了 @REV"));
+    }
+
+    #[test]
+    fn multi_mention_dispatches_all_and_says_so() {
+        let mut m = min_model();
+        // 用户很自然会这么写,期望顺序执行,实际是同时开工
+        for c in "@老K 改一下,完成后 @阿码 评审".chars() {
+            key(&mut m, KeyCode::Char(c));
+        }
+        let cmds = key_cmds(&mut m, KeyCode::Enter);
+
+        // 两个人都被派了(不静默丢用户打的 @)
+        let spawned: Vec<&str> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::SpawnAgent { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(spawned.contains(&"老K") && spawned.contains(&"阿码"), "实际派了 {spawned:?}");
+
+        // 但必须当场告诉用户这是「同时」而不是「顺序」
+        let hint = m.status_hint.as_ref().expect("应该有提示");
+        assert!(hint.contains("同时"), "提示没说清语义: {hint}");
+        assert!(hint.contains("分几条发"), "提示没给出解法: {hint}");
+    }
+
+    #[test]
+    fn single_mention_has_no_extra_hint() {
+        let mut m = min_model();
+        for c in "@老K 改一下".chars() {
+            key(&mut m, KeyCode::Char(c));
+        }
+        key_cmds(&mut m, KeyCode::Enter);
+        // 只 @一个人时不该有这条提示(别加噪音)
+        assert!(m.status_hint.as_deref().is_none_or(|h| !h.contains("同时")));
     }
 
     #[test]

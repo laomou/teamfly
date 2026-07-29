@@ -81,7 +81,7 @@ pub fn draw(f: &mut Frame, m: &Model, info: &mut DrawInfo) {
 }
 
 /// 帮助浮层里的内容行数(和下面 `lines` 向量对齐;改了那个向量记得改这里)。
-const HELP_LINES: u16 = 23;
+const HELP_LINES: u16 = 24;
 
 /// 帮助浮层:居中显示所有键位,再按 ? 或 Esc 关闭。
 fn draw_help_overlay(f: &mut Frame) {
@@ -110,6 +110,7 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from(vec![Span::styled("  发言", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
         Line::from("    输入文字 + ⏎     发到总览(不带 @ 只是留言)"),
         Line::from("    @名字 …           派活给该 agent(TAB 补全)"),
+        Line::from("    一条里 @多人      他们**同时**开工;要按顺序就分几条发"),
         Line::from("    Backspace / ^U    删字符 / 清空输入行"),
         Line::from(""),
         Line::from(vec![Span::styled("  斜杠命令", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
