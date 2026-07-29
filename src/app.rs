@@ -774,6 +774,10 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     }
     m.selection = Selection::Chat;
     m.scroll = 0;
+    // 清掉所有成员里该议题的 last_seen 条目,免得 HashMap 随议题数无限膨胀
+    for mem in &mut m.members {
+        mem.last_seen.remove(&removed.id);
+    }
     set_hint(m, format!("已关闭议题:{}", removed.name), 5);
     vec![Command::DeleteIssueFile { issue: removed.name }]
 }
