@@ -261,7 +261,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
     crate::builtin::seed_default(&teamfly_dir)?;
 
     // 加载 agent 环境变量(.teamfly/env.toml,可选)
-    let agent_env = crate::env::load(&teamfly_dir)?;
+    let agent_env = crate::env::load()?;
 
     // 团队来源优先级:--team > 唯一/default 团队
     let team_dir = resolve_team_dir(team_arg, &teamfly_dir)?;
@@ -347,7 +347,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
         );
     }
     // 如果配了 codex 的 OPENAI_BASE_URL,确保 ~/.codex/config.toml 里有 _tf provider
-    if let Ok(true) = crate::env::seed_codex_provider(&model.teamfly_dir) {
+    if let Ok(true) = crate::env::seed_codex_provider() {
         warns.push("已为 codex 配置中转站 provider(_tf),每次 codex 启动都可用".into());
     }
 

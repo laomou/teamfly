@@ -62,22 +62,11 @@ impl AgentEnv {
     }
 }
 
-/// 加载 env.toml。**不合并**:
-///   项目级 `<工作目录>/.teamfly/env.toml` 存在 → 只用项目级(忽略用户级)
-///   否则 → 用用户级 `~/.teamfly/env.toml`(不存在则自动 seed 模板)
-pub fn load(teamfly_dir: &Path) -> Result<AgentEnv> {
+/// 加载用户级 env.toml(`~/.teamfly/env.toml`),不存在则自动播种模板。
+pub fn load() -> Result<AgentEnv> {
     let mut env = AgentEnv::default();
-
-    // 项目级存在 → 只用它
-    let project_path = teamfly_dir.join("env.toml");
-    if project_path.exists() {
-        merge_into(&mut env, &project_path)?;
-        return Ok(env);
-    }
-
-    // 否则用用户级(不存在则播种模板)
     if let Some(user_path) = user_env_path() {
-        seed_user_env(&user_path).ok(); // seed 失败不致命
+        seed_user_env(&user_path).ok();
         if user_path.exists() {
             merge_into(&mut env, &user_path)?;
         }
@@ -168,7 +157,7 @@ pub fn seed_user_env(path: &Path) -> Result<bool> {
 ///
 /// 用户配了 OPENAI_BASE_URL 但 codex 不认识它,需要写一个 provider 定义进去。
 /// 写到 ~/.codex/config.toml(不是项目配置),一劳永逸,codex 自己就能用。
-pub fn seed_codex_provider(teamfly_dir: &Path) -> Result<bool> {
+pub fn seed_codex_provider() -> Result<bool> {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -179,27 +168,14 @@ pub fn seed_codex_provider(teamfly_dir: &Path) -> Result<bool> {
         return Ok(false);
     };
 
-    // 读项目级的 env.toml 取 BASE_URL
-    let project_env = teamfly_dir.join("env.toml");
+    // 从用户级 env.toml 取 BASE_URL
     let mut base_url = String::new();
-    if let Ok(text) = std::fs::read_to_string(&project_env) {
-        if let Ok(table) = text.parse::<toml::Table>() {
-            if let Some(codex_tbl) = table.get("codex").and_then(|v| v.as_table()) {
-                if let Some(url) = codex_tbl.get("OPENAI_BASE_URL").and_then(|v| v.as_str()) {
-                    base_url = url.to_string();
-                }
-            }
-        }
-    }
-    // 回退到用户级
-    if base_url.is_empty() {
-        if let Some(user_path) = user_env_path() {
-            if let Ok(text) = std::fs::read_to_string(&user_path) {
-                if let Ok(table) = text.parse::<toml::Table>() {
-                    if let Some(codex_tbl) = table.get("codex").and_then(|v| v.as_table()) {
-                        if let Some(url) = codex_tbl.get("OPENAI_BASE_URL").and_then(|v| v.as_str()) {
-                            base_url = url.to_string();
-                        }
+    if let Some(user_path) = user_env_path() {
+        if let Ok(text) = std::fs::read_to_string(&user_path) {
+            if let Ok(table) = text.parse::<toml::Table>() {
+                if let Some(codex_tbl) = table.get("codex").and_then(|v| v.as_table()) {
+                    if let Some(url) = codex_tbl.get("OPENAI_BASE_URL").and_then(|v| v.as_str()) {
+                        base_url = url.to_string();
                     }
                 }
             }
