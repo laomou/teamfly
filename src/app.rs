@@ -389,11 +389,18 @@ fn handle_agent_done(
     if !ok {
         // 用户主动取消 与 真掉线 分开措辞,别把自己按的 ^C 说成「掉线」
         let reason = err.unwrap_or_else(|| "未知错误".into());
-        let text = if reason == CANCELLED {
+        let mut text = if reason == CANCELLED {
             format!("{name} 已被取消")
         } else {
             format!("{name} 掉线:{reason}")
         };
+        // 失败/取消时更容易留下空 worktree:没动过就回收,动过就告诉用户在哪
+        if let Some((wt_dir, branch)) = &worktree {
+            if wt_dir.exists() && !crate::worktree::drop_if_untouched(&m.work_dir, wt_dir, branch) {
+                let summary = crate::worktree::change_summary(wt_dir, &m.work_dir, branch);
+                text.push_str(&format!("(已改的留在 {branch} — {summary})"));
+            }
+        }
         let msg = ChatMsg { ts: now_ts(), author: "系统".into(), text, is_system: true };
         m.issues[idx].timeline.push(msg.clone());
         cmds.push(Command::PersistChat { issue: issue_name.clone(), msg });
@@ -417,8 +424,13 @@ fn handle_agent_done(
     // 不是去磁盘上按时间猜 —— 猜会拿到别轮甚至别的 agent 的 worktree。
     if let Some((wt_dir, branch)) = &worktree {
         if wt_dir.exists() {
-            let summary = crate::worktree::change_summary(wt_dir, &m.work_dir, branch);
-            chat_text.push_str(&format!("\n📂 {branch} — {summary}"));
+            // 一点改动都没有(纯查询类任务)→ 直接回收,别留个完整 checkout 占磁盘
+            if crate::worktree::drop_if_untouched(&m.work_dir, wt_dir, branch) {
+                // 什么都不追加:没改动就没什么可让用户采纳的
+            } else {
+                let summary = crate::worktree::change_summary(wt_dir, &m.work_dir, branch);
+                chat_text.push_str(&format!("\n📂 {branch} — {summary}"));
+            }
         }
     }
 
