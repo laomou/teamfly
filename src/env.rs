@@ -243,6 +243,9 @@ pub fn seed_codex_provider(teamfly_dir: &Path) -> Result<bool> {
         .as_table_mut()
         .unwrap()
         .insert("_tf".to_string(), toml::Value::Table(provider));
+    // 不设默认 model_provider —— 用户可能已有自己的 provider(比如 stepcode)。
+    // 加了 _tf 定义后,codex_cmd 可以用 -c model_provider=_tf 来选它,
+    // 不影响用户已有的默认配置。
 
     // 写回去
     // 这里不写 0600,codex config.toml 不含明文 key(key 从 env 拿)

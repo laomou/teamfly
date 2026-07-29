@@ -223,25 +223,10 @@ fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         "--json".to_string(),                // JSONL 事件流
         "--skip-git-repo-check".to_string(), // 不要求工作目录是 git 库
     ];
-
-    // 选用 teamfly 的 provider(已在 ~/.codex/config.toml 里定义了 _tf provider)。
-    // 用户没配 codex 时这条 -c 会被忽略,退回 codex 默认 provider。
-    // 检查 _tf provider 是否真的存在(在 ~/.codex/config.toml 里)
-    // 不存在就不加,codex 用自己的默认 provider
-    static CODEX_HAS_TF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let has_tf = CODEX_HAS_TF.get_or_init(|| {
-        let codex_home = std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")));
-        let Some(cfg) = codex_home.map(|p| p.join("config.toml")) else { return false };
-        let Ok(text) = std::fs::read_to_string(&cfg) else { return false };
-        let Ok(table) = text.parse::<toml::Table>() else { return false };
-        table.get("model_providers").and_then(|v| v.as_table()).is_some_and(|p| p.contains_key("_tf"))
-    });
-    if *has_tf {
-        args.push("-c".to_string());
-        args.push("model_provider=_tf".to_string());
-    }
+    // _tf provider 已写入 ~/.codex/config.toml,但用户可能有自己的默认 provider,
+    // 所以显式选它。
+    args.push("-c".to_string());
+    args.push("model_provider=_tf".to_string());
 
     if spec.read_only {
         args.push("--sandbox".to_string());
@@ -411,7 +396,6 @@ fn push_tail(tail: &mut Vec<String>, line: &str) {
         tail.remove(0);
     }
 }
-
 
 #[cfg(test)]
 mod tests {
