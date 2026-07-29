@@ -984,6 +984,21 @@ fn translate_event(ev: Event, model: &Model) -> Option<Msg> {
         Event::Key(k) => Some(Msg::Key(k)),
         Event::Mouse(me) => {
             match me.kind {
+                // 滚轮:只在右侧时间线区域生效,其它位置/视图一律吞掉
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    if model.selection == Selection::Chat && me.column >= 20 {
+                        let code = if matches!(me.kind, MouseEventKind::ScrollUp) {
+                            KeyCode::PageUp
+                        } else {
+                            KeyCode::PageDown
+                        };
+                        return Some(Msg::Key(crossterm::event::KeyEvent::new(
+                            code,
+                            KeyModifiers::empty(),
+                        )));
+                    }
+                    return None; // 明确吞掉,不让任何滚轮事件穿透到下面的 click 处理
+                }
                 MouseEventKind::Down(MouseButton::Left) => {
                     // tab 栏在 y=1(顶部品牌+tab 栏共 3 行,其中中间那行是内容)
                     if me.row == 1 {
@@ -1002,23 +1017,6 @@ fn translate_event(ev: Event, model: &Model) -> Option<Msg> {
                             }
                         }
                     }
-                }
-                // 鼠标滚轮:只在右侧时间线区域生效(左栏不滚、raw 视图是实时追底流不滚)
-                MouseEventKind::ScrollUp
-                    if model.selection == Selection::Chat && me.column >= 20 =>
-                {
-                    return Some(Msg::Key(crossterm::event::KeyEvent::new(
-                        KeyCode::PageUp,
-                        KeyModifiers::empty(),
-                    )));
-                }
-                MouseEventKind::ScrollDown
-                    if model.selection == Selection::Chat && me.column >= 20 =>
-                {
-                    return Some(Msg::Key(crossterm::event::KeyEvent::new(
-                        KeyCode::PageDown,
-                        KeyModifiers::empty(),
-                    )));
                 }
                 _ => {}
             }
