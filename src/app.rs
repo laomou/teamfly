@@ -135,8 +135,9 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                     m.scroll = 0;
                     set_hint(m, format!("切到议题 {n}"), 5);
                 }
-                return vec![];
             }
+            // Alt+其它字符一律吞掉:不能让 Alt+a 落下去被当成普通输入插进输入框
+            return vec![];
         }
     }
 
@@ -200,7 +201,6 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 m.selection = Selection::Chat;
                 m.scroll = 0;
                 m.input.clear();
-                m.input_mode = InputMode::Chat;
                 set_hint(m, format!("已建议题:{name}"), 5);
                 m.pending_delete = None;
                 return vec![];
@@ -227,15 +227,8 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
 
     match k.code {
         KeyCode::Esc => {
-            if m.input_mode == InputMode::NewIssue {
-                // 取消新建议题
-                m.input_mode = InputMode::Chat;
-                m.input.clear();
-                set_hint(m, "已取消新建议题", 5);
-            } else {
-                m.selection = Selection::Chat;
-                m.scroll = 0;
-            }
+            m.selection = Selection::Chat;
+            m.scroll = 0;
         }
         KeyCode::Up => {
             move_selection(m, -1);
@@ -303,38 +296,9 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
     }
     m.input.clear();
 
-    // 斜杠命令:/init 展开成消息,/team 直接切队
-    if m.input_mode == InputMode::Chat {
-        if let Some(slash) = crate::slash::parse(&text) {
-            return handle_slash(m, slash);
-        }
-    }
-
-    // 新建议题模式:创建议题并切过去,不进时间线
-    if m.input_mode == InputMode::NewIssue {
-        m.input_mode = InputMode::Chat;
-        // 校验:非空、不重名、名字里不含分隔/路径字符(用于落盘 <名>.jsonl)
-        if text.contains('/') || text.contains('\\') || text.contains('.') {
-            set_hint(m, format!("议题名不能含 / \\ .:{text}"), 5);
-            return vec![];
-        }
-        if m.issues.iter().any(|i| i.name == text) {
-            // 已存在,直接切过去
-            if let Some(idx) = m.issues.iter().position(|i| i.name == text) {
-                m.current_issue = idx;
-                m.selection = Selection::Chat;
-                m.scroll = 0;
-                set_hint(m, format!("议题「{text}」已存在,切过去"), 5);
-            }
-            return vec![];
-        }
-        // 新建
-        m.issues.push(Issue::new(text.clone()));
-        m.current_issue = m.issues.len() - 1;
-        m.selection = Selection::Chat;
-        m.scroll = 0;
-        set_hint(m, format!("已建议题:{text}"), 5);
-        return vec![];
+    // 斜杠命令(目前只有 /team,直接切队)
+    if let Some(slash) = crate::slash::parse(&text) {
+        return handle_slash(m, slash);
     }
 
     let mut cmds = Vec::new();
@@ -349,7 +313,9 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
         let new_name = derive_issue_name(&text, &m.issues, m.current_issue);
         if new_name != m.cur_issue().name {
             let old_name = std::mem::replace(&mut m.cur_issue_mut().name, new_name.clone());
-            cmds.push(Command::DeleteIssueFile { issue: old_name });
+            // 改名而不是删掉:旧文件里可能已经落了内容(比如自动改名前的
+            // 「X 掉线」系统消息),直接删会把它永久丢掉,重启后就没了。
+            cmds.push(Command::RenameIssueFile { from: old_name, to: new_name });
         }
     }
 
@@ -497,7 +463,12 @@ fn dispatch(
     let idx = m.issue_index(issue_id)?; // 议题已关闭 → 无处可派
     if m.issues[idx].paused || m.members[i].state != AgentState::Idle {
         // 暂停中 或 忙 → 排队(暂停的等 Ctrl+P 放出来)
-        m.members[i].inbox.push_back(Assignment { issue: issue_id, text: assignment });
+        let dropped = m.members[i]
+            .push_inbox(Assignment { issue: issue_id, text: assignment });
+        if dropped.is_some() {
+            // 丢了活必须说,别让它静默消失
+            set_hint(m, format!("{name} 待办已满({INBOX_CAP} 条),丢弃了最旧的一条"), 10);
+        }
         return None;
     }
     // 闲 → 起进程
@@ -635,7 +606,7 @@ fn handle_slash(m: &mut Model, slash: crate::slash::Slash) -> Vec<Command> {
             vec![]
         }
         Slash::Unknown { text } => {
-            set_hint(m, format!("未知斜杠命令:{text}(试试 /init / /team <名>)"), 5);
+            set_hint(m, format!("未知斜杠命令:{text}(只有 /team <名>)"), 5);
             vec![]
         }
     }
@@ -701,37 +672,60 @@ fn handle_tab_click(m: &mut Model, col: u16) {
     }
 }
 
-/// 粗略计算显示宽度(CJK/emoji 记 2,其余 1)。
+/// 显示宽度。用 unicode-width,和终端/ratatui 的排版一致 ——
+/// 以前是「码点 > 0x1100 就算 2 列」的启发式,`⚙`/`①`/`…`/变体选择符 全都算错,
+/// 导致 tab 点击热区整体偏移,点第 3 个 tab 会切到第 2 个。
 fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| if (c as u32) > 0x1100 { 2 } else { 1 })
-        .sum()
+    use unicode_width::UnicodeWidthStr;
+    s.width()
 }
 
-/// 从我的第一句话里派生议题名(前 20 字符,去掉 @、清理换行、避免文件名非法字符,
+/// 议题名里不允许出现的字符。
+///
+/// 议题名同时当 jsonl 文件名用,所以要挡住所有平台的路径分隔与保留字符:
+/// `/ \` 分隔符、`.` 会被当扩展名、Windows 的 `: * ? " < > |`、以及全部控制字符。
+/// 漏掉的话每次 `PersistChat` 都会失败,而用户只看到状态行闪一下「落盘失败」,
+/// 这个议题的历史一条都没存下来。
+fn is_bad_name_char(c: char) -> bool {
+    matches!(c, '/' | '\\' | '.' | '@' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        || c.is_control()
+}
+
+/// Windows 保留设备名(不分大小写)。用它当文件名在 Windows 上必然失败。
+const RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// 从我的第一句话里派生议题名(前 20 字符,清掉不能进文件名的字符,
 /// 若和已有议题重名则附 -2/-3…)。当前议题的原名允许重复(是它自己)。
 fn derive_issue_name(first_msg: &str, issues: &[Issue], current: usize) -> String {
     let s: String = first_msg
         .chars()
-        .filter(|c| !matches!(c, '/' | '\\' | '.' | '\n' | '\r' | '@'))
+        .filter(|c| !is_bad_name_char(*c))
         .take(20)
         .collect();
     let s = s.trim().to_string();
-    let base = if s.is_empty() { "新议题".to_string() } else { s };
+    let mut base = if s.is_empty() { "新议题".to_string() } else { s };
+    if RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(&base)) {
+        base.push('_'); // CON → CON_
+    }
 
-    // 去重
-    let taken: std::collections::HashSet<&str> = issues
+    // 去重。**按大小写不敏感比**:macOS/Windows 的文件系统不区分大小写,
+    // 「Fix login」和「fix login」会写进同一个 jsonl,互相覆盖、关一个删两个。
+    let taken: Vec<String> = issues
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != current)
-        .map(|(_, x)| x.name.as_str())
+        .map(|(_, x)| x.name.to_lowercase())
         .collect();
-    if !taken.contains(base.as_str()) {
+    let clash = |cand: &str| taken.iter().any(|t| t == &cand.to_lowercase());
+    if !clash(&base) {
         return base;
     }
     for n in 2.. {
         let cand = format!("{base}-{n}");
-        if !taken.contains(cand.as_str()) {
+        if !clash(&cand) {
             return cand;
         }
     }
@@ -817,6 +811,12 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
         Command::DeleteIssueFile { issue } => {
             let dir = model.teamfly_dir.clone();
             if let Err(e) = crate::issue::delete_file(&dir, &issue) {
+                let _ = tx.send(Msg::IoError { detail: format!("{e:#}") });
+            }
+        }
+        Command::RenameIssueFile { from, to } => {
+            let dir = model.teamfly_dir.clone();
+            if let Err(e) = crate::issue::rename_file(&dir, &from, &to) {
                 let _ = tx.send(Msg::IoError { detail: format!("{e:#}") });
             }
         }
@@ -990,6 +990,21 @@ fn translate_event(ev: Event, model: &Model) -> Option<Msg> {
 pub mod test_support {
     use super::*;
 
+    pub fn tiny_member(name: &str) -> Member {
+        Member {
+            name: name.into(),
+            role: "角色".into(),
+            emoji: "👤".into(),
+            backend: BackendKind::Claude,
+            model: None,
+            system_prompt: String::new(),
+            state: AgentState::Working,
+            inbox: std::collections::VecDeque::new(),
+            raw: std::collections::VecDeque::new(),
+            last_seen: std::collections::HashMap::new(),
+        }
+    }
+
     pub fn tiny_model() -> Model {
         Model {
             team_name: "T".into(),
@@ -1000,7 +1015,6 @@ pub mod test_support {
             issues: vec![Issue::new("i")],
             current_issue: 0,
             selection: Selection::Chat,
-            input_mode: InputMode::Chat,
             input: String::new(),
             scroll: 0,
             scroll_max: std::cell::Cell::new(0),
@@ -1031,6 +1045,9 @@ mod e2e {
     }
     fn ctrl(m: &mut Model, c: char) {
         let _ = update(m, Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)));
+    }
+    fn key_cmds(m: &mut Model, code: KeyCode) -> Vec<Command> {
+        update(m, Msg::Key(KeyEvent::new(code, KeyModifiers::empty())))
     }
     fn ctrl_cmds(m: &mut Model, c: char) -> Vec<Command> {
         update(m, Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)))
@@ -1063,7 +1080,6 @@ mod e2e {
             issues: vec![Issue::new("i")],
             current_issue: 0,
             selection: Selection::Chat,
-            input_mode: InputMode::Chat,
             input: String::new(),
             scroll: 0,
             scroll_max: std::cell::Cell::new(0),
@@ -1128,8 +1144,6 @@ mod e2e {
         let mut m = min_model();
         assert_eq!(m.issues.len(), 1);
         ctrl(&mut m, 'n');
-        // 无输入直接建 + 切,input_mode 保持 Chat
-        assert_eq!(m.input_mode, InputMode::Chat);
         assert_eq!(m.issues.len(), 2);
         assert_eq!(m.issues[1].name, "议题2");
         assert_eq!(m.current_issue, 1);
@@ -1409,6 +1423,76 @@ mod e2e {
         // A 的活还留在队里等 ^P
         assert_eq!(m.members[0].inbox.len(), 1);
         assert_eq!(m.members[0].inbox[0].issue, a);
+    }
+
+    #[test]
+    fn issue_name_rejects_filesystem_hostile_chars() {
+        // 这些字符进了文件名,每条 PersistChat 都会失败,整个议题的历史一条都存不下来
+        let issues = vec![Issue::new("别的")];
+        for msg in [
+            "@DEV 修 config:prod 的 \"bug\"?",
+            "改 a/b\\c.rs",
+            "带\t制表符和\u{7}响铃",
+            "通配 * 和 ? 还有 <> |",
+        ] {
+            let name = derive_issue_name(msg, &issues, 0);
+            assert!(
+                !name.chars().any(is_bad_name_char),
+                "{msg:?} 派生出的名字 {name:?} 仍含非法字符"
+            );
+        }
+        // Windows 保留设备名要避开
+        assert_eq!(derive_issue_name("CON", &issues, 0), "CON_");
+        assert_eq!(derive_issue_name("nul", &issues, 0), "nul_");
+    }
+
+    #[test]
+    fn issue_name_dedup_is_case_insensitive() {
+        // macOS/Windows 文件系统不区分大小写:两个只差大小写的议题会写进同一个 jsonl,
+        // 互相覆盖,关一个删两个
+        let issues = vec![Issue::new("Fix login"), Issue::new("别的")];
+        let name = derive_issue_name("fix login", &issues, 1);
+        assert_ne!(name.to_lowercase(), "fix login", "只差大小写也算撞名");
+        assert_eq!(name, "fix login-2");
+    }
+
+    #[test]
+    fn auto_rename_keeps_persisted_file() {
+        let mut m = min_model();
+        // 议题名是自动生成的那种,且已经落过一条系统消息
+        m.issues[0].name = "议题2".into();
+        m.issues[0].timeline.push(ChatMsg {
+            ts: "t".into(), author: "系统".into(), text: "老K 掉线:挂了".into(), is_system: true,
+        });
+        for c in "开始正式干活".chars() { key(&mut m, KeyCode::Char(c)); }
+        let cmds = key_cmds(&mut m, KeyCode::Enter);
+        // 必须是改名而不是删掉 —— 删掉会把已落盘的掉线记录永久丢掉
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::RenameIssueFile { from, to }
+                if from == "议题2" && to == "开始正式干活")),
+            "自动改名应发 RenameIssueFile,实际是 {cmds:?}"
+        );
+        assert!(!cmds.iter().any(|c| matches!(c, Command::DeleteIssueFile { .. })));
+    }
+
+    #[test]
+    fn alt_plus_letter_does_not_leak_into_input() {
+        let mut m = min_model();
+        let _ = update(&mut m, Msg::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)));
+        assert!(m.input.is_empty(), "Alt+a 不该被当成普通输入插进输入框");
+    }
+
+    #[test]
+    fn inbox_has_a_cap() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        m.members[1].state = AgentState::Working; // 忙 → 都进队列
+        for i in 0..(crate::model::INBOX_CAP + 5) {
+            dispatch(&mut m, id, "阿码", format!("活{i}"), 0);
+        }
+        assert_eq!(m.members[1].inbox.len(), crate::model::INBOX_CAP);
+        // 丢活必须有提示
+        assert!(m.status_hint.as_ref().unwrap().contains("待办已满"));
     }
 
     #[test]

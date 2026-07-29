@@ -1,8 +1,9 @@
 //! env.toml —— agent 环境变量,注入到 agent 子进程。
 //!
-//! 两级加载(后覆盖前):
+//! 两级加载(**不合并**,项目级整体顶替用户级):
 //!   1. 用户级 `~/.teamfly/env.toml` —— API key 等全局默认放这里,一次配好多项目共用
-//!   2. 项目级 `<工作目录>/.teamfly/env.toml` —— 覆盖用户级同名 key,项目特定的东西放这里
+//!   2. 项目级 `<工作目录>/.teamfly/env.toml` —— 存在则**整体顶替**用户级(不逐 key 继承),
+//!      所以项目级里要把 token 之类也一并写全
 //!
 //! 格式:
 //! ```toml
@@ -139,7 +140,8 @@ pub fn seed_user_env(path: &Path) -> Result<bool> {
         return Ok(false);
     }
     let tmpl = r#"# teamfly 用户级 agent 环境变量(全局默认,所有项目共用)
-# 项目里可写 <工作目录>/.teamfly/env.toml 覆盖同名 key
+# 注意:项目里若有 <工作目录>/.teamfly/env.toml,它会**整体顶替**这个文件,
+# 不是逐 key 覆盖 —— 项目级里没写的 key(比如 token)不会从这里继承。
 # 值支持 ${VAR} 或 $VAR 引用当前 shell 里的环境变量(避免密钥入文件)
 #
 # 常见用法:把 key 存在 shell(比如 ~/.zshrc),这里只写引用:

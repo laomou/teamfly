@@ -60,6 +60,11 @@ pub struct Member {
 
 pub const RAW_CAP: usize = 2000; // 单 agent raw 环形缓冲上限
 
+/// 单个成员待办队列上限。有上限是因为:一条我指令可以往每个成员塞一批活,
+/// 队列不设顶的话在长会话里会单调增长(而且这些活越旧越没意义)。
+/// 超出后丢**最旧**的,并让调用方报出来 —— 不能静默。
+pub const INBOX_CAP: usize = 32;
+
 /// 用户主动取消时 AgentDone.err 的内容。用它区分「用户掐的」和「真掉线」,
 /// 两者在群聊里的措辞不一样。
 pub const CANCELLED: &str = "已取消";
@@ -68,6 +73,15 @@ impl Member {
     /// 该成员在某议题里上次看到的时间线长度(没记过就是 0 = 从头看)。
     pub fn last_seen_for(&self, issue: u64) -> usize {
         self.last_seen.get(&issue).copied().unwrap_or(0)
+    }
+    /// 往待办队列里塞一条。超出上限时丢掉最旧的一条并返回它(供调用方提示用户)。
+    pub fn push_inbox(&mut self, a: Assignment) -> Option<Assignment> {
+        self.inbox.push_back(a);
+        if self.inbox.len() > INBOX_CAP {
+            self.inbox.pop_front()
+        } else {
+            None
+        }
     }
     pub fn push_raw(&mut self, line: String) {
         self.raw.push_back(line);
@@ -131,13 +145,6 @@ pub enum Selection {
     Member(usize),
 }
 
-/// 输入框当前模式:普通聊天 / 新建议题。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputMode {
-    Chat,
-    NewIssue,
-}
-
 /// 全部应用状态。TEA 的 Model。
 pub struct Model {
     pub team_name: String,
@@ -149,8 +156,6 @@ pub struct Model {
     pub issues: Vec<Issue>,
     pub current_issue: usize,
     pub selection: Selection,
-    /// 输入框模式(默认 Chat;Ctrl+N 进入 NewIssue)
-    pub input_mode: InputMode,
     /// 输入框草稿（入 Model → 抗刷屏）
     pub input: String,
     /// 右区滚动偏移（0 = 贴底）
@@ -255,4 +260,6 @@ pub enum Command {
     PersistChat { issue: String, msg: ChatMsg },
     /// 删除议题的落盘文件 .teamfly/issues/<名>.jsonl(关闭议题时)
     DeleteIssueFile { issue: String },
+    /// 议题自动改名时,把落盘文件一起改名(保住已经落进去的内容)
+    RenameIssueFile { from: String, to: String },
 }

@@ -20,8 +20,9 @@ cargo build --release
 
 - 底部输入框打字。**带 `@名字` 才会派活**；默认团队从 `@TPM 加个登录功能` 开始，由 TPM 拆解、调度实现和评审。不带 `@` 只是留言。
 - `↑↓`(或鼠标点左栏)在 `# 总览`(全员时间线)/ 某个成员(看他进程的原始输出流)间切。
-- `?` 帮助 · `^N` 新议题 · `^W` 关议题 · `Alt+1-9` 切议题 · `Esc` 回总览 · `^C` 退出。
-- 斜杠命令:`/team <名>` 热切当前议题的团队。
+- `?` 帮助 · `^N` 新议题 · `^W` 关议题 · `Alt+1-9` 切议题 · `PgUp`/`PgDn` 翻历史 · `Esc` 回总览。
+- `^P` 解除防乒乓暂停并放出排队的活;`^C` 在有 agent 在跑时先取消它们(再按一次才退出)。
+- 斜杠命令:`/team <名>` 热切团队。注意是**全局**生效(所有议题共用一份花名册),且会取消正在跑的 agent。
 
 ## 团队 = 磁盘文件夹
 
@@ -38,8 +39,8 @@ default/
 
 - **agent md** 只写单一职责(我是谁、做什么);**team.md** 写团队职责和任务流转(谁完成后交给谁),改流程只改一处。
 - `backend` 二选一:`claude`(claude CLI,stream-json)/ `codex`(codex CLI,JSONL)。
-- `model` 可选;不写则由 env.toml 的 `ANTHROPIC_MODEL` 或继承环境决定。
-- 内置 `default` 队(TPM/DEV/REV)首次运行自动播种到工作目录的 `.teamfly/teams/default/`；旧的未修改 DEV/QE 默认队会自动迁移。
+- `model` 可选;不写则由 env.toml 的 `ANTHROPIC_MODEL`(codex 成员是 `OPENAI_MODEL`)或继承环境决定。
+- 内置 `default` 队(TPM/DEV/REV)首次运行自动播种到工作目录的 `.teamfly/teams/default/`；旧的未修改 `team.md` / `QE.md` 会自动迁移(`DEV.md` 不迁移,想拿新版人设请自行删掉它再启动)。
 
 ## 配置(env.toml / mcp.json)
 
@@ -62,7 +63,8 @@ ANTHROPIC_MODEL      = "claude-opus-4-6"
 OPENAI_API_KEY = "${OPENAI_API_KEY}"
 ```
 
-模型优先级:**frontmatter `model:` > env.toml 的 `ANTHROPIC_MODEL` > 继承环境**。
+模型优先级:**frontmatter `model:` > env.toml 的 `ANTHROPIC_MODEL` / `OPENAI_MODEL` > 继承环境**。
+(注入哪个变量取决于成员的 backend:claude → `ANTHROPIC_MODEL`,codex → `OPENAI_MODEL`。)
 
 ## 工作机制
 
@@ -86,7 +88,7 @@ OPENAI_API_KEY = "${OPENAI_API_KEY}"
 cargo test
 ```
 
-纯函数单测(汇报提炼/@ 解析/剥 ANSI/env 展开与分段/claude+codex 事件解析)+ 键盘操作与议题增删测试,共 45 项。
+纯函数单测(汇报提炼/@ 解析/剥 ANSI/env 展开与分段/claude+codex 事件解析)+ 键盘操作与议题增删测试,共 77 项。
 
 ## 已知边界
 

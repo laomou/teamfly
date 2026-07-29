@@ -84,7 +84,8 @@ pub fn init() -> Result<()> {
     let body = toml::to_string_pretty(&table)?;
     let out = format!(
         "# teamfly 用户级 agent 环境变量(teamfly init 生成/更新)\n\
-         # 项目里可写 <工作目录>/.teamfly/env.toml 覆盖同名 key\n\n{body}"
+         # 注意:项目里若有 <工作目录>/.teamfly/env.toml,它会**整体顶替**本文件,\n\
+         # 不是逐 key 覆盖 —— 项目级里没写的 key(比如 token)不会从这里继承。\n\n{body}"
     );
 
     // 原子 + 0600 写入(不再「先 0644 再 chmod」留可读窗口)
@@ -269,7 +270,8 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
     }
 
     // 恢复落盘的议题;没有则建一个默认议题
-    let mut issues = crate::issue::load_all_issues(&teamfly_dir)?;
+    let (mut issues, issue_warns) = crate::issue::load_all_issues(&teamfly_dir)?;
+    warns.extend(issue_warns);
     let fresh_start = issues.is_empty();
     if fresh_start {
         issues.push(Issue::new("默认议题"));
@@ -303,7 +305,6 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
         issues,
         current_issue: 0,
         selection: Selection::Chat,
-        input_mode: crate::model::InputMode::Chat,
         input: String::new(),
         scroll: 0,
         scroll_max: std::cell::Cell::new(0),
