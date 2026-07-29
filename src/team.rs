@@ -16,7 +16,12 @@ struct AgentFront {
     backend: String,
     #[serde(default)]
     model: Option<String>,
+    /// 是否在独立 git worktree 里干活。默认 true。
+    #[serde(default = "default_true")]
+    worktree: bool,
 }
+
+fn default_true() -> bool { true }
 
 /// team.md 的 frontmatter。
 #[derive(Debug, serde::Deserialize, Default)]
@@ -137,6 +142,7 @@ pub fn load_team(dir: &Path) -> Result<Team> {
             emoji,
             backend,
             model: af.model,
+            worktree: af.worktree,
             system_prompt: sp,
             state: AgentState::Idle,
             inbox: VecDeque::new(),
