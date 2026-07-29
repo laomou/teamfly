@@ -146,6 +146,7 @@ pub fn load_team(dir: &Path) -> Result<Team> {
             system_prompt: sp,
             state: AgentState::Idle,
             inbox: VecDeque::new(),
+            working_issue: None,
             raw: VecDeque::new(),
             last_seen: std::collections::HashMap::new(),
         });

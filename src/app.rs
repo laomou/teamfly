@@ -375,12 +375,15 @@ fn handle_agent_done(
     // 该成员回到空闲
     if let Some(i) = m.member_index(&name) {
         m.members[i].state = AgentState::Idle;
+        // 必须清掉,否则「同议题是否有写手在跑」的判断会永久为真,
+        // 后续派活全部卡在队列里出不来
+        m.members[i].working_issue = None;
     }
 
     // 议题已被关掉:汇报无处可去。只给一条临时提示,绝不写进别的议题。
     let Some(idx) = m.issue_index(issue_id) else {
         set_hint(m, format!("{name} 的汇报所属议题已关闭,已丢弃"), 8);
-        cmds.extend(drain_inbox(m, &name));
+        cmds.extend(drain_after_done(m, &name));
         return cmds;
     };
     let issue_name = m.issues[idx].name.clone();
@@ -396,7 +399,9 @@ fn handle_agent_done(
         };
         // 失败/取消时更容易留下空 worktree:没动过就回收,动过就告诉用户在哪
         if let Some((wt_dir, branch)) = &worktree {
-            if wt_dir.exists() && !crate::worktree::drop_if_untouched(&m.work_dir, wt_dir, branch) {
+            if wt_dir.exists()
+                && !crate::worktree::drop_if_untouched(&m.work_dir, &m.teamfly_dir, issue_id)
+            {
                 let summary = crate::worktree::change_summary(wt_dir, &m.work_dir, branch);
                 text.push_str(&format!("(已改的留在 {branch} — {summary})"));
             }
@@ -405,7 +410,7 @@ fn handle_agent_done(
         m.issues[idx].timeline.push(msg.clone());
         cmds.push(Command::PersistChat { issue: issue_name.clone(), msg });
         // 尝试处理该成员排队的下一条
-        cmds.extend(drain_inbox(m, &name));
+        cmds.extend(drain_after_done(m, &name));
         return cmds;
     }
 
@@ -425,7 +430,7 @@ fn handle_agent_done(
     if let Some((wt_dir, branch)) = &worktree {
         if wt_dir.exists() {
             // 一点改动都没有(纯查询类任务)→ 直接回收,别留个完整 checkout 占磁盘
-            if crate::worktree::drop_if_untouched(&m.work_dir, wt_dir, branch) {
+            if crate::worktree::drop_if_untouched(&m.work_dir, &m.teamfly_dir, issue_id) {
                 // 什么都不追加:没改动就没什么可让用户采纳的
             } else {
                 let summary = crate::worktree::change_summary(wt_dir, &m.work_dir, branch);
@@ -470,7 +475,7 @@ fn handle_agent_done(
     }
 
     // 该成员自己的排队任务
-    cmds.extend(drain_inbox(m, &name));
+    cmds.extend(drain_after_done(m, &name));
     cmds
 }
 
@@ -485,8 +490,20 @@ fn dispatch(
 ) -> Option<Command> {
     let i = m.member_index(name)?;
     let idx = m.issue_index(issue_id)?; // 议题已关闭 → 无处可派
-    if m.issues[idx].paused || m.members[i].state != AgentState::Idle {
-        // 暂停中 或 忙 → 排队(暂停的等 Ctrl+P 放出来)
+
+    // 同议题内的写手必须串行:一个议题共享一个 worktree,两个写手同时在里面
+    // 改文件就会互相踩(而共享 worktree 正是接力能直接看到上游改动的前提)。
+    // 只读成员(worktree: false,在主目录只读)不占这个位置,可以随时跑。
+    let writer_busy = m.members[i].worktree
+        && m.members.iter().enumerate().any(|(j, other)| {
+            j != i
+                && other.worktree
+                && other.state != AgentState::Idle
+                && other.working_issue == Some(issue_id)
+        });
+
+    if m.issues[idx].paused || m.members[i].state != AgentState::Idle || writer_busy {
+        // 暂停中 / 自己忙 / 同议题有别的写手在跑 → 排队
         let dropped = m.members[i]
             .push_inbox(Assignment { issue: issue_id, text: assignment });
         if dropped.is_some() {
@@ -500,6 +517,7 @@ fn dispatch(
     let user_input = issue::build_prompt_input(issue_id, &timeline, &m.members[i], &assignment);
     m.members[i].last_seen.insert(issue_id, timeline.len());
     m.members[i].state = AgentState::Thinking;
+    m.members[i].working_issue = Some(issue_id);
     m.issues[idx].chain_depth = chain_depth;
 
     let mem = &m.members[i];
@@ -555,6 +573,26 @@ fn drain_inbox(m: &mut Model, name: &str) -> Vec<Command> {
 }
 
 /// 把所有成员 inbox 队头能派的活都放出来(Ctrl+P 恢复暂停后用)。
+/// 某成员交卷后放行排队的活。
+///
+/// 不能只 drain 它自己的队列:写手交卷会腾出**这个议题的 worktree 位置**,
+/// 别的写手可能正因为「同议题有写手在跑」而排在队里 —— 不一并 drain 的话
+/// 那些活会一直卡着,界面上所有人显示摸鱼但队列非空。
+fn drain_after_done(m: &mut Model, name: &str) -> Vec<Command> {
+    let mut cmds = drain_inbox(m, name);
+    // 自己的先出队;然后给其他人一次机会(位置刚腾出来)
+    let others: Vec<String> = m
+        .members
+        .iter()
+        .map(|x| x.name.clone())
+        .filter(|n| n != name)
+        .collect();
+    for n in others {
+        cmds.extend(drain_inbox(m, &n));
+    }
+    cmds
+}
+
 fn drain_all_inboxes(m: &mut Model) -> Vec<Command> {
     let names: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
     let mut cmds = Vec::new();
@@ -632,7 +670,7 @@ fn handle_slash(m: &mut Model, slash: crate::slash::Slash) -> Vec<Command> {
         }
         Slash::Drop { name } => {
             let id = m.cur_issue().id;
-            let n = crate::worktree::remove_agent(&m.work_dir, &m.teamfly_dir, id, &name);
+            let n = usize::from(crate::worktree::remove_issue(&m.work_dir, &m.teamfly_dir, id));
             if n == 0 {
                 set_hint(m, format!("{name} 在当前议题没有 worktree"), 5);
             } else {
@@ -878,7 +916,6 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                     &model.work_dir,
                     &model.teamfly_dir,
                     issue,
-                    &name,
                 );
                 (wt.agent_dir, wt.branch)
             } else {
@@ -1072,6 +1109,7 @@ pub mod test_support {
             system_prompt: String::new(),
             state: AgentState::Working,
             inbox: std::collections::VecDeque::new(),
+            working_issue: None,
             raw: std::collections::VecDeque::new(),
             last_seen: std::collections::HashMap::new(),
         }
@@ -1568,6 +1606,61 @@ mod e2e {
     }
 
     #[test]
+    fn writers_in_same_issue_are_serialized() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        // 三个成员都是写手(min_model 默认 worktree=true)
+        // 老K 正在为这个议题干活
+        m.members[0].state = AgentState::Working;
+        m.members[0].working_issue = Some(id);
+
+        // 同议题派给另一个写手 → 必须排队,不能起进程
+        //(一个议题共享一个 worktree,两个写手同时改文件会互相踩)
+        let c = dispatch(&mut m, id, "阿码", "同议题的活".into(), 0);
+        assert!(c.is_none(), "同议题已有写手在跑,第二个必须排队");
+        assert_eq!(m.members[1].inbox.len(), 1);
+
+        // 换个议题 → 立刻起进程(跨议题仍然并行)
+        ctrl(&mut m, 'n');
+        let other = m.issues[1].id;
+        let c = dispatch(&mut m, other, "阿测", "别的议题".into(), 0);
+        assert!(c.is_some(), "跨议题不该被挡");
+    }
+
+    #[test]
+    fn readonly_members_do_not_block_writers() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        // 老K 是只读成员(worktree: false),在主目录只读,不占 worktree
+        m.members[0].worktree = false;
+        m.members[0].state = AgentState::Working;
+        m.members[0].working_issue = Some(id);
+
+        // 写手照样能起
+        let c = dispatch(&mut m, id, "阿码", "写活".into(), 0);
+        assert!(c.is_some(), "只读成员不占 worktree,不该挡住写手");
+    }
+
+    #[test]
+    fn working_issue_cleared_on_done_so_queue_can_drain() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        m.members[0].state = AgentState::Working;
+        m.members[0].working_issue = Some(id);
+        // 阿码 排在队里
+        dispatch(&mut m, id, "阿码", "排队的活".into(), 0);
+        assert_eq!(m.members[1].inbox.len(), 1);
+
+        // 老K 交卷 → working_issue 必须清掉,否则队列永久出不来
+        let cmds = done(&mut m, "老K", id, "干完了");
+        assert_eq!(m.members[0].working_issue, None);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SpawnAgent { name, .. } if name == "阿码")),
+            "老K 交卷后阿码该被放出来,实际 {cmds:?}"
+        );
+    }
+
+    #[test]
     fn io_error_surfaces_as_hint() {
         let mut m = min_model();
         update(&mut m, Msg::IoError { detail: "磁盘已满".into() });
@@ -1586,6 +1679,7 @@ mod e2e {
             system_prompt: if role == "架构" { "架构".into() } else { String::new() },
             state: AgentState::Idle,
             inbox: VecDeque::new(),
+            working_issue: None,
             raw: VecDeque::new(),
             last_seen: std::collections::HashMap::new(),
         }

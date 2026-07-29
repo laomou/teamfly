@@ -51,6 +51,10 @@ pub struct Member {
     pub state: AgentState,
     /// 忙时/议题暂停时被 @，进这个待办队列
     pub inbox: VecDeque<Assignment>,
+    /// 正在为哪个议题干活（Idle 时无意义）。
+    /// 用来判断「同议题内是否已有写手在跑」—— 一个议题共享一个 worktree，
+    /// 两个写手同时在里面改文件会互相踩。
+    pub working_issue: Option<u64>,
     /// raw 输出流（环形缓冲，剥过 ANSI），供单人视图展示
     pub raw: VecDeque<String>,
     /// 每个议题里「上次活跃时该议题时间线的长度」,用于算增量前情。
