@@ -9,6 +9,8 @@
 pub enum Slash {
     /// 热切当前议题的团队。
     SwitchTeam { name: String },
+    /// 丢弃某个 agent 在当前议题的 worktree + 分支。
+    Drop { name: String },
     /// 未知斜杠,text 是原始输入。
     Unknown { text: String },
 }
@@ -29,6 +31,13 @@ pub fn parse(input: &str) -> Option<Slash> {
                 Some(Slash::Unknown { text: s.to_string() })
             } else {
                 Some(Slash::SwitchTeam { name: args.to_string() })
+            }
+        }
+        "/drop" => {
+            if args.is_empty() {
+                Some(Slash::Unknown { text: s.to_string() })
+            } else {
+                Some(Slash::Drop { name: args.to_string() })
             }
         }
         _ => Some(Slash::Unknown { text: s.to_string() }),

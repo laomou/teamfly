@@ -1,7 +1,7 @@
 //! TEA 事件循环 + update + Command 执行。
 //! 所有并发事件源汇成单一 mpsc<Msg>,主循环逐条喂 update。
 
-use crate::backend::{self, RunSpec};
+use crate::backend::{self, resolve_mcp_config, RunSpec};
 use crate::issue;
 use crate::model::*;
 use crate::tui;
@@ -409,7 +409,16 @@ fn handle_agent_done(
     let mentions = crate::router::parse_mentions(&report, &roster, &name);
 
     // 群聊里展示/落盘的是截断版(若真截断了会标注派给了谁)
-    let chat_text = crate::router::report_for_chat(&report, &mentions);
+    let mut chat_text = crate::router::report_for_chat(&report, &mentions);
+
+    // 如果用了 worktree，附上分支名和 diff 摘要，让用户知道改动在哪
+    let branch = format!("teamfly/{issue_id}/{name}");
+    let wt = crate::worktree::worktree_path(&m.teamfly_dir, issue_id, &name);
+    if wt.exists() {
+        let summary = crate::worktree::diff_summary(&m.work_dir, &branch);
+        chat_text.push_str(&format!("\n📂 分支 {branch} ({summary})"));
+    }
+
     let msg = ChatMsg { ts: now_ts(), author: name.clone(), text: chat_text, is_system: false };
     m.issues[idx].timeline.push(msg.clone());
     cmds.push(Command::PersistChat { issue: issue_name.clone(), msg });
@@ -605,8 +614,20 @@ fn handle_slash(m: &mut Model, slash: crate::slash::Slash) -> Vec<Command> {
             }
             vec![]
         }
+        Slash::Drop { name } => {
+            let issue_id = m.cur_issue().id;
+            let branch = format!("teamfly/{issue_id}/{name}");
+            let wt = crate::worktree::worktree_path(&m.teamfly_dir, issue_id, &name);
+            if !wt.exists() {
+                set_hint(m, format!("{name} 在当前议题没有 worktree"), 5);
+                return vec![];
+            }
+            crate::worktree::remove(&m.work_dir, &m.teamfly_dir, issue_id, &name);
+            set_hint(m, format!("已丢弃 {name} 的改动(分支 {branch} 已删)"), 8);
+            vec![]
+        }
         Slash::Unknown { text } => {
-            set_hint(m, format!("未知斜杠命令:{text}(只有 /team <名>)"), 5);
+            set_hint(m, format!("未知斜杠命令:{text}(试试 /team <名> / /drop <名>)"), 5);
             vec![]
         }
     }
@@ -778,6 +799,9 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     for mem in &mut m.members {
         mem.last_seen.remove(&removed.id);
     }
+    // 关议题时把属于它的所有 worktree + 分支一起清掉
+    let member_names: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
+    crate::worktree::remove_issue(&m.work_dir, &m.teamfly_dir, removed.id, &member_names);
     set_hint(m, format!("已关闭议题:{}", removed.name), 5);
     vec![Command::DeleteIssueFile { issue: removed.name }]
 }
@@ -834,6 +858,15 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             system_prompt,
             user_input,
         } => {
+            // 每个 agent 每个议题一个隔离 worktree + 分支，互不冲突。
+            // 非 git 仓库时 fallback 到共用 work_dir（和以前一样）。
+            let wt = crate::worktree::prepare(
+                &model.work_dir,
+                &model.teamfly_dir,
+                issue,
+                &name,
+            );
+            let mcp_config = resolve_mcp_config(&model.work_dir);
             let spec = RunSpec {
                 name,
                 issue,
@@ -843,7 +876,8 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                 env,
                 system_prompt,
                 user_input,
-                work_dir: model.work_dir.clone(),
+                work_dir: wt.agent_dir,
+                mcp_config,
             };
             let tx = tx.clone();
             let cancel = model.cancel.clone();

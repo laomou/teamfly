@@ -22,6 +22,8 @@ pub struct RunSpec {
     pub system_prompt: String,
     pub user_input: String,
     pub work_dir: PathBuf,
+    /// 预解析好的 MCP 配置文件路径(查的是主 work_dir,不是 worktree)
+    pub mcp_config: Option<String>,
 }
 
 /// 重试前追加给 agent 的提醒。上一次尝试已经动过工具(可能改了文件、跑过命令),
@@ -167,10 +169,10 @@ fn claude_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         spec.system_prompt.clone(),
     ];
     // 模型不走 --model,改由 env ANTHROPIC_MODEL 接管(见 run_process 里的注入逻辑)
-    // MCP 两级 fallback:项目级 <work_dir>/.teamfly/mcp.json > 用户级 ~/.teamfly/mcp.json
-    if let Some(mcp) = resolve_mcp_config(&spec.work_dir) {
+    // MCP 配置已在 spawn 时从主 work_dir 解析好(worktree 里没有 .teamfly/)
+    if let Some(mcp) = &spec.mcp_config {
         args.push("--mcp-config".into());
-        args.push(mcp);
+        args.push(mcp.clone());
         args.push("--strict-mcp-config".into());
     }
     args.push(user_input.to_string());
@@ -181,7 +183,7 @@ fn claude_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
 }
 
 /// MCP 配置文件:项目级优先,回退到用户级。都不存在返回 None。
-fn resolve_mcp_config(work_dir: &std::path::Path) -> Option<String> {
+pub fn resolve_mcp_config(work_dir: &std::path::Path) -> Option<String> {
     // 项目级
     let proj = work_dir.join(".teamfly").join("mcp.json");
     if proj.is_file() {

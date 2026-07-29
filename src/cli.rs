@@ -324,6 +324,15 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
     if let Some(warn) = check_instance_lock(&model.teamfly_dir) {
         warns.push(warn);
     }
+    // 列出上次残留的 worktree(崩溃/被杀时来不及清理)
+    let stale = crate::worktree::list_stale(&model.teamfly_dir);
+    if !stale.is_empty() {
+        warns.push(format!(
+            "有 {} 个残留的 agent worktree(.teamfly/worktrees/{}…),可用 /drop 清理",
+            stale.len(),
+            stale[0]
+        ));
+    }
 
     Ok((model, warns))
 }

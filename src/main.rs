@@ -10,6 +10,7 @@ mod slash;
 mod stream;
 mod team;
 mod tui;
+mod worktree;
 
 use clap::Parser;
 
