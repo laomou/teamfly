@@ -24,8 +24,34 @@ pub fn append_chat(teamfly_dir: &Path, issue_name: &str, msg: &ChatMsg) -> Resul
         .append(true)
         .open(&path)
         .with_context(|| format!("打开 {}", path.display()))?;
-    let line = serde_json::to_string(msg)?;
-    writeln!(f, "{line}")?;
+    // 一次 write 写完整行(含换行)。
+    // `writeln!` 会拆成两个 write 系统调用(内容 + "\n"),而 O_APPEND 只保证
+    // **单次** write 原子 —— 同一目录开两个 teamfly 实例时,两边的写会交错成
+    // `{..A..}{..B..}\n\n`,重启时这一整行解析失败被跳过,两条消息一起消失。
+    let mut line = serde_json::to_string(msg)?;
+    line.push('\n');
+    f.write_all(line.as_bytes())
+        .with_context(|| format!("写入 {}", path.display()))?;
+    Ok(())
+}
+
+/// 议题改名时把落盘文件一起改名。源文件不存在视为成功(还没落过盘)。
+/// 目标已存在则不覆盖 —— 那是另一个议题的历史,宁可留下孤儿也别冲掉它。
+pub fn rename_file(teamfly_dir: &Path, from: &str, to: &str) -> Result<()> {
+    let src = issue_path(teamfly_dir, from);
+    if !src.exists() {
+        return Ok(());
+    }
+    let dst = issue_path(teamfly_dir, to);
+    if dst.exists() {
+        anyhow::bail!(
+            "{} 已存在,不覆盖(旧文件 {} 保留待人工处理)",
+            dst.display(),
+            src.display()
+        );
+    }
+    std::fs::rename(&src, &dst)
+        .with_context(|| format!("把 {} 改名为 {}", src.display(), dst.display()))?;
     Ok(())
 }
 
@@ -39,10 +65,13 @@ pub fn delete_file(teamfly_dir: &Path, issue_name: &str) -> Result<()> {
 }
 
 /// 从盘上重放所有 issue(重开恢复 tab 与时间线)。
-pub fn load_all_issues(teamfly_dir: &Path) -> Result<Vec<Issue>> {
+/// 读回落盘的议题。第二个返回值是需要提示给用户的告警(读不了的文件等) ——
+/// 这些必须进 TUI 的预检消息,不能只往 stderr 打(马上就进备用屏了)。
+pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> {
     let dir = issues_dir(teamfly_dir);
+    let mut warns: Vec<String> = Vec::new();
     if !dir.is_dir() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), warns));
     }
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
@@ -64,7 +93,9 @@ pub fn load_all_issues(teamfly_dir: &Path) -> Result<Vec<Issue>> {
         let content = match std::fs::read(&path) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => {
-                eprintln!("跳过读不了的议题文件 {}:{e}", path.display());
+                // 不能只 eprintln:紧接着就 EnterAlternateScreen,用户永远看不到,
+                // 只感觉某个 tab 凭空没了。攒起来交给调用方当预检 warn 显示。
+                warns.push(format!("读不了议题文件 {}({e}),已跳过", path.display()));
                 continue;
             }
         };
@@ -80,7 +111,7 @@ pub fn load_all_issues(teamfly_dir: &Path) -> Result<Vec<Issue>> {
         }
         issues.push(issue);
     }
-    Ok(issues)
+    Ok((issues, warns))
 }
 
 /// 为被唤醒的 agent 拼「自上次活跃以来新增的群聊前情」+ 本次指派。

@@ -72,11 +72,17 @@ pub fn draw(f: &mut Frame, m: &Model) {
     }
 }
 
+/// 帮助浮层里的内容行数(和下面 `lines` 向量对齐;改了那个向量记得改这里)。
+const HELP_LINES: u16 = 23;
+
 /// 帮助浮层:居中显示所有键位,再按 ? 或 Esc 关闭。
 fn draw_help_overlay(f: &mut Frame) {
     let area = f.area();
-    let w = 60u16.min(area.width.saturating_sub(4));
-    let h = 20u16.min(area.height.saturating_sub(4));
+    let w = 66u16.min(area.width.saturating_sub(4));
+    // 高度按内容条数算,不写死 —— 写死 20 时最后 3 行(^P / ^C)被裁在框外,
+    // 而系统消息恰恰在教用户「按 Ctrl+P 恢复」,他按 ? 去查却查不到。
+    let content_h = HELP_LINES + 2; // +2 是上下边框
+    let h = content_h.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -108,11 +114,13 @@ fn draw_help_overlay(f: &mut Frame) {
         Line::from(vec![Span::styled("  议题", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
         Line::from("    ^N                新建议题(自动命名,第一条消息决定名字)"),
         Line::from("    ^W                关当前议题(有内容需再按一次确认)"),
-        Line::from("    Alt+1..9          切议题"),
+        Line::from("    ^1..9 / Alt+1..9  切议题(^数字 部分终端不发送)"),
         Line::from(""),
         Line::from(vec![Span::styled("  其他", Style::default().add_modifier(Modifier::BOLD).fg(Color::White))]),
-        Line::from("    ^P                解除防乒乓暂停"),
+        Line::from("    PgUp / PgDn       上下翻历史"),
+        Line::from("    ^P                解除防乒乓暂停并放出排队的活"),
         Line::from("    ^C                有 agent 在跑时:取消它们;否则退出"),
+        Line::from("    鼠标              点左栏切视图 · 点顶栏切议题"),
     ];
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
@@ -301,7 +309,22 @@ fn state_color(s: AgentState) -> Color {
     }
 }
 
+/// 正文区能正常渲染所需的最小宽度。
+///
+/// ratatui 0.28 在极窄区域里折行遇到双宽字符(中文/emoji)会写到 area 外面 ——
+/// 实测宽 2 时会往 x=2 写,直接 `index outside of buffer` panic。
+/// 这里的内容全是中文,所以宽度不够就换成纯 ASCII 的提示,不把内容喂进去。
+const MIN_CONTENT_W: u16 = 4;
+
 fn draw_main(f: &mut Frame, area: Rect, m: &Model) {
+    if area.width < MIN_CONTENT_W || area.height == 0 {
+        // 只画 ASCII,避免双宽字符再踩上面那个坑
+        f.render_widget(
+            Paragraph::new("<>").style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
     match m.selection {
         Selection::Chat => draw_timeline(f, area, m),
         Selection::Member(i) => draw_agent_raw(f, area, m, i),
@@ -461,21 +484,6 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize) {
 
 fn draw_input(f: &mut Frame, area: Rect, m: &Model) {
     // NewIssue 模式:输入议题名,标题反映
-    if m.input_mode == crate::model::InputMode::NewIssue {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(Span::styled(
-                " 新建议题 · ⏎ 创建 · Esc 取消 ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ));
-        let text = format!("# {}", m.input);
-        f.render_widget(Paragraph::new(text).block(block), area);
-        let cx = area.x + 3 + display_width(&m.input) as u16;
-        let cy = area.y + 1;
-        f.set_cursor_position((cx.min(area.x + area.width.saturating_sub(2)), cy));
-        return;
-    }
 
     // @ 补全建议(输入中最后一个 @token 的候选)
     let roster: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
@@ -691,6 +699,54 @@ mod tests {
             let m = crate::app::test_support::tiny_model();
             term.draw(|f| draw(f, &m))
                 .unwrap_or_else(|e| panic!("{w}x{h} 渲染失败: {e}"));
+        }
+    }
+
+    /// 帮助浮层不能被裁:内容行数必须和 HELP_LINES 一致,而且在常见终端里放得下。
+    /// 以前高度写死 20 而内容 21 行,最后几行(^P / ^C)永远看不到 ——
+    /// 而系统消息恰恰在教用户按 Ctrl+P。
+    #[test]
+    fn help_overlay_not_truncated() {
+        const H: u16 = 40;
+        const W: u16 = 100;
+        let mut m = crate::app::test_support::tiny_model();
+        m.show_help = true;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+        term.draw(|f| draw(f, &m)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let screen: String = (0..H)
+            .map(|y| (0..W).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // TestBackend 把双宽字符存成「字符 + 空续格」,重建出来会多空格,比较前先去掉
+        let flat: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+        for must in ["^P", "^C", "PgUp", "鼠标"] {
+            let needle: String = must.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(flat.contains(&needle), "帮助浮层里看不到 {must},说明被裁了");
+        }
+    }
+
+    /// 极窄终端 + 长 CJK 行:折行会落在双宽字符中间,ratatui 在 area.right() 处越界。
+    #[test]
+    fn draw_survives_narrow_terminal_with_cjk() {
+        let long = "@ 连锁已达 1 轮,自动暂停以防打转。按 Ctrl+P 恢复,或直接发新指令。";
+        for w in [1u16, 2, 3, 4, 5] {
+            for h in [8u16, 17, 24, 40] {
+                let mut m = crate::app::test_support::tiny_model();
+                m.members.push(crate::app::test_support::tiny_member("老K"));
+                m.selection = Selection::Member(0);
+                m.members[0].raw.push_back(long.to_string());
+                m.issues[0].timeline.push(crate::model::ChatMsg {
+                    ts: "t".into(),
+                    author: "老K".into(),
+                    text: long.to_string(),
+                    is_system: false,
+                });
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                term.draw(|f| draw(f, &m))
+                    .unwrap_or_else(|e| panic!("{w}x{h} 渲染失败: {e}"));
+            }
         }
     }
 
