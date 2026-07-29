@@ -178,7 +178,8 @@ const ASSIGNMENT_MAX_CHARS: usize = 12_000;
 /// REV 永不评审,界面上所有人都摸鱼,看起来像「做完了」。
 const HANDOFF_NOTE: &str = "\n\n（干完后,用简短一段话总结你做了什么、结果如何。\
 按你的职责决定是否接力:需要别人接手或需要向调度者汇报时,在结尾 @对应成员;\
-如果这一轮是直接回答用户、不需要任何人接手,就不要 @任何成员。）";
+如果这一轮是直接回答用户、不需要任何人接手,就不要 @任何成员。\
+注意:你改过的文件需要先 `git add` 并 `git commit` 提交到当前分支,这样接力的队友才能看到你的改动。）";
 
 fn clamp_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
