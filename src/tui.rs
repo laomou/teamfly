@@ -181,6 +181,16 @@ fn draw_brand(f: &mut Frame, area: Rect, _m: &Model) {
     f.render_widget(Paragraph::new(line), inner);
 }
 
+/// 顶栏 tab 显示用的议题名。自动占位名「议题N」里的 N 已经由位置前缀(`N:`)承载,
+/// 显示时去掉,否则「2:议题2」把序号显示两遍。用户起的名字、以及「默认议题」原样保留。
+/// 这里按名字形状判断(而非是否空议题),这样连改动前落盘的老「议题N」也一并生效。
+fn display_issue_name(name: &str) -> &str {
+    match name.strip_prefix("议题") {
+        Some(rest) if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) => "议题",
+        _ => name,
+    }
+}
+
 fn draw_tabs(f: &mut Frame, area: Rect, m: &Model) {
     // 边框由 topbar_frame 统一画;分隔线在 area 左侧前一列。
     // 内容从 area 左缘起(紧贴分隔线),右侧留 1 列给外框右边。
@@ -232,7 +242,13 @@ fn draw_tabs(f: &mut Frame, area: Rect, m: &Model) {
             String::new()
         };
         let paused = if issue.paused { " ⏸" } else { "" };
-        let label = format!(" #{}{}{} ", issue.name, badge, paused);
+        let label = format!(
+            " {}:{}{}{} ",
+            i + 1,
+            display_issue_name(&issue.name),
+            badge,
+            paused
+        );
         let style = if i == m.current_issue {
             Style::default()
                 .fg(Color::Black)
@@ -1209,6 +1225,54 @@ mod tests {
             // 路径图标始终画得出(和 tab 各占一段,不互相吃掉)
             assert!(flat.contains("📂"), "宽 {w}:路径被挤没了:{row:?}");
         }
+    }
+
+    /// 议题序号常显:每个 tab 带 `N:` 前缀(N = 1-based 位置,正是 Alt+N 的目标)。
+    #[test]
+    fn tab_shows_issue_position_number() {
+        let mut m = crate::app::test_support::tiny_model();
+        m.issues = vec![
+            crate::model::Issue::new("a"),
+            crate::model::Issue::new("b"),
+            crate::model::Issue::new("c"),
+        ];
+        m.current_issue = 0;
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 6)).unwrap();
+        term.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let row: String = (0..100u16).map(|x| buf[(x, 1)].symbol()).collect();
+        let flat: String = row.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(flat.contains("1:a"), "1 号议题序号没显示:{row:?}");
+        assert!(flat.contains("2:b"), "2 号议题序号没显示:{row:?}");
+        assert!(flat.contains("3:c"), "3 号议题序号没显示:{row:?}");
+    }
+
+    /// 自动占位名「议题N」显示时去掉数字(序号已在 `N:` 前缀里),含改动前落盘的老名字。
+    #[test]
+    fn display_issue_name_strips_placeholder_number() {
+        assert_eq!(display_issue_name("议题2"), "议题");
+        assert_eq!(display_issue_name("议题10"), "议题");
+        assert_eq!(display_issue_name("议题"), "议题"); // 已无数字
+        assert_eq!(display_issue_name("默认议题"), "默认议题"); // 首个议题原样
+        assert_eq!(display_issue_name("登录功能"), "登录功能"); // 用户起的名原样
+        assert_eq!(display_issue_name("议题讨论"), "议题讨论"); // 「议题」开头但非纯数字
+    }
+
+    /// 端到端:已落盘的老「议题2」在 tab 里显示成「议题」(不带冗余数字)。
+    #[test]
+    fn tab_hides_placeholder_number_end_to_end() {
+        let mut m = crate::app::test_support::tiny_model();
+        m.issues = vec![crate::model::Issue::new("议题2")];
+        m.current_issue = 0;
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 6)).unwrap();
+        term.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let row: String = (0..100u16).map(|x| buf[(x, 1)].symbol()).collect();
+        let flat: String = row.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(flat.contains("1:议题"), "没显示 1:议题:{row:?}");
+        assert!(!flat.contains("议题2"), "还在显示冗余的「议题2」:{row:?}");
     }
 
     /// 帮助浮层不能被裁:内容行数必须和 HELP_LINES 一致,而且在常见终端里放得下。
