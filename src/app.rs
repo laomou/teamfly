@@ -342,8 +342,18 @@ fn submit_input(m: &mut Model) -> Vec<Command> {
     cmds.push(Command::PersistChat { issue_id, issue: issue_name.clone(), msg });
 
     // 我指令:重置连锁深度、解除暂停
+    let was_paused = m.cur_issue().paused;
     m.cur_issue_mut().chain_depth = 0;
     m.cur_issue_mut().paused = false;
+
+    // 刚从暂停里出来的话,把攒着的活一起放出来。
+    //
+    // 触顶的系统消息写的是「按 Ctrl+P 恢复,**或直接发新指令**」,而以前这条
+    // 路径只清 paused 不 drain —— 用户照提示发了新指令,排队的活还挂在那儿,
+    // 界面上全员💤,看不出还有活没放出来。^P 一直是 drain 的,两条路得一致。
+    if was_paused {
+        cmds.extend(drain_all_inboxes(m));
+    }
 
     // 解析 @ —— 不带 @ 则只是留言,不触发任何人
     let roster: Vec<String> = m.members.iter().map(|x| x.name.clone()).collect();
@@ -1272,6 +1282,35 @@ mod e2e {
                 err: None,
             },
         )
+    }
+
+    /// 触顶暂停后「直接发新指令」也要放出排队的活。
+    ///
+    /// 系统消息写的是「按 Ctrl+P 恢复,**或直接发新指令**」,而 submit_input
+    /// 以前只清 paused 不 drain —— 用户照提示做了,活还挂在队列里,界面上
+    /// 全员💤,完全看不出来。^P 一直是 drain 的,两条路得一致。
+    #[test]
+    fn new_instruction_also_drains_after_pause() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        m.issues[0].paused = true;
+        let who = m.members[1].name.clone();
+        m.members[1].inbox.push_back(Assignment { issue: id, text: "暂停期间攒的活".into() });
+
+        // 照系统消息的提示:直接发一条新指令
+        for c in "继续".chars() { key(&mut m, KeyCode::Char(c)); }
+        let cmds = key_cmds(&mut m, KeyCode::Enter);
+
+        assert!(!m.issues[0].paused, "发新指令该解除暂停");
+        let idx = m.member_index(&who).unwrap();
+        assert!(
+            m.members[idx].inbox.is_empty(),
+            "排队的活没被放出来 —— 而提示明说「或直接发新指令」"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SpawnAgent { .. })),
+            "该起进程干那条排队的活"
+        );
     }
 
     /// ^C 之后,**已经交卷但还躺在 channel 里**的成功结果不能再派活。

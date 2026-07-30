@@ -103,7 +103,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
         warns.push(warn);
     }
     // 上次残留的 worktree(崩溃/被杀时来不及清理)
-    let stale = crate::worktree::count_stale(&model.teamfly_dir);
+    let stale = crate::worktree::count_stale(&model.work_dir, &model.teamfly_dir);
     if stale > 0 {
         warns.push(format!(
             "有 {stale} 个 agent worktree 留在 .teamfly/worktrees/(对应 teamfly/issue-* 分支)"
