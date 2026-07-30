@@ -422,8 +422,29 @@ fn draw_timeline(f: &mut Frame, area: Rect, m: &Model, info: &mut DrawInfo) {
 
 fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut DrawInfo) {
     let mem = &m.members[idx];
+    /// raw 流里一行属于哪一类。相邻两行**类别不同**时插一条空行,
+    /// 让「思考 / 工具调用 / 工具结果 / 回复正文」在视觉上分块 ——
+    /// 全挤在一起时扫读根本分不出边界。
+    ///
+    /// 工具结果(📋/❌)算和工具调用(🔧)同一块:结果本来就该紧挨着它的调用,
+    /// 中间插空行反而把这对拆散了。
+    #[derive(PartialEq, Clone, Copy)]
+    enum Blk { Think, Tool, Text, Err }
+    fn blk_of(l: &str) -> Blk {
+        if l.starts_with("💭") {
+            Blk::Think
+        } else if l.starts_with("🔧") || l.starts_with("📋") || l.starts_with("❌") {
+            Blk::Tool
+        } else if l.starts_with("⟨err⟩") {
+            Blk::Err
+        } else {
+            Blk::Text
+        }
+    }
+
     let mut lines: Vec<Line> = Vec::new();
     let mut seen_init = false;
+    let mut prev: Option<Blk> = None;
     for l in &mem.raw {
         // 每轮以 ⟨init⟩ 开头:新一轮前插一条空行 + 分隔,和上一轮拉开
         if l.starts_with("⟨init⟩") {
@@ -435,23 +456,38 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut D
                 format!("── {l} ──"),
                 Style::default().fg(Color::DarkGray),
             ));
+            // 分隔线本身也是一块:后面第一块内容要和它拉开。
+            // `prev = None` 会让下一行不触发换块判断,于是分隔线和第一条思考
+            // 紧贴 —— 别的块都分开了,只有这里没分反而更突兀。
+            lines.push(Line::raw(""));
+            prev = None;
             continue;
         }
-        let (style, prefix) = if l.starts_with("⟨err⟩") {
-            (Style::default().fg(Color::Red), "  ")
-        } else if l.starts_with("🔧") {
-            (Style::default().fg(Color::Cyan), "  ")
-        } else if l.starts_with("📋") {
+        let kind = blk_of(l);
+        // 空一行的两种情况:
+        //  1. 换块了(思考 → 工具、工具 → 正文…)
+        //  2. 同是工具块但又起了一次**新调用** —— 一串 🔧 连着会糊成一片,
+        //     而 📋/❌ 要紧挨着它自己的 🔧,不能拆
+        let new_block = prev.is_some_and(|p| p != kind);
+        let new_tool_call = kind == Blk::Tool && prev == Some(Blk::Tool) && l.starts_with("🔧");
+        if new_block || new_tool_call {
+            lines.push(Line::raw(""));
+        }
+        prev = Some(kind);
+
+        let (style, prefix) = match kind {
+            Blk::Err => (Style::default().fg(Color::Red), "  "),
+            Blk::Tool if l.starts_with("🔧") => (Style::default().fg(Color::Cyan), "  "),
             // 工具结果:挂在工具调用下面,再缩一层 + 灰色弱化
-            (Style::default().fg(Color::DarkGray), "    ")
-        } else if l.starts_with("❌") {
+            Blk::Tool if l.starts_with("📋") => (Style::default().fg(Color::DarkGray), "    "),
             // 工具执行失败
-            (Style::default().fg(Color::Red), "    ")
-        } else if l.starts_with("💭") {
+            Blk::Tool => (Style::default().fg(Color::Red), "    "),
             // 思考链:黄色 + dim,和回复正文拉开
-            (Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM), "  ")
-        } else {
-            (Style::default().fg(Color::Gray), "  ")
+            Blk::Think => (
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+                "  ",
+            ),
+            Blk::Text => (Style::default().fg(Color::Gray), "  "),
         };
         lines.push(Line::styled(format!("{prefix}{l}"), style));
     }
@@ -659,23 +695,38 @@ fn str_cols(s: &str) -> usize {
     s.width()
 }
 
+/// 把一段正文切成「每行一段」,供渲染层逐段加缩进前缀。
+///
+/// 两件事:
+/// 1. **先按 `\n` 断行**。agent 的汇报几乎都是多行的(列表、代码块、分点),
+///    而 ratatui 的 `Line` 不把内容里的 `\n` 当换行 —— 它会被当控制字符渲染成
+///    空白,于是整段汇报在总览里挤成一坨。
+/// 2. 再按宽度折行。这里不能交给 `Paragraph` 的 `Wrap` 做:折出来的续行不会
+///    带上调用方加的两格缩进,气泡会破形。
+///
+/// 宽度用 unicode-width 逐字符算。以前是「码点 > 0x1100 就算 2 列」的启发式,
+/// `…`/`①`/变体选择符全都算错(和 tab 热区、输入行光标那两处同源的 bug)。
 fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
     if width == 0 {
         return vec![s.to_string()];
     }
     let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = if (c as u32) > 0x1100 { 2 } else { 1 };
-        if w + cw > width {
-            out.push(std::mem::take(&mut cur));
-            w = 0;
+    // \r\n 和纯 \r 都当换行:agent 输出里两种都见过
+    for para in s.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
+        let mut cur = String::new();
+        let mut w = 0usize;
+        for c in para.chars() {
+            // 控制字符没有宽度概念,直接跳过(制表符等留给上层的 raw 视图)
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > width && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                w = 0;
+            }
+            cur.push(c);
+            w += cw;
         }
-        cur.push(c);
-        w += cw;
-    }
-    if !cur.is_empty() {
+        // 空段也要推:`\n\n` 中间那个空行是作者故意留的段落间隔
         out.push(cur);
     }
     if out.is_empty() {
@@ -687,6 +738,140 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// agent 汇报里的换行必须在总览里真的换行。
+    ///
+    /// ratatui 的 `Line` 不把内容里的 `\n` 当换行 —— 它被当控制字符渲染成空白,
+    /// 于是多行汇报(列表、分点、代码块)在总览里挤成一坨。agent 的汇报几乎
+    /// 都是多行的,所以这条影响每一次交卷。
+    #[test]
+    fn timeline_renders_newlines_as_line_breaks() {
+        let segs = wrap_text("第一行\n第二行\n\n第四行", 40);
+        assert_eq!(
+            segs,
+            vec!["第一行", "第二行", "", "第四行"],
+            "换行没被切成独立段"
+        );
+        // \r\n 和裸 \r 也算换行
+        assert_eq!(wrap_text("a\r\nb", 40), vec!["a", "b"]);
+        assert_eq!(wrap_text("a\rb", 40), vec!["a", "b"]);
+    }
+
+    /// 端到端:真的画一帧,确认多行汇报在屏幕上占了多行。
+    #[test]
+    fn multiline_report_occupies_multiple_screen_rows() {
+        const W: u16 = 80;
+        const H: u16 = 24;
+        let mut m = crate::app::test_support::tiny_model();
+        m.issues[0].timeline.push(crate::model::ChatMsg {
+            ts: "2026-07-30T10:00:00".into(),
+            author: "DEV".into(),
+            text: "改了三个文件:\n- src/a.rs\n- src/b.rs\n- src/c.rs".into(),
+            is_system: false,
+        });
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+        term.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..H)
+            .map(|y| (0..W).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+
+        // 三个文件名必须各占一行,不能挤在同一行
+        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
+        let (ra, rb, rc) = (
+            row_of("src/a.rs").expect("a 没画出来"),
+            row_of("src/b.rs").expect("b 没画出来"),
+            row_of("src/c.rs").expect("c 没画出来"),
+        );
+        assert!(
+            ra < rb && rb < rc,
+            "三行挤在一起了:a在{ra}行 b在{rb}行 c在{rc}行\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// raw 视图里「思考 / 工具调用 / 回复正文」之间必须空行分块。
+    ///
+    /// 全紧贴在一起时扫读分不出边界 —— 一屏几十行里哪几行是思考、哪几行是
+    /// 工具调用、agent 最后说了什么,全糊成一片。
+    ///
+    /// 但**工具结果要紧挨着它的调用**(📋/❌ 跟在 🔧 后面),中间插空行反而
+    /// 把这一对拆散了。
+    #[test]
+    fn raw_view_separates_semantic_blocks() {
+        const W: u16 = 70;
+        const H: u16 = 26;
+        let mut m = crate::app::test_support::tiny_model();
+        m.members.push(crate::app::test_support::tiny_member("DEV"));
+        for l in [
+            "⟨init⟩ model=x tools=3",
+            "💭 thinking-one auth.py",
+            "💭 thinking-two decide",
+            "🔧 Read(src/auth.py)",
+            "📋 res-read 42",
+            "🔧 Edit(src/auth.py)",
+            "📋 res-edit ok",
+            "final-reply done",
+        ] {
+            m.members[0].push_raw(l.into());
+        }
+        m.selection = crate::model::Selection::Member(0);
+
+        let mut t =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+        t.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
+        let b = t.backend().buffer().clone();
+        // 只取右区(左栏宽 20),按行取文本
+        let rows: Vec<String> = (0..H)
+            .map(|y| (21..W).map(|x| b[(x, y)].symbol()).collect::<String>())
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        let row_of = |needle: &str| {
+            rows.iter().position(|r| r.contains(needle)).unwrap_or_else(|| {
+                panic!("找不到 {needle}\n{}", rows.join("\n"))
+            })
+        };
+        let blank_between = |a: usize, b: usize| rows[a + 1..b].iter().any(|r| r.is_empty());
+
+        let (t1, t2) = (row_of("thinking-one"), row_of("thinking-two"));
+        let (r1, res1) = (row_of("Read("), row_of("res-read"));
+        let (e1, res2) = (row_of("Edit("), row_of("res-edit"));
+        let txt = row_of("final-reply");
+
+        // 连续两条思考之间不空行
+        assert!(!blank_between(t1, t2), "同类之间不该空行\n{}", rows.join("\n"));
+        // 思考 → 工具:空
+        assert!(blank_between(t2, r1), "思考和工具调用之间该空一行\n{}", rows.join("\n"));
+        // 工具调用和它的结果之间:不空(结果要挂在调用下面)
+        assert!(!blank_between(r1, res1), "工具结果被和它的调用拆开了\n{}", rows.join("\n"));
+        // 两次工具调用之间:空
+        assert!(blank_between(res1, e1), "两次工具调用之间该空一行\n{}", rows.join("\n"));
+        assert!(!blank_between(e1, res2), "工具结果被拆开了");
+        // 工具 → 正文:空
+        assert!(blank_between(res2, txt), "工具块和回复正文之间该空一行\n{}", rows.join("\n"));
+        // ⟨init⟩ 分隔线和它后面第一块之间也要空 —— 别的块都分开了,
+        // 只有分隔线贴着后面的内容会更突兀
+        let sep = row_of("⟨init⟩");
+        assert!(
+            blank_between(sep, t1),
+            "⟨init⟩ 分隔线后面该空一行\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// 折行宽度也得用 unicode-width。这是同一个错误启发式的第三份拷贝
+    /// (tab 热区、输入行光标那两处已经修过),`…`/`①` 被算成 2 列的话
+    /// 每行会比实际窄,气泡右边缘参差不齐。
+    #[test]
+    fn wrap_uses_real_width_not_heuristic() {
+        // 40 个 `…`:真实宽度 40 列,刚好一行装满
+        let dots: String = "…".repeat(40);
+        assert_eq!(wrap_text(&dots, 40).len(), 1, "按真实宽度该正好一行");
+        // CJK 确实是 2 列
+        assert_eq!(wrap_text(&"汉".repeat(20), 40).len(), 1, "20 个汉字刚好 40 列");
+        assert_eq!(wrap_text(&"汉".repeat(21), 40).len(), 2, "多一个就该折行");
+    }
 
     /// 输入行光标必须按**终端实际列宽**算,不能用「码点 > 0x1100 就算 2 列」的启发式。
     /// 那个启发式把 `…`/`①` 算成 2 列、把带变体选择符的 emoji 算成 4 列,
