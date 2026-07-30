@@ -446,30 +446,6 @@ fn draw_timeline(f: &mut Frame, area: Rect, m: &Model, info: &mut DrawInfo) {
 
 fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut DrawInfo) {
     let mem = &m.members[idx];
-    /// raw 流里一行属于哪一类。相邻两行**类别不同**时插一条空行,
-    /// 让「思考 / 工具调用 / 工具结果 / 回复正文」在视觉上分块 ——
-    /// 全挤在一起时扫读根本分不出边界。
-    ///
-    /// 工具结果(📋/❌)算和工具调用(🔧)同一块:结果本来就该紧挨着它的调用,
-    /// 中间插空行反而把这对拆散了。
-    #[derive(PartialEq, Clone, Copy)]
-    enum Blk { Think, Tool, Text, Err }
-    fn blk_of(l: &str) -> Blk {
-        if l.starts_with("💭") {
-            Blk::Think
-        } else if l.starts_with("🔧") || l.starts_with("📋") || l.starts_with("❌") {
-            Blk::Tool
-        } else if l.starts_with("⟨err⟩") {
-            Blk::Err
-        } else if l.starts_with("   ") {
-            // 多行工具结果的续行(stream 层用三空格对齐首行的图标)。
-            // 判成 Text 的话会在结果中间插空行、还按正文着色 —— 结果被撕开。
-            Blk::Tool
-        } else {
-            Blk::Text
-        }
-    }
-
     let mut lines: Vec<Line> = Vec::new();
     let mut seen_init = false;
     let mut prev: Option<Blk> = None;
@@ -491,7 +467,7 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut D
             prev = None;
             continue;
         }
-        let kind = blk_of(l);
+        let kind = if is_tool_cont(l, prev) { Blk::Tool } else { blk_of(l) };
         // 空一行的两种情况:
         //  1. 换块了(思考 → 工具、工具 → 正文…)
         //  2. 同是工具块但又起了一次**新调用** —— 一串 🔧 连着会糊成一片,
@@ -656,6 +632,36 @@ fn bottom_scroll(total: u16, height: u16, user_scroll: u16) -> u16 {
 /// 而 `lines.len()` 是未折行的条目数。只要有一条比区域宽,贴底偏移就会算少,
 /// 底部内容被顶出可视区且再也划不下去(现象是「界面卡住不更新」)。
 /// `Line::width()` 用的是 unicode-width,和 ratatui 内部折行的度量一致。
+/// raw 流里一行属于哪一类。相邻两行**类别不同**时插一条空行,
+/// 让「思考 / 工具调用 / 工具结果 / 回复正文」在视觉上分块 ——
+/// 全挤在一起时扫读根本分不出边界。
+///
+/// 工具结果(📋/❌)算和工具调用(🔧)同一块:结果本来就该紧挨着它的调用,
+/// 中间插空行反而把这对拆散了。
+#[derive(PartialEq, Clone, Copy)]
+enum Blk { Think, Tool, Text, Err }
+fn blk_of(l: &str) -> Blk {
+    if l.starts_with("💭") {
+        Blk::Think
+    } else if l.starts_with("🔧") || l.starts_with("📋") || l.starts_with("❌") {
+        Blk::Tool
+    } else if l.starts_with("⟨err⟩") {
+        Blk::Err
+    } else {
+        Blk::Text
+    }
+}
+
+/// 这一行是不是上一行工具结果的**续行**?
+///
+/// stream 层把多行结果的续行用三空格对齐首行图标。但光看「三空格开头」
+/// 会误伤 agent 回复里的缩进代码(`    return a + b` 也是三空格开头)——
+/// 那会被当成工具块,在代码中间插空行、还按结果的灰色渲染。
+/// 所以必须**同时**满足「上一行就是工具块」。
+fn is_tool_cont(l: &str, prev: Option<Blk>) -> bool {
+    prev == Some(Blk::Tool) && l.starts_with("   ")
+}
+
 fn wrapped_height(lines: &[Line], w: u16) -> u16 {
     let w = w.max(1) as usize;
     let total: usize = lines.iter().map(|l| word_wrap_rows(l, w)).sum();
@@ -957,6 +963,60 @@ mod tests {
             "翻遍 {} 个滚动位置仍看不到这些行:{missing:#?}",
             di.scroll_max + 1
         );
+    }
+
+    /// agent 回复里的**缩进代码**不能被当成工具结果的续行。
+    ///
+    /// 续行的标记是「三空格开头」,而 `    return a + b` 也满足 —— 光看前缀
+    /// 会把代码块判成工具块,于是在代码行之间插空行、还按结果的灰色渲染。
+    /// 真机实测过:让 agent 复述一个 python 文件,`def` 和 `return` 之间凭空
+    /// 多出一个空行。
+    #[test]
+    fn indented_code_in_reply_is_not_tool_continuation() {
+        const W: u16 = 60;
+        const H: u16 = 22;
+        let mut m = crate::app::test_support::tiny_model();
+        m.members.push(crate::app::test_support::tiny_member("DEV"));
+        for l in [
+            "⟨init⟩ model=x tools=1",
+            "文件内容如下:",
+            "```python",
+            "def add(a, b):",
+            "    return a + b",
+            "```",
+        ] {
+            m.members[0].push_raw(l.into());
+        }
+        m.selection = crate::model::Selection::Member(0);
+
+        let mut t =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+        t.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
+        let b = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..H)
+            .map(|y| (21..W).map(|x| b[(x, y)].symbol()).collect::<String>())
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        let row_of = |n: &str| {
+            rows.iter()
+                .position(|r| r.contains(n))
+                .unwrap_or_else(|| panic!("找不到 {n}\n{}", rows.join("\n")))
+        };
+        let (d, r) = (row_of("def add"), row_of("return a + b"));
+        assert_eq!(
+            r, d + 1,
+            "代码两行之间被插了空行(def 在 {d} 行,return 在 {r} 行)\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// 但工具结果的续行仍然要被认出来(别把上面那条修成一刀切)。
+    #[test]
+    fn tool_result_continuation_still_recognized() {
+        assert!(is_tool_cont("   第二行", Some(Blk::Tool)), "紧跟工具块的该认");
+        assert!(!is_tool_cont("   看似续行", Some(Blk::Text)), "跟在正文后的不算");
+        assert!(!is_tool_cont("   看似续行", None), "开头第一行不算");
+        assert!(!is_tool_cont("没有缩进", Some(Blk::Tool)), "没缩进的不算");
     }
 
     /// 多行工具结果在 raw 视图里必须逐行显示,且整块跟着它的 🔧 不被撕开。
