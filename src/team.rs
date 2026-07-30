@@ -107,7 +107,7 @@ pub fn load_team(dir: &Path) -> Result<Team> {
     entries.sort();
 
     if entries.is_empty() {
-        bail!("agents/ 里没有任何 .md 群友定义");
+        bail!("agents/ 里没有任何 .md 成员定义");
     }
 
     let mut members = Vec::new();
@@ -159,7 +159,7 @@ pub fn load_team(dir: &Path) -> Result<Team> {
         for j in (i + 1)..members.len() {
             if members[i].name.eq_ignore_ascii_case(&members[j].name) {
                 bail!(
-                    "重名群友: {} 与 {}(@ 匹配不区分 ASCII 大小写)",
+                    "重名成员: {} 与 {}(@ 匹配不区分 ASCII 大小写)",
                     members[i].name,
                     members[j].name
                 );
