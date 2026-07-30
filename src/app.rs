@@ -200,15 +200,15 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 return cmds;
             }
             KeyCode::Char('n') => {
-                // 直接建一个新议题,名字自动递增,并切过去
+                // 直接建一个新议题(占位名「议题」,序号看 tab 前缀),并切过去
                 let name = next_issue_name(&m.issues);
-                m.issues.push(Issue::new(name.clone()));
+                m.issues.push(Issue::new(name));
                 let next = m.issues[m.issues.len() - 1].id + 1;
                 m.current_issue = m.issues.len() - 1;
                 m.selection = Selection::Chat;
                 m.scroll = 0;
                 m.input.clear();
-                set_hint(m, format!("已建议题:{name}"), 5);
+                set_hint(m, format!("已建议题 {}", m.current_issue + 1), 5);
                 m.pending_delete = None;
                 // 立刻把水位线落盘:这个 id 已经发出去了,关掉它之后分支还会留着
                 return vec![Command::BumpIssueWatermark { next }];
@@ -662,15 +662,11 @@ fn now_ts() -> String {
 }
 
 /// 生成一个未占用的议题名:议题2、议题3…(默认议题算 1 号)。
-pub fn next_issue_name(issues: &[Issue]) -> String {
-    let existing: std::collections::HashSet<&str> = issues.iter().map(|i| i.name.as_str()).collect();
-    for n in 2.. {
-        let candidate = format!("议题{n}");
-        if !existing.contains(candidate.as_str()) {
-            return candidate;
-        }
-    }
-    unreachable!()
+/// 新议题的占位名。序号由顶栏 tab 的位置前缀(`N:名字`)承载,占位名不再自带
+/// 数字 —— 否则「2:议题2」会把序号显示两遍。空占位允许重名:还没落盘,发第一条
+/// 消息就会按内容自动改名(submit_input 里的 is_auto_name 判定 + derive_issue_name)。
+pub fn next_issue_name(_issues: &[Issue]) -> String {
+    "议题".to_string()
 }
 
 /// 设置状态提示,持续大约 `secs` 秒(1 tick ≈ 150ms)。
@@ -1556,29 +1552,29 @@ mod e2e {
         assert_eq!(m.issues.len(), 1);
         ctrl(&mut m, 'n');
         assert_eq!(m.issues.len(), 2);
-        assert_eq!(m.issues[1].name, "议题2");
+        assert_eq!(m.issues[1].name, "议题");
         assert_eq!(m.current_issue, 1);
         assert!(m.input.is_empty());
     }
 
     #[test]
-    fn ctrl_n_repeated_generates_unique_names() {
+    fn ctrl_n_repeated_placeholders_and_switches() {
         let mut m = min_model();
         ctrl(&mut m, 'n');
         ctrl(&mut m, 'n');
         ctrl(&mut m, 'n');
+        // 占位名不带数字、允许重名(序号看 tab 位置前缀);每次都切到新建的那个
         let names: Vec<&str> = m.issues.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, vec!["i", "议题2", "议题3", "议题4"]);
+        assert_eq!(names, vec!["i", "议题", "议题", "议题"]);
         assert_eq!(m.current_issue, 3);
     }
 
     #[test]
-    fn next_issue_name_skips_taken() {
+    fn next_issue_is_numberless_placeholder() {
         let mut m = min_model();
-        // 手动占用 议题2,再按 Ctrl+N 应给出 议题3
-        m.issues.push(Issue::new("议题2"));
+        // 序号由 tab 位置前缀承载,占位名不带数字;发第一条消息才会按内容改名
         ctrl(&mut m, 'n');
-        assert_eq!(m.issues.last().unwrap().name, "议题3");
+        assert_eq!(m.issues.last().unwrap().name, "议题");
     }
 
     #[test]
