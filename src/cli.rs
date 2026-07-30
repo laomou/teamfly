@@ -120,9 +120,20 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
             "git 没配 user.name / user.email,agent 在 worktree 里 commit 会失败".into(),
         );
     }
-    // .teamfly/ 里有 API key,必须确保它被 git 忽略
-    if crate::worktree::ensure_teamfly_ignored(&model.work_dir) {
-        warns.push(".teamfly/ 未被忽略,已自动加进 .gitignore(里面有议题历史和 MCP 配置)".into());
+    // .teamfly/ 下有议题历史和 mcp.json(可能带鉴权 header),必须被 git 忽略 ——
+    // 否则 fallback 模式下 agent 一句 `git add -A` 就把它们提交进历史
+    use crate::worktree::IgnoreState;
+    match crate::worktree::ensure_teamfly_ignored(&model.work_dir) {
+        IgnoreState::AlreadyIgnored => {}
+        IgnoreState::JustAdded => warns.push(
+            ".teamfly/ 未被忽略,已自动加进 .gitignore(里面有议题历史和 MCP 配置)".into(),
+        ),
+        // 写不进去是最危险的一种:保护没生效,而以前这里和「本来就忽略了」
+        // 返回同一个值,用户什么提示都收不到
+        IgnoreState::WriteFailed(e) => warns.push(format!(
+            "⚠ .teamfly/ 没被 git 忽略,而 .gitignore 写不进去({e})——\
+             agent 可能把议题历史和 MCP 配置提交进你的仓库,请手动加一条 .teamfly/"
+        )),
     }
 
     Ok((model, warns))

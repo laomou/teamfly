@@ -206,11 +206,16 @@ fn remove_issue(work_dir: &Path, teamfly_dir: &Path, issue_id: u64) -> bool {
         .arg(&wt_dir)
         .current_dir(work_dir)
         .output();
-    let _ = Command::new("git")
+    let branch_gone = Command::new("git")
         .args(["branch", "-D", &issue_branch(issue_id)])
         .current_dir(work_dir)
-        .output();
-    true
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    // 目录还在 = worktree remove 没成功。以前无条件 return true,
+    // 调用方(drop_if_untouched)据此在群聊里说「已回收」,而东西还在盘上;
+    // 更糟的是残壳会被下一轮 prepare 捡起来当 worktree 用。
+    !wt_dir.exists() && branch_gone
 }
 
 /// 统计残留的 worktree 数量（启动时提示用户）。
@@ -378,14 +383,29 @@ pub fn missing_git_identity(work_dir: &Path) -> bool {
     false
 }
 
-/// 确保 `.teamfly/` 被 git 忽略。返回是否新写入了规则。
+/// `.teamfly/` 的 gitignore 状态。
+///
+/// 以前是 `bool`,而 `false` 同时表示「本来就忽略了,不用管」和「我想写但
+/// 写不进去」。调用方只在 `true` 时告警,于是后者**没有任何提示** ——
+/// `.gitignore` 只读(团队规范锁的 / 只读挂载)时,保护静默失效。
+#[derive(Debug, PartialEq)]
+pub enum IgnoreState {
+    /// 本来就被忽略,什么都没做
+    AlreadyIgnored,
+    /// 刚刚追加了规则
+    JustAdded,
+    /// 需要追加但写不进去 —— 必须告警
+    WriteFailed(String),
+}
+
+/// 确保 `.teamfly/` 被 git 忽略。
 ///
 /// `.teamfly/` 下有议题历史和 `mcp.json`(可能带鉴权 header)。没 ignore 的话,
 /// 它会以未跟踪文件出现在 `git status` 里,agent 一句 `git add -A`
 /// 就把密钥提交进历史了(fallback 模式下 agent 就在主目录干活)。
-pub fn ensure_teamfly_ignored(work_dir: &Path) -> bool {
+pub fn ensure_teamfly_ignored(work_dir: &Path) -> IgnoreState {
     if !work_dir.join(".git").exists() {
-        return false;
+        return IgnoreState::AlreadyIgnored; // 非 git 库,无所谓
     }
     let ignored = Command::new("git")
         .args(["check-ignore", "-q", ".teamfly/"])
@@ -394,21 +414,24 @@ pub fn ensure_teamfly_ignored(work_dir: &Path) -> bool {
         .map(|s| s.success())
         .unwrap_or(false);
     if ignored {
-        return false;
+        return IgnoreState::AlreadyIgnored;
     }
     // 已有 .teamfly/ 规则(哪怕被否定规则覆盖)就不动 ——
     // 用户自己配了 !.teamfly/ 说明他有意要追踪它,不该替他改。
     let path = work_dir.join(".gitignore");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     if existing.lines().any(|l| l.trim() == ".teamfly/") {
-        return false;
+        return IgnoreState::AlreadyIgnored;
     }
     let mut content = existing;
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str("\n# teamfly 的本地状态(含 API key,不要提交)\n.teamfly/\n");
-    std::fs::write(&path, content).is_ok()
+    content.push_str("\n# teamfly 的本地状态(议题历史 / MCP 配置,不要提交)\n.teamfly/\n");
+    match std::fs::write(&path, content) {
+        Ok(()) => IgnoreState::JustAdded,
+        Err(e) => IgnoreState::WriteFailed(e.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +459,54 @@ mod tests {
     fn git_in(d: &Path, a: &[&str]) -> String {
         let o = Command::new("git").args(a).current_dir(d).output().unwrap();
         String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    /// `.gitignore` 写不进去时必须**明确报出来**。
+    ///
+    /// 以前返回 bool,而 `false` 同时表示「本来就忽略了」和「想写但写不进去」。
+    /// 调用方只在 true 时告警,于是只读 .gitignore(团队规范锁的 / 只读挂载)
+    /// 时保护静默失效 —— agent 一句 `git add -A` 就把议题历史和 MCP 配置
+    /// 提交进用户仓库。
+    #[test]
+    fn ignore_write_failure_is_reported() {
+        let root = repo("ign");
+        let gi = root.join(".gitignore");
+        std::fs::write(&gi, "target/\n").unwrap();
+        // 设成只读
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gi, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+
+        let st = ensure_teamfly_ignored(&root);
+        assert!(
+            matches!(st, IgnoreState::WriteFailed(_)),
+            "写不进去却没报告失败,拿到的是 {st:?}"
+        );
+        // 恢复权限好清理
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&gi, std::fs::Permissions::from_mode(0o644));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 已经忽略了就别重复追加(也不该报成「刚加的」)。
+    #[test]
+    fn already_ignored_is_distinguished_from_added() {
+        let root = repo("ign2");
+        assert_eq!(ensure_teamfly_ignored(&root), IgnoreState::JustAdded, "第一次该写入");
+        assert_eq!(
+            ensure_teamfly_ignored(&root),
+            IgnoreState::AlreadyIgnored,
+            "第二次不该重复写"
+        );
+        let n = std::fs::read_to_string(root.join(".gitignore")).unwrap()
+            .lines().filter(|l| l.trim() == ".teamfly/").count();
+        assert_eq!(n, 1, "规则被写了 {n} 次");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// git 命令跑不通时**绝不能**判成「没改动」—— 那会 `git branch -D`
