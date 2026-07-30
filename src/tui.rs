@@ -190,6 +190,25 @@ fn draw_tabs(f: &mut Frame, area: Rect, m: &Model) {
     }
     let working = m.working_count();
 
+    // 右端先给工作目录(短路径)划一块独立列区,tab 和它各占一段、绝不重叠。
+    // 以前两者都往同一个 inner 里画,中等宽度下右对齐的路径会盖掉 [+ 新议题]
+    // 的尾巴,渲染出 "[+ " / "新议题📂" 这种残缺碎片。
+    let path_line = Line::from(vec![Span::styled(
+        format!("📂 {} ", short_path(&m.work_dir)),
+        Style::default().fg(Color::DarkGray),
+    )]);
+    // 至少给 tab 留 MIN_TABS 列(保住当前议题名);连有意义的路径都塞不下就整块不画。
+    const MIN_TABS: u16 = 12;
+    let mut path_w = (path_line.width() as u16 + 1).min(inner.width.saturating_sub(MIN_TABS));
+    if path_w < 6 {
+        path_w = 0;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(path_w)])
+        .split(inner);
+    let (tabs_area, path_area) = (cols[0], cols[1]);
+
     // 议题过多时,以当前议题为中心,只画左右各 2 个;溢出用 «/» 提示
     let total = m.issues.len();
     let (start, end, prefix, suffix) = if total <= 6 {
@@ -198,7 +217,7 @@ fn draw_tabs(f: &mut Frame, area: Rect, m: &Model) {
         let cur = m.current_issue;
         let s = cur.saturating_sub(2);
         let e = (cur + 3).min(total);
-        (s, e, if s > 0 { "« " } else { "" }, if e < total { " »" } else { "" })
+        (s, e, if s > 0 { "« " } else { "" }, if e < total { " » " } else { "" })
     };
 
     let mut spans = Vec::new();
@@ -228,21 +247,21 @@ fn draw_tabs(f: &mut Frame, area: Rect, m: &Model) {
     if !suffix.is_empty() {
         spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
     }
-    spans.push(Span::styled("[+ 新议题]", Style::default().fg(Color::DarkGray)));
+    // [+ 新议题] 只有整块放得下才画 —— 被 tab 区右界截成 "[+ 新" 一样难看,
+    // 宁可整块不画(新建议题还有 ^N 兜底)。
+    let used: usize = spans.iter().map(|s| s.width()).sum();
+    let button = Span::styled("[+ 新议题]", Style::default().fg(Color::DarkGray));
+    if used as u16 + button.width() as u16 <= tabs_area.width {
+        spans.push(button);
+    }
 
-    // 左侧 tab
-    f.render_widget(Paragraph::new(Line::from(spans)), inner);
-
-    // 右端:工作目录(短路径),右对齐
-    let wd = short_path(&m.work_dir);
-    let right = Line::from(vec![Span::styled(
-        format!("📂 {wd} "),
-        Style::default().fg(Color::DarkGray),
-    )]);
-    f.render_widget(
-        Paragraph::new(right).alignment(ratatui::layout::Alignment::Right),
-        inner,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
+    if path_w > 0 {
+        f.render_widget(
+            Paragraph::new(path_line).alignment(ratatui::layout::Alignment::Right),
+            path_area,
+        );
+    }
 }
 
 /// 缩短路径:只留最后两段,前面用 ~ 或 …。
@@ -1101,6 +1120,34 @@ mod tests {
             let m = crate::app::test_support::tiny_model();
             term.draw(|f| draw(f, &m, &mut DrawInfo::default()))
                 .unwrap_or_else(|e| panic!("{w}x{h} 渲染失败: {e}"));
+        }
+    }
+
+    /// 回归:中等宽度下,右对齐的工作目录路径曾盖掉 [+ 新议题] 按钮尾部,
+    /// 渲染出 "[+ " / "新议题📂" 这种残缺碎片(tab 行和路径画进了同一个 rect)。
+    /// 现在两者各占一段列区:按钮要么整块画、要么整块不画,路径始终完整。
+    #[test]
+    fn tab_button_and_path_never_collide() {
+        let mut m = crate::app::test_support::tiny_model();
+        m.work_dir = std::path::PathBuf::from("/home/u/proj/teamfly");
+        m.issues[0].name = "默认议题".into();
+        for w in [56u16, 58, 60, 62, 66, 70, 80, 120] {
+            // 高度给足 6:top(3) 满足后 body 拿剩下 3,tab 栏才真的画得出来
+            // (只给 3 行时约束求解器会把固定高的顶栏压成 0,body 顶上来)。
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 6)).unwrap();
+            term.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
+            let buf = term.backend().buffer().clone();
+            // tab 内容在顶框内那一行(y=1);整行拼起来后去掉空白便于比对
+            // (TestBackend 把双宽字的续格存成空,去空白对 "" / " " 两种都稳)
+            let row: String = (0..w).map(|x| buf[(x, 1)].symbol()).collect();
+            let flat: String = row.chars().filter(|c| !c.is_whitespace()).collect();
+            // 按钮要么完整,要么根本没画 —— 绝不能是被截断/覆盖的碎片
+            if flat.contains("[+") {
+                assert!(flat.contains("[+新议题]"), "宽 {w}:按钮成了残缺碎片:{row:?}");
+            }
+            // 路径图标始终画得出(和 tab 各占一段,不互相吃掉)
+            assert!(flat.contains("📂"), "宽 {w}:路径被挤没了:{row:?}");
         }
     }
 
