@@ -372,8 +372,13 @@ fn draw_timeline(f: &mut Frame, area: Rect, m: &Model, info: &mut DrawInfo) {
         ]));
         // 正文:缩进两格,像气泡
         for seg in wrap_text(&msg.text, width.saturating_sub(2)) {
+            // 空段(段落之间的空行)**不能**加缩进 —— 纯空格的行会被 ratatui 的
+            // WordWrapper 折成 2 行,而 wrapped_height 算它 1 行。每个空行少算
+            // 一行,累积下来贴底偏移不够,底部内容被顶出可视区,而且 scroll_max
+            // 同样算少,PageUp 也翻不到(现象是「多行汇报显示不全」)。
+            let body = if seg.is_empty() { String::new() } else { format!("  {seg}") };
             lines.push(Line::styled(
-                format!("  {seg}"),
+                body,
                 if msg.is_system {
                     Style::default().fg(Color::Red)
                 } else {
@@ -437,6 +442,10 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut D
             Blk::Tool
         } else if l.starts_with("⟨err⟩") {
             Blk::Err
+        } else if l.starts_with("   ") {
+            // 多行工具结果的续行(stream 层用三空格对齐首行的图标)。
+            // 判成 Text 的话会在结果中间插空行、还按正文着色 —— 结果被撕开。
+            Blk::Tool
         } else {
             Blk::Text
         }
@@ -480,8 +489,10 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut D
             Blk::Tool if l.starts_with("🔧") => (Style::default().fg(Color::Cyan), "  "),
             // 工具结果:挂在工具调用下面,再缩一层 + 灰色弱化
             Blk::Tool if l.starts_with("📋") => (Style::default().fg(Color::DarkGray), "    "),
-            // 工具执行失败
-            Blk::Tool => (Style::default().fg(Color::Red), "    "),
+            // 失败:整块红色(首行 ❌,续行三空格对齐)
+            Blk::Tool if l.starts_with("❌") => (Style::default().fg(Color::Red), "    "),
+            // 多行结果的续行:和它的首行同缩进同配色
+            Blk::Tool => (Style::default().fg(Color::DarkGray), "    "),
             // 思考链:黄色 + dim,和回复正文拉开
             Blk::Think => (
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
@@ -489,7 +500,10 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut D
             ),
             Blk::Text => (Style::default().fg(Color::Gray), "  "),
         };
-        lines.push(Line::styled(format!("{prefix}{l}"), style));
+        // 空行不加缩进:纯空格的行会被 WordWrapper 折成 2 行(见 word_wrap_rows),
+        // 白占一行而且看不出来
+        let body = if l.is_empty() { String::new() } else { format!("{prefix}{l}") };
+        lines.push(Line::styled(body, style));
     }
     // 正在思考/干活:加一行 spinner
     let frame = SPINNER[(m.tick as usize) % SPINNER.len()];
@@ -638,6 +652,16 @@ fn word_wrap_rows(line: &Line, w: usize) -> usize {
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     if text.is_empty() {
         return 1; // 空行也占一行
+    }
+    // **非空但全是空白**的行,WordWrapper 会吐出两行(空白那行 + 一个空行),
+    // 只要那段空白放得下。实测:" "/"  "/"\t" 在宽 70 下都是 2 行,
+    // 而 "     " 在宽 4(放不下)下是 1 行。
+    //
+    // 这个 quirk 必须照搬 —— 少算一行的话贴底偏移和 scroll_max 都偏小,
+    // 底部内容被顶出可视区且 PageUp 也翻不到。调用方应尽量别产出这种行
+    // (时间线的空段就不加缩进前缀),但 wrapped_height 得对任何输入都准。
+    if text.chars().all(char::is_whitespace) {
+        return if str_cols(&text) <= w { 2 } else { 1 };
     }
     let mut rows = 1usize;
     let mut used = 0usize; // 当前行已占列数
@@ -788,6 +812,186 @@ mod tests {
             ra < rb && rb < rc,
             "三行挤在一起了:a在{ra}行 b在{rb}行 c在{rc}行\n{}",
             rows.join("\n")
+        );
+    }
+
+    /// `wrapped_height` 必须和真实渲染逐行一致 —— **包括只含空格的行**。
+    ///
+    /// 纯空格的行会被 ratatui 的 WordWrapper 折成 2 行,而 wrapped_height
+    /// 算它 1 行。汇报里每个段落间的空行都会踩到:每个少算一行,累积下来
+    /// 贴底偏移不够、scroll_max 也偏小,底部内容被顶出屏幕且 PageUp 翻不到。
+    #[test]
+    fn height_matches_for_whitespace_only_lines() {
+        for (txt, w) in [("", 70u16), ("  ", 70), (" ", 70), ("   ", 10), ("\t", 20)] {
+            let got = wrapped_height(&[Line::raw(txt)], w);
+            let real = real_rows(txt, w) as u16;
+            assert_eq!(got, real, "{txt:?} 宽{w}: 算 {got} 行,实际渲染 {real} 行");
+        }
+    }
+
+    /// 时间线里的空行不能带缩进前缀 —— 否则就成了上面那种「纯空格行」。
+    #[test]
+    fn timeline_blank_lines_carry_no_indent() {
+        const W: u16 = 70;
+        const H: u16 = 24;
+        let mut m = crate::app::test_support::tiny_model();
+        m.members.push(crate::app::test_support::tiny_member("DEV"));
+        m.issues[0].timeline.push(crate::model::ChatMsg {
+            ts: "2026-07-30T10:00:00".into(),
+            author: "DEV".into(),
+            text: "第一段\n\n第二段\n\n第三段".into(),
+            is_system: false,
+        });
+        let mut di = DrawInfo::default();
+        let mut t =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+        t.draw(|f| draw(f, &m, &mut di)).unwrap();
+        let b = t.backend().buffer().clone();
+        // 右区里「看起来空」的行必须真的一个字符都没有(不能是两个空格)
+        for y in 0..H {
+            let raw: String = (21..W).map(|x| b[(x, y)].symbol()).collect();
+            if raw.trim().is_empty() {
+                assert!(
+                    !raw.starts_with("  ") || raw.chars().all(|c| c == ' '),
+                    "第 {y} 行是带缩进的空行"
+                );
+            }
+        }
+        // 真正的断言:三段都在,且 wrapped_height 和真实渲染一致
+        let all: String = (0..H)
+            .map(|y| (21..W).map(|x| b[(x, y)].symbol()).collect::<String>())
+            .collect();
+        let flat: String = all.chars().filter(|c| !c.is_whitespace()).collect();
+        for seg in ["第一段", "第二段", "第三段"] {
+            assert!(flat.contains(seg), "{seg} 没显示出来");
+        }
+    }
+
+    /// 用仓库里真实的 jsonl 走**完整加载路径**,确认多行汇报每一行都能看到。
+    ///
+    /// 这条盯的是 sample/.teamfly 里那条 8 行的 DEV 汇报 —— 换行被吃掉时
+    /// 它会挤成一坨(见 #24)。前面那些测试用的是手写文本,这条用真数据。
+    ///
+    /// 注意两个读屏陷阱(都踩过):
+    /// 1. 只能读**右区**(x>=21)。连左栏一起读的话,一句话折行后
+    ///    左栏文字会被插进这句中间,`contains` 直接找不到。
+    /// 2. 每个滚动位置要用**全新** TestBackend。同一个 backend 连续画多帧时,
+    ///    宽字符(CJK)占两格,上一帧的第二格残留会和新帧交错成乱码。
+    #[test]
+    fn real_multiline_report_is_fully_reachable() {
+        const W: u16 = 90;
+        const H: u16 = 30;
+        let tf = std::path::Path::new("sample/.teamfly");
+        if !tf.join("issues").is_dir() {
+            return; // 没有样例数据就跳过(别人 clone 下来可能没带)
+        }
+        let (issues, _) = crate::issue::load_all_issues(tf).unwrap();
+        let Some(idx) = issues.iter().position(|i| {
+            i.timeline.iter().any(|m| m.author == "DEV" && m.text.lines().count() > 3)
+        }) else {
+            return; // 样例里没有多行 DEV 汇报,这条就没东西可测
+        };
+        let want: Vec<String> = issues[idx]
+            .timeline
+            .iter()
+            .filter(|m| m.author == "DEV")
+            .flat_map(|m| m.text.lines())
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(want.len() >= 4, "样例数据该有几行才有意义");
+
+        let mut m = crate::app::test_support::tiny_model();
+        m.members.push(crate::app::test_support::tiny_member("DEV"));
+        m.issues = issues;
+        m.current_issue = idx;
+
+        // 先画一帧拿 scroll_max
+        let mut di = DrawInfo::default();
+        let mut t0 =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+        t0.draw(|f| draw(f, &m, &mut di)).unwrap();
+
+        // 翻遍每个滚动位置,收集右区出现过的文本
+        let mut seen = String::new();
+        for step in 0..=di.scroll_max {
+            m.scroll = step;
+            let mut t =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+            t.draw(|f| draw(f, &m, &mut di)).unwrap();
+            let b = t.backend().buffer().clone();
+            for y in 0..H {
+                seen.extend((21..W).map(|x| b[(x, y)].symbol()));
+            }
+        }
+        // CJK 在 TestBackend 里逐字符占格,比对时去掉所有空白
+        let flat: String = seen.chars().filter(|c| !c.is_whitespace()).collect();
+        let missing: Vec<&String> = want
+            .iter()
+            .filter(|l| {
+                let key: String = l.chars().filter(|c| !c.is_whitespace()).collect();
+                !flat.contains(&key)
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "翻遍 {} 个滚动位置仍看不到这些行:{missing:#?}",
+            di.scroll_max + 1
+        );
+    }
+
+    /// 多行工具结果在 raw 视图里必须逐行显示,且整块跟着它的 🔧 不被撕开。
+    #[test]
+    fn raw_view_shows_multiline_tool_result() {
+        const W: u16 = 60;
+        const H: u16 = 20;
+        let mut m = crate::app::test_support::tiny_model();
+        m.members.push(crate::app::test_support::tiny_member("DEV"));
+        for l in [
+            "⟨init⟩ model=x tools=1",
+            "🔧 Read(Cargo.toml)",
+            "📋 R1 first",
+            "   R2 second",
+            "   R3 third",
+            "final-reply ok",
+        ] {
+            m.members[0].push_raw(l.into());
+        }
+        m.selection = crate::model::Selection::Member(0);
+
+        let mut t =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+        t.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
+        let b = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..H)
+            .map(|y| (21..W).map(|x| b[(x, y)].symbol()).collect::<String>())
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        let row_of = |n: &str| {
+            rows.iter()
+                .position(|r| r.contains(n))
+                .unwrap_or_else(|| panic!("找不到 {n}\n{}", rows.join("\n")))
+        };
+        let (r1, r2, r3) = (row_of("R1"), row_of("R2"), row_of("R3"));
+        // 三行结果各占一行,顺序不乱
+        assert!(r1 < r2 && r2 < r3, "结果三行没有分行:{r1} {r2} {r3}");
+        // 中间不能插空行 —— 那会把一块结果撕成几块
+        assert!(
+            rows[r1 + 1..r3].iter().all(|r| !r.is_empty()),
+            "多行结果中间被插了空行\n{}",
+            rows.join("\n")
+        );
+        // 结果和它的 🔧 之间也不空
+        let tool = row_of("Read(");
+        assert!(
+            rows[tool + 1..r1].iter().all(|r| !r.is_empty()),
+            "结果和它的工具调用被拆开了"
+        );
+        // 但结果块和后面的正文之间要空
+        let txt = row_of("final-reply");
+        assert!(
+            rows[r3 + 1..txt].iter().any(|r| r.is_empty()),
+            "结果块和正文之间该空一行"
         );
     }
 
