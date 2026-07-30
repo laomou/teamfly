@@ -83,8 +83,8 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Command> {
             }
             vec![]
         }
-        Msg::AgentDone { name, issue, gen, worktree, full_output, ok, err } => {
-            handle_agent_done(m, name, issue, gen, worktree, full_output, ok, err)
+        Msg::AgentDone { name, issue, gen, cancel_gen, worktree, full_output, ok, err } => {
+            handle_agent_done(m, name, issue, gen, cancel_gen, worktree, full_output, ok, err)
         }
         Msg::IoError { detail } => {
             // 落盘失败必须让用户看见 —— 否则他会以为历史都保住了
@@ -155,6 +155,10 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                     m.cancel.cancel();
                     // 换一个新 token,否则之后新起的 agent 一生下来就是取消态
                     m.cancel = tokio_util::sync::CancellationToken::new();
+                    // 纪元 +1:此刻已经交卷、正躺在 channel 里没被消费的 AgentDone
+                    // 会带着旧纪元回来。清 inbox 堵不住它 —— 它走的是成功路径,
+                    // 自己解析 @ 然后派活,拿的是**新** token。
+                    m.cancel_gen = m.cancel_gen.wrapping_add(1);
                     // 排队的活也得清:不清的话被取消的成员一交卷就走 drain_inbox,
                     // 拿着**新** token 立刻起下一个进程,用户按不停也按不出去。
                     let queued: usize = m.members.iter().map(|x| x.inbox.len()).sum();
@@ -363,6 +367,7 @@ fn handle_agent_done(
     name: String,
     issue_id: u64,
     gen: u64,
+    cancel_gen: u64,
     worktree: Option<(std::path::PathBuf, String)>,
     full_output: String,
     ok: bool,
@@ -384,6 +389,16 @@ fn handle_agent_done(
         // 后续派活全部卡在队列里出不来
         m.members[i].working_issue = None;
     }
+
+    // 这一轮在它交卷之后被 ^C(或关议题)掐过。
+    //
+    // 状态得清(上面已经做了),但**绝不能再派活** —— 它是走成功路径进来的,
+    // 会解析自己汇报里的 @ 然后 dispatch,拿着取消后换的**新** token 起进程。
+    // 用户看到「已取消 N 个在跑的 agent」,紧接着又有 agent 开始改仓库,
+    // 而且 working_count 重新 >0,连提示里那句「再按 ^C 退出」也一起失效。
+    //
+    // 汇报本身还是要入群聊的:活已经干完了,内容不该凭空消失。
+    let cancelled_meanwhile = cancel_gen != m.cancel_gen;
 
     // 议题已被关掉:汇报无处可去。只给一条临时提示,绝不写进别的议题。
     let Some(idx) = m.issue_index(issue_id) else {
@@ -447,6 +462,26 @@ fn handle_agent_done(
     let msg = ChatMsg { ts: now_ts(), author: name.clone(), text: chat_text, is_system: false };
     m.issues[idx].timeline.push(msg.clone());
     cmds.push(Command::PersistChat { issue_id, issue: issue_name.clone(), msg });
+
+    // 交卷之后被取消过:汇报已经入群聊(活确实干完了,内容不该消失),
+    // 但接力到此为止 —— 用户按 ^C 的意思就是「都停下」。
+    if cancelled_meanwhile {
+        if !mentions.is_empty() {
+            let who: Vec<String> = mentions.iter().map(|t| format!("@{t}")).collect();
+            let smsg = ChatMsg {
+                ts: now_ts(),
+                author: "系统".into(),
+                text: format!(
+                    "{name} 交卷时你已取消,{} 没有接力(要继续就自己 @ 一次)",
+                    who.join(" ")
+                ),
+                is_system: true,
+            };
+            m.issues[idx].timeline.push(smsg.clone());
+            cmds.push(Command::PersistChat { issue_id, issue: issue_name, msg: smsg });
+        }
+        return cmds;
+    }
 
     // 防乒乓:连锁深度 +1
     let new_depth = depth_when_started + 1;
@@ -535,6 +570,7 @@ fn dispatch(
         name: mem.name.clone(),
         issue: issue_id,
         gen: m.team_gen,
+        cancel_gen: m.cancel_gen,
         backend: mem.backend,
         model: mem.model.clone(),
         system_prompt: mem.system_prompt.clone(),
@@ -865,6 +901,8 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
         m.cancel.cancel();
         // 换新 token,否则之后新起的 agent 一生下来就是取消态
         m.cancel = tokio_util::sync::CancellationToken::new();
+        // 同 ^C:堵住已在 channel 里的交卷结果,别让它再派活
+        m.cancel_gen = m.cancel_gen.wrapping_add(1);
         // 别的议题排队的活不受影响,但**这个**议题的要清掉:议题都没了,
         // 放出来只会去建一个新 worktree 干一件用户已经放弃的事。
         for mem in &mut m.members {
@@ -947,6 +985,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             name,
             issue,
             gen,
+            cancel_gen,
             backend,
             // 别名:不能叫 model,会遮蔽 execute() 的 model: &Model 参数
             model: mdl,
@@ -970,6 +1009,7 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
                 name,
                 issue,
                 gen,
+                cancel_gen,
                 backend,
                 model: mdl,
                 system_prompt,
@@ -1010,11 +1050,12 @@ pub async fn run(model: Model) -> Result<()> {
 
     let (tx, rx) = unbounded_channel::<Msg>();
     let rt = Runtime::new(tx.clone());
-    // model 会被移进 run_loop,先把需要的东西取出来
-    let cancel = model.cancel.clone();
+    // model 会被移进 run_loop,先把不受 ^C 影响的东西取出来
     let lock_path = model.teamfly_dir.join("teamfly.lock");
 
-    let res = run_loop(&mut terminal, model, rt, tx, rx).await;
+    // cancel token 由 run_loop 交回来 —— 每次 ^C / 热切都会换一个新的,
+    // 提前克隆的那份早已没人持有,拿它 cancel 是空操作。
+    let (res, cancel) = run_loop(&mut terminal, model, rt, tx, rx).await;
 
     // 退出前掐掉所有在跑的 agent。不然它们会变成孤儿,继续用 bypass 权限改工作区,
     // 而用户已经看不到任何界面了。
@@ -1035,13 +1076,21 @@ pub async fn run(model: Model) -> Result<()> {
     res
 }
 
+/// 返回 `(结果, 退出时刻的 cancel token)`。
+///
+/// token 必须**从这里交回去** —— 不能在进循环前克隆一份:每次 ^C 和每次
+/// `/team` 热切都会把 `model.cancel` 换成新的,外面那份快照早就没人持有了,
+/// 拿它 cancel 等于什么都没做。而 `terminal.draw()?` 那条出错路径完全可能
+/// 带着在跑的 agent 冲出循环 —— 界面消失,bypassPermissions 进程还在改仓库。
+type LoopExit = (Result<()>, tokio_util::sync::CancellationToken);
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut model: Model,
     rt: Runtime,
     tx: UnboundedSender<Msg>,
     mut rx: UnboundedReceiver<Msg>,
-) -> Result<()> {
+) -> LoopExit {
     // 键盘/鼠标事件流
     let mut events = EventStream::new();
     // spinner tick
@@ -1058,7 +1107,9 @@ async fn run_loop(
 
     // 首帧
     let mut draw_info = tui::DrawInfo::default();
-    terminal.draw(|f| tui::draw(f, &model, &mut draw_info))?;
+    if let Err(e) = terminal.draw(|f| tui::draw(f, &model, &mut draw_info)) {
+        return (Err(e.into()), model.cancel.clone());
+    }
 
     loop {
         tokio::select! {
@@ -1081,10 +1132,13 @@ async fn run_loop(
         if model.should_quit {
             break;
         }
-        terminal.draw(|f| tui::draw(f, &model, &mut draw_info))?;
+        if let Err(e) = terminal.draw(|f| tui::draw(f, &model, &mut draw_info)) {
+            // 画不出来了也得把**当前**的 token 交出去,让调用方掐掉在跑的 agent
+            return (Err(e.into()), model.cancel.clone());
+        }
         model.scroll = model.scroll.min(draw_info.scroll_max);
     }
-    Ok(())
+    (Ok(()), model.cancel.clone())
 }
 
 /// 把 crossterm 事件翻译成 Msg。
@@ -1178,6 +1232,7 @@ pub mod test_support {
             show_help: false,
             cancel: tokio_util::sync::CancellationToken::new(),
             team_gen: 0,
+            cancel_gen: 0,
         }
     }
 }
@@ -1210,12 +1265,84 @@ mod e2e {
                 name: name.into(),
                 issue,
                 gen: 0,
+                cancel_gen: 0,
                 worktree: None,
                 full_output: output.into(),
                 ok: true,
                 err: None,
             },
         )
+    }
+
+    /// ^C 之后,**已经交卷但还躺在 channel 里**的成功结果不能再派活。
+    ///
+    /// 清 inbox 堵不住它:它走的是成功路径,自己解析汇报里的 @ 然后 dispatch,
+    /// 拿的是取消后换的**新** token。用户看到「已取消 N 个在跑的 agent」,
+    /// 紧接着又有 agent 开始改仓库,而且 working_count 重新 >0,
+    /// 连提示里那句「再按 ^C 退出」也一起失效。
+    #[test]
+    fn inflight_done_after_cancel_does_not_dispatch() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        let (a, b) = (m.members[0].name.clone(), m.members[1].name.clone());
+        m.members[0].state = AgentState::Working;
+        m.members[0].working_issue = Some(id);
+        let gen_at_dispatch = m.cancel_gen;
+
+        // 用户按 ^C
+        ctrl(&mut m, 'c');
+        assert!(
+            m.cancel_gen != gen_at_dispatch,
+            "^C 必须递增取消纪元,否则堵不住已在管道里的交卷"
+        );
+
+        // 此刻那条「成功交卷 + 带 @」的 AgentDone 才被消费
+        let tg = m.team_gen;
+        let cmds = update(&mut m, Msg::AgentDone {
+            name: a.clone(), issue: id, gen: tg,
+            cancel_gen: gen_at_dispatch,   // 派活时的旧纪元
+            worktree: None,
+            full_output: format!("干完了 @{b} 接着来"),
+            ok: true, err: None,
+        });
+
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Command::SpawnAgent { .. })),
+            "^C 之后不该再起新 agent"
+        );
+        assert_eq!(m.members[0].state, AgentState::Idle, "状态还是得清");
+        assert_eq!(m.working_count(), 0, "否则「再按 ^C 退出」会失效");
+        // 汇报本身要留下 —— 活确实干完了
+        assert!(
+            m.issues[0].timeline.iter().any(|x| x.author == a),
+            "汇报不该凭空消失"
+        );
+        // 而且要告诉用户接力断在哪
+        assert!(
+            m.issues[0].timeline.iter().any(|x| x.is_system && x.text.contains(&b)),
+            "该说明 @{b} 没有接力"
+        );
+    }
+
+    /// 没按过 ^C 时,正常交卷必须照常接力(别把上面那道闸修成常闭)。
+    #[test]
+    fn normal_done_still_dispatches() {
+        let mut m = min_model();
+        let id = m.issues[0].id;
+        let (a, b) = (m.members[0].name.clone(), m.members[1].name.clone());
+        m.members[0].state = AgentState::Working;
+        m.members[0].working_issue = Some(id);
+
+        let (tg, cg) = (m.team_gen, m.cancel_gen);
+        let cmds = update(&mut m, Msg::AgentDone {
+            name: a, issue: id, gen: tg, cancel_gen: cg,
+            worktree: None, full_output: format!("干完了 @{b} 接着来"),
+            ok: true, err: None,
+        });
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SpawnAgent { .. })),
+            "正常情况下该接力"
+        );
     }
 
     /// 关掉「还有 agent 在跑」的议题时,必须先警告、确认后必须掐掉它。
@@ -1324,6 +1451,7 @@ mod e2e {
             show_help: false,
             cancel: tokio_util::sync::CancellationToken::new(),
             team_gen: 0,
+            cancel_gen: 0,
         }
     }
 
@@ -1572,6 +1700,7 @@ mod e2e {
                 name: "老K".into(),
                 issue: id,
                 gen: 0,
+                cancel_gen: 0,
                 worktree: None,
                 full_output: "旧团队的汇报 @阿码 接手".into(),
                 ok: true,
@@ -1624,7 +1753,7 @@ mod e2e {
 
         // 交卷后确实不会再起进程
         let cmds = update(&mut m, Msg::AgentDone {
-            name: "老K".into(), issue: id, gen: 0, worktree: None,
+            name: "老K".into(), issue: id, gen: 0, cancel_gen: 0, worktree: None,
             full_output: String::new(), ok: false,
             err: Some(crate::model::CANCELLED.into()),
         });
@@ -1644,7 +1773,7 @@ mod e2e {
 
         // 成员空闲后交卷触发 drain
         let cmds = update(&mut m, Msg::AgentDone {
-            name: "老K".into(), issue: b, gen: 0, worktree: None,
+            name: "老K".into(), issue: b, gen: 0, cancel_gen: 0, worktree: None,
             full_output: "干完了".into(), ok: true, err: None,
         });
 

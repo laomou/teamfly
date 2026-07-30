@@ -201,6 +201,14 @@ pub struct Model {
     /// 代号过期的结果一律丢弃 —— 否则旧团队的汇报会按**新**花名册解析 @,
     /// 把新团队里同名的人莫名唤醒。
     pub team_gen: u64,
+    /// 取消纪元。每次 ^C(以及关掉带在跑 agent 的议题)+1。
+    ///
+    /// 光靠 `cancel` token 堵不住这个洞:按 ^C 那一刻,某个 agent 可能**刚好**
+    /// 已经成功交卷、`AgentDone` 正躺在 channel 里没被消费。它会走完整的成功
+    /// 路径解析 @ 然后派活,拿着**新** token 起进程 —— 用户看到「已取消 N 个」
+    /// 紧接着又有 agent 开始改仓库,而且 working_count 重新 >0,连「再按 ^C
+    /// 退出」也失效了。派活时记下纪元,回来时不符就只清状态、不派活。
+    pub cancel_gen: u64,
 }
 
 impl Model {
@@ -243,6 +251,9 @@ pub enum Msg {
         issue: u64,
         /// 派活时的团队代号。与当前 team_gen 不符则整条结果作废
         gen: u64,
+        /// 派活时的取消纪元。与当前 cancel_gen 不符说明这一轮已被 ^C 掐过,
+        /// 结果不再用来派活(状态还是要清)。
+        cancel_gen: u64,
         /// 这一轮用的 worktree (目录, 分支)。fallback 到主目录时为 None。
         /// 由派活时决定并原样回投 —— 不能事后去磁盘上猜,那样会拿到别轮的。
         worktree: Option<(std::path::PathBuf, String)>,
@@ -268,6 +279,8 @@ pub enum Command {
         issue: u64,
         /// 派活时的团队代号,原样回投
         gen: u64,
+        /// 派活时的取消纪元,原样回投
+        cancel_gen: u64,
         backend: BackendKind,
         model: Option<String>,
         system_prompt: String,

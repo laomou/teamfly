@@ -95,6 +95,7 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
         show_help: false,
         cancel: tokio_util::sync::CancellationToken::new(),
         team_gen: 0,
+        cancel_gen: 0,
     };
 
     // 多实例检测:写一个 pid 文件,若已有别的活进程在用,警告(不阻止)
