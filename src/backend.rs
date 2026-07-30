@@ -15,6 +15,8 @@ pub struct RunSpec {
     pub issue: u64,
     /// 派活时的团队代号,原样回投给 AgentDone
     pub gen: u64,
+    /// 派活时的取消纪元,原样回投给 AgentDone
+    pub cancel_gen: u64,
     pub backend: BackendKind,
     /// frontmatter 指定的模型;None = 不传 --model,由 CLI 自己决定。
     pub model: Option<String>,
@@ -58,6 +60,7 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
                 name,
                 issue,
                 gen,
+                cancel_gen: spec.cancel_gen,
                 worktree: worktree.clone(),
                 full_output: String::new(),
                 ok: false,
@@ -104,6 +107,7 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
                     name,
                     issue,
                     gen,
+                    cancel_gen: spec.cancel_gen,
                     worktree: worktree.clone(),
                     full_output: full,
                     ok: true,
@@ -119,6 +123,7 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
                         name,
                         issue,
                         gen,
+                        cancel_gen: spec.cancel_gen,
                         worktree: worktree.clone(),
                         full_output: String::new(),
                         ok: false,
@@ -158,6 +163,7 @@ pub async fn run(spec: RunSpec, cancel: CancellationToken, tx: UnboundedSender<M
         name,
         issue,
         gen,
+        cancel_gen: spec.cancel_gen,
         worktree,
         full_output: String::new(),
         ok: false,
@@ -267,6 +273,20 @@ fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
     }
 }
 
+/// 杀掉 agent **及它起的所有孙子进程**。
+///
+/// `child.kill()` 只发 SIGKILL 给直接子进程;agent 用 Bash 起的
+/// cargo build / npm test 会活下来继续改工作区。因为 spawn 时给了
+/// `process_group(0)`,这里可以按进程组一次杀干净。
+async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // 负号 = 整个进程组。失败(组已空/已回收)就无所谓,下面还有兜底。
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+    }
+    let _ = child.kill().await;
+}
+
 struct ProcSpec {
     bin: String,
     args: Vec<String>,
@@ -290,6 +310,14 @@ async fn run_process(
         // 兜底:任何提前 return / panic / 进程退出都别把子进程留成孤儿。
         // 这些 agent 跑的是 bypassPermissions,留下来会继续改工作区。
         .kill_on_drop(true);
+    // 让 agent 自成一个进程组,这样取消时能连它起的**孙子进程**一起杀。
+    //
+    // agent 用 Bash 工具起的 cargo build / npm test / 脚本都是孙子进程。
+    // 只 kill 直接子进程的话它们全都活下来继续写文件 —— 实测过:
+    // 杀掉 agent 后孙子进程 1.2s 内又往文件里追加了 6 行。
+    // 用户看到「已取消 N 个在跑的 agent」,而仓库还在被改。
+    #[cfg(unix)]
+    cmd.process_group(0);
 
 
     let mut child = cmd
@@ -311,7 +339,7 @@ async fn run_process(
         tokio::select! {
             biased; // 优先响应取消
             _ = cancel.cancelled() => {
-                let _ = child.kill().await;
+                kill_tree(&mut child).await;
                 anyhow::bail!("{}", crate::model::CANCELLED);
             }
             line = out_reader.next_line() => {
@@ -442,6 +470,53 @@ mod tests {
         }
     }
 
+    /// 取消必须连 agent 起的**孙子进程**一起杀。
+    ///
+    /// agent 用 Bash 工具起的 cargo build / npm test 都是孙子进程。只 kill
+    /// 直接子进程的话它们全都活下来继续写文件 —— 用户看到「已取消 N 个在跑的
+    /// agent」,而仓库还在被改。实测过:裸 kill 之后 1.2s 内又追加了 6 行。
+    ///
+    /// 这个测试起真实进程树来验,不是断言代码形状。
+    #[tokio::test]
+    async fn cancel_kills_grandchildren() {
+        let dir = std::env::temp_dir().join(format!("tf_kg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("grandchild.log");
+
+        // 父进程立刻退,只留孙子在后台写 —— 模拟 agent 起了个长跑命令
+        let script = format!(
+            "sh -c 'i=0; while [ $i -lt 200 ]; do echo x >> {} ; sleep 0.1; i=$((i+1)); done' & wait",
+            out.display()
+        );
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", &script]).kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("起得来");
+
+        // 等孙子真的开始写
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if out.exists() && std::fs::read(&out).map(|b| !b.is_empty()).unwrap_or(false) {
+                break;
+            }
+        }
+        let lines = || -> usize {
+            std::fs::read_to_string(&out).map(|s| s.lines().count()).unwrap_or(0)
+        };
+        assert!(lines() > 0, "孙子进程没起来,这个测试就白测了");
+
+        kill_tree(&mut child).await;
+        let after_kill = lines();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(
+            lines(), after_kill,
+            "取消后孙子进程还在写文件(裸 kill 只杀得掉直接子进程)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// E2BIG 的最后一道防线:任何一个 argv 都不能超过 MAX_ARG_STRLEN。
     ///
     /// 实测阈值正好 131072 字节(131071 可以,131072 就 `Argument list too long`)。
@@ -489,6 +564,7 @@ mod tests {
             name: "X".into(),
             issue: 1,
             gen: 0,
+            cancel_gen: 0,
             backend,
             model: None,
             system_prompt: "sp".into(),
