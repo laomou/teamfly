@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "teamfly", about = "终端里的 AI 团队协作台 —— 你带一个群,agent 是群友")]
+#[command(name = "teamfly", about = "终端里的 AI 团队协作台 —— 你带一支队,agent 是队员")]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Cmd,
@@ -15,7 +15,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
-    /// 用某团队在工作目录里开群
+    /// 在工作目录里带一支团队开干
     Work {
         /// 工作目录(缺省 = 当前目录)
         dir: Option<PathBuf>,
