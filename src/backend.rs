@@ -332,6 +332,9 @@ async fn run_process(
     let mut stream_err: Option<String> = None;  // 流里的**致命**错误
     let mut last_warn: Option<String> = None;   // 流里最后一条**瞬时**错误(仅兜底用)
     let mut err_tail: Vec<String> = Vec::new(); // 保留最后几行 stderr 供报错
+    // 已经提示过「模型没返回思考内容」了吗?一轮里只说一次 ——
+    // thinking 块可能有很多个,每个都提示会把 raw 视图刷满。
+    let mut empty_thinking_noted = false;
     let mut out_reader = BufReader::new(stdout).lines();
     let mut err_reader = BufReader::new(stderr).lines();
 
@@ -349,6 +352,16 @@ async fn run_process(
                         let outcome = crate::stream::classify(fmt, &clean);
                         for disp in outcome.display {
                             let _ = tx.send(Msg::AgentStdout { name: spec.name.clone(), line: disp });
+                        }
+                        // 有 thinking 块但内容是空的(中转站剥掉了正文)。不说的话
+                        // 用户分不清是模型没思考、中转站剥了、还是 teamfly 坏了 ——
+                        // 只看到「从来没有 💭」。
+                        if outcome.empty_thinking && !empty_thinking_noted {
+                            empty_thinking_noted = true;
+                            let _ = tx.send(Msg::AgentStdout {
+                                name: spec.name.clone(),
+                                line: "💭 (该模型未返回思考内容)".to_string(),
+                            });
                         }
                         if let Some(t) = outcome.text_delta {
                             full.push_str(&t);
