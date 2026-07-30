@@ -133,13 +133,28 @@ fn classify_claude(line: &str) -> StreamOutcome {
                         continue;
                     }
                     let body = tool_result_text(blk.get("content"));
-                    let summary = summarize(&body, TOOL_RESULT_MAX);
-                    if blk.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false) {
+                    let rows = result_lines(&body, TOOL_RESULT_MAX_LINES, TOOL_RESULT_MAX_COLS);
+                    let is_err = blk
+                        .get("is_error")
+                        .and_then(|e| e.as_bool())
+                        .unwrap_or(false);
+                    if is_err {
                         // 失败时错误文本也在 content 里,没有单独的 error 字段
-                        let msg = if summary.is_empty() { "执行失败".to_string() } else { summary };
-                        out.display.push(format!("❌ {msg}"));
-                    } else if !summary.is_empty() {
-                        out.display.push(format!("📋 {summary}"));
+                        if rows.is_empty() {
+                            out.display.push("❌ 执行失败".to_string());
+                        } else {
+                            // 首行带图标,续行用空格对齐 —— tui 那边按前缀分类,
+                            // 续行不能再带 ❌ 否则每行都被当成一个新错误
+                            for (i, r) in rows.iter().enumerate() {
+                                out.display
+                                    .push(if i == 0 { format!("❌ {r}") } else { format!("   {r}") });
+                            }
+                        }
+                    } else {
+                        for (i, r) in rows.iter().enumerate() {
+                            out.display
+                                .push(if i == 0 { format!("📋 {r}") } else { format!("   {r}") });
+                        }
                     }
                 }
             }
@@ -259,7 +274,10 @@ fn tool_input_hint(input: Option<&serde_json::Value>) -> String {
 }
 
 /// tool_result 摘要保留的最大字符数。
-const TOOL_RESULT_MAX: usize = 200;
+/// 工具结果最多显示多少行。结果可能上千行,全塞进 raw 缓冲会把别的轮次挤掉。
+const TOOL_RESULT_MAX_LINES: usize = 20;
+/// 工具结果单行最多多少字符(一行几千字符会把 raw 视图撑爆)。
+const TOOL_RESULT_MAX_COLS: usize = 200;
 
 /// tool_result 的 content:可能是字符串,也可能是内容块数组(取里面的 text 块,图片等跳过)。
 fn tool_result_text(content: Option<&serde_json::Value>) -> String {
@@ -283,20 +301,39 @@ fn tool_result_text(content: Option<&serde_json::Value>) -> String {
 
 /// 压成单行(空白折叠)再截断到 max 字符,超长补 …。
 /// 折成单行是必须的:一条 display 就是 raw 视图里的一行,内嵌换行会把渲染搞乱。
-fn summarize(s: &str, max: usize) -> String {
-    let mut one = String::new();
-    for w in s.split_whitespace() {
-        if !one.is_empty() {
-            one.push(' ');
+/// 把工具结果切成**保留行结构**的若干行,供 raw 视图逐行加缩进。
+///
+/// 以前走 `summarize`,它用 `split_whitespace()` 把整段压成一行 ——
+/// Read 一个文件、跑一次测试返回几十行,全糊成一行再砍到 200 字,
+/// 结构和内容一起没了。
+///
+/// 行数上限:结果可能上千行,全塞进 raw 缓冲会把别的轮次挤掉(RAW_CAP)。
+/// 超出时保**前面**几行(文件头/报错开头信息量最大)并说明省了多少。
+fn result_lines(s: &str, max_lines: usize, max_cols: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let total = s.lines().count();
+    for l in s.lines().take(max_lines) {
+        // 制表符换成空格:终端里 tab 跳到 8 列对齐,和 tui 那边加的缩进前缀
+        // 叠在一起会错位(`cat -n` / Read 的行号就是 tab 分隔的)
+        let l = l.replace('\t', "    ");
+        let l = l.trim_end();
+        // 单行超长仍要截 —— 一行几千字符会把 raw 视图撑爆
+        if l.chars().count() > max_cols {
+            let mut t: String = l.chars().take(max_cols).collect();
+            t.push('…');
+            out.push(t);
+        } else {
+            out.push(l.to_string());
         }
-        one.push_str(w);
     }
-    if one.chars().count() <= max {
-        return one;
+    if total > max_lines {
+        out.push(format!("…(还有 {} 行)", total - max_lines));
     }
-    let mut r: String = one.chars().take(max).collect();
-    r.push('…');
-    r
+    // 全是空行时别推一堆空的
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out
 }
 
 /// 只读工具:不改工作区,重试时无需带「先核对现状」的提醒。
@@ -312,6 +349,7 @@ fn is_readonly_tool(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     // ---- claude ----
@@ -346,7 +384,76 @@ mod tests {
         // 真机形状:tool_result 挂在 type=user 上,不在 assistant 里
         let line = r#"{"type":"user","message":{"content":[{"tool_use_id":"t1","type":"tool_result","content":"1\t[package]\n2\tname = \"teamfly\"\n"}]}}"#;
         let o = classify(StreamFmt::Claude, line);
-        assert_eq!(o.display, vec![r#"📋 1 [package] 2 name = "teamfly""#]);
+        // 保留行结构:首行带 📋,续行用三空格对齐(tui 那边靠这个前缀认出是续行)。
+        // 制表符展开成空格,不然和 tui 加的缩进叠在一起会错位。
+        assert_eq!(
+            o.display,
+            vec![
+                r#"📋 1    [package]"#,
+                r#"   2    name = "teamfly""#,
+            ]
+        );
+    }
+
+    /// `result_lines` 本身保留行结构。
+    #[test]
+    fn tool_result_keeps_line_structure() {
+        let body = "line one\nline two\nline three";
+        let rows = result_lines(body, 20, 200);
+        assert_eq!(rows, vec!["line one", "line two", "line three"]);
+    }
+
+    /// 走**完整 classify 路径**确认多行结果没被压平。
+    ///
+    /// 只测 `result_lines` 不够 —— 那只守函数本身,不守调用点有没有接上。
+    /// (实测过:把调用点换回 split_whitespace 压平,只有这条会红。)
+    #[test]
+    fn classify_does_not_flatten_tool_result() {
+        let line = "{\"type\":\"user\",\"message\":{\"content\":[{\"tool_use_id\":\"t1\",\
+\"type\":\"tool_result\",\"content\":\"A one\\nB two\\nC three\"}]}}";
+        let o = classify(StreamFmt::Claude, line);
+        assert_eq!(o.display.len(), 3, "三行结果被压成了 {} 行", o.display.len());
+        assert!(o.display[0].starts_with("📋 A one"));
+        assert!(o.display[1].starts_with("   B two"));
+        assert!(o.display[2].starts_with("   C three"));
+    }
+
+    /// 行数超上限时保**前面**几行(文件头/报错开头信息量最大),并说明省了多少。
+    #[test]
+    fn tool_result_caps_lines_and_says_how_many_dropped() {
+        let body: String = (1..=50).map(|i| format!("L{i}\n")).collect();
+        let rows = result_lines(&body, 20, 200);
+        assert_eq!(rows.len(), 21, "20 行 + 1 行说明");
+        assert_eq!(rows[0], "L1");
+        assert_eq!(rows[19], "L20");
+        assert!(rows[20].contains("还有 30 行"), "没说省了多少: {:?}", rows[20]);
+    }
+
+    /// 单行超长要截,否则一行几千字符会把 raw 视图撑爆。
+    #[test]
+    fn tool_result_truncates_huge_single_line() {
+        let body = "x".repeat(500);
+        let rows = result_lines(&body, 20, 200);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].chars().count(), 201, "200 字符 + 省略号");
+        assert!(rows[0].ends_with('…'));
+    }
+
+    /// 多行**错误**结果同样保留结构,且续行不能再带 ❌ ——
+    /// tui 按前缀分类,每行都带 ❌ 会被当成一串独立错误。
+    #[test]
+    fn multiline_error_keeps_icon_only_on_first_line() {
+        let line = "{\"type\":\"user\",\"message\":{\"content\":[{\"tool_use_id\":\"t1\",\
+\"type\":\"tool_result\",\"is_error\":true,\
+\"content\":\"error: 第一行\\nerror: 第二行\"}]}}";
+        let o = classify(StreamFmt::Claude, line);
+        assert_eq!(o.display.len(), 2);
+        assert!(o.display[0].starts_with("❌ "));
+        assert!(
+            o.display[1].starts_with("   ") && !o.display[1].contains('❌'),
+            "续行不该再带 ❌: {:?}",
+            o.display[1]
+        );
     }
 
     #[test]
@@ -368,16 +475,6 @@ mod tests {
         let line = r#"{"type":"user","message":{"content":[{"type":"text","text":"帮我改 auth.py"}]}}"#;
         let o = classify(StreamFmt::Claude, line);
         assert!(o.display.is_empty());
-    }
-
-    #[test]
-    fn summarize_flattens_and_truncates() {
-        // 摘要必须是单行:内嵌换行会把 raw 视图渲染搞乱
-        assert_eq!(summarize("a\nb  c\t\nd", 100), "a b c d");
-        let long = "x".repeat(250);
-        let s = summarize(&long, TOOL_RESULT_MAX);
-        assert_eq!(s.chars().count(), TOOL_RESULT_MAX + 1);
-        assert!(s.ends_with('…') && !s.contains('\n'));
     }
 
     #[test]

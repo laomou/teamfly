@@ -437,6 +437,10 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut D
             Blk::Tool
         } else if l.starts_with("⟨err⟩") {
             Blk::Err
+        } else if l.starts_with("   ") {
+            // 多行工具结果的续行(stream 层用三空格对齐首行的图标)。
+            // 判成 Text 的话会在结果中间插空行、还按正文着色 —— 结果被撕开。
+            Blk::Tool
         } else {
             Blk::Text
         }
@@ -480,8 +484,10 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut D
             Blk::Tool if l.starts_with("🔧") => (Style::default().fg(Color::Cyan), "  "),
             // 工具结果:挂在工具调用下面,再缩一层 + 灰色弱化
             Blk::Tool if l.starts_with("📋") => (Style::default().fg(Color::DarkGray), "    "),
-            // 工具执行失败
-            Blk::Tool => (Style::default().fg(Color::Red), "    "),
+            // 失败:整块红色(首行 ❌,续行三空格对齐)
+            Blk::Tool if l.starts_with("❌") => (Style::default().fg(Color::Red), "    "),
+            // 多行结果的续行:和它的首行同缩进同配色
+            Blk::Tool => (Style::default().fg(Color::DarkGray), "    "),
             // 思考链:黄色 + dim,和回复正文拉开
             Blk::Think => (
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
@@ -788,6 +794,61 @@ mod tests {
             ra < rb && rb < rc,
             "三行挤在一起了:a在{ra}行 b在{rb}行 c在{rc}行\n{}",
             rows.join("\n")
+        );
+    }
+
+    /// 多行工具结果在 raw 视图里必须逐行显示,且整块跟着它的 🔧 不被撕开。
+    #[test]
+    fn raw_view_shows_multiline_tool_result() {
+        const W: u16 = 60;
+        const H: u16 = 20;
+        let mut m = crate::app::test_support::tiny_model();
+        m.members.push(crate::app::test_support::tiny_member("DEV"));
+        for l in [
+            "⟨init⟩ model=x tools=1",
+            "🔧 Read(Cargo.toml)",
+            "📋 R1 first",
+            "   R2 second",
+            "   R3 third",
+            "final-reply ok",
+        ] {
+            m.members[0].push_raw(l.into());
+        }
+        m.selection = crate::model::Selection::Member(0);
+
+        let mut t =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+        t.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
+        let b = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..H)
+            .map(|y| (21..W).map(|x| b[(x, y)].symbol()).collect::<String>())
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        let row_of = |n: &str| {
+            rows.iter()
+                .position(|r| r.contains(n))
+                .unwrap_or_else(|| panic!("找不到 {n}\n{}", rows.join("\n")))
+        };
+        let (r1, r2, r3) = (row_of("R1"), row_of("R2"), row_of("R3"));
+        // 三行结果各占一行,顺序不乱
+        assert!(r1 < r2 && r2 < r3, "结果三行没有分行:{r1} {r2} {r3}");
+        // 中间不能插空行 —— 那会把一块结果撕成几块
+        assert!(
+            rows[r1 + 1..r3].iter().all(|r| !r.is_empty()),
+            "多行结果中间被插了空行\n{}",
+            rows.join("\n")
+        );
+        // 结果和它的 🔧 之间也不空
+        let tool = row_of("Read(");
+        assert!(
+            rows[tool + 1..r1].iter().all(|r| !r.is_empty()),
+            "结果和它的工具调用被拆开了"
+        );
+        // 但结果块和后面的正文之间要空
+        let txt = row_of("final-reply");
+        assert!(
+            rows[r3 + 1..txt].iter().any(|r| r.is_empty()),
+            "结果块和正文之间该空一行"
         );
     }
 
