@@ -52,6 +52,10 @@ pub fn build(dir: Option<PathBuf>, team_arg: Option<String>) -> Result<(Model, V
     let fresh_start = issues.is_empty();
     if fresh_start {
         issues.push(Issue::new("默认议题"));
+        // 这个 id 也得落水位线 —— 关掉它之后分支还会留着
+        if let Err(e) = crate::issue::bump_watermark(&teamfly_dir, issues[0].id + 1) {
+            warns.push(format!("议题 id 水位线写不进去({e});关议题后重启可能重发已用过的 id"));
+        }
     }
 
     // 首次开箱:塞一条欢迎消息进默认议题(不落盘,仅当前会话)

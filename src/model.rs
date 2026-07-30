@@ -128,6 +128,14 @@ pub struct Issue {
 
 static NEXT_ISSUE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// 保留 `up_to` 之前的所有 id,下一个新议题从 `up_to` 起发。
+///
+/// 用于启动时应用落盘的水位线 —— 关掉的议题分支还在(关议题故意不删分支),
+/// 它们的 id **不能**被重新发出去,否则新议题会 checkout 到别人的成果上。
+pub fn reserve_issue_ids_up_to(up_to: u64) {
+    NEXT_ISSUE_ID.fetch_max(up_to, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 用一个已知 id 造议题（从盘上恢复时用），并把计数器推到它之后。
 ///
 /// id 必须跨重启稳定：worktree 目录 `worktrees/<id>/` 和分支 `teamfly/issue-<id>`
@@ -294,4 +302,9 @@ pub enum Command {
     DeleteIssueFile { issue_id: u64, issue: String },
     /// 议题自动改名时,把落盘文件一起改名(保住已经落进去的内容)
     RenameIssueFile { issue_id: u64, from: String, to: String },
+    /// 把「已发放 id」的水位线推到 `next` —— 新建议题时立刻落盘。
+    ///
+    /// 不能等退出时再写:关议题会删 jsonl 但**保留分支**,而崩溃/被 kill
+    /// 时没有退出钩子。水位线一丢,下次启动就会重发那些分支还在的 id。
+    BumpIssueWatermark { next: u64 },
 }

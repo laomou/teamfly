@@ -10,6 +10,43 @@ fn issues_dir(teamfly_dir: &Path) -> PathBuf {
     teamfly_dir.join("issues")
 }
 
+/// 已发放 id 的水位线文件:`<teamfly_dir>/next-issue-id`。
+///
+/// 为什么必须落盘:`NEXT_ISSUE_ID` 以前只从**存活的** jsonl 文件推高
+/// (`fetch_max(id+1)`),而关议题会删掉 jsonl、却**故意保留分支**
+/// (关掉只是「我不看了」,不该销毁工作成果)。于是关掉 id 最大的那个议题
+/// 之后重启,新议题会拿回同一个 id,`prepare` 撞上 `teamfly/issue-<id>`
+/// 已存在 —— 新议题的 agent 站在上一个议题的成果上干活,或者(更糟)
+/// 那个分支被当成本议题的、在 `drop_if_untouched` 时被 `branch -D`。
+fn watermark_path(teamfly_dir: &Path) -> PathBuf {
+    teamfly_dir.join("next-issue-id")
+}
+
+/// 读水位线。文件不存在/读不动/内容不是数字都返回 0(退回「按存活文件推高」)。
+fn read_watermark(teamfly_dir: &Path) -> u64 {
+    std::fs::read_to_string(watermark_path(teamfly_dir))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// 把水位线推到至少 `id`。失败返回 Err 让调用方决定怎么提示 ——
+/// 写不进去的话下次启动 id 就会退回去,那正是这个文件要防的事。
+pub fn bump_watermark(teamfly_dir: &Path, id: u64) -> Result<()> {
+    if read_watermark(teamfly_dir) >= id {
+        return Ok(());
+    }
+    std::fs::create_dir_all(teamfly_dir)?;
+    let path = watermark_path(teamfly_dir);
+    // 先写临时文件再 rename:写一半掉电不会留下半截数字被解析成小值
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{id}\n"))
+        .with_context(|| format!("写入 {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("替换 {}", path.display()))?;
+    Ok(())
+}
+
 /// 落盘文件名:`<id>-<名字>.jsonl`。
 ///
 /// 名字里带 id 是为了让 id **跨重启稳定** —— worktree 目录和分支都按 id 命名,
@@ -81,6 +118,13 @@ pub fn delete_file(teamfly_dir: &Path, id: u64, issue_name: &str) -> Result<()> 
 pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> {
     let dir = issues_dir(teamfly_dir);
     let mut warns: Vec<String> = Vec::new();
+    // 先把 id 计数器推到落盘的水位线之上 —— 必须在读文件**之前**,
+    // 这样即使 issues/ 目录是空的(所有议题都关掉了),新议题也不会
+    // 从 1 开始重发那些分支还在的 id。
+    let mark = read_watermark(teamfly_dir);
+    if mark > 0 {
+        crate::model::reserve_issue_ids_up_to(mark);
+    }
     if !dir.is_dir() {
         return Ok((Vec::new(), warns));
     }
@@ -161,6 +205,21 @@ pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> 
             warns.push(format!(
                 "议题文件 {} 迁移到新命名失败({e});重启后 id 可能变",
                 old_path.display()
+            ));
+        }
+    }
+    // 把水位线补到「所有见过的 id」之上。
+    //
+    // 兼容老项目:它们没有这个文件,水位线要从现存文件重建。这补不回**已经
+    // 关掉**的议题(那些 jsonl 已经没了),所以老项目升级后第一次仍可能撞上
+    // 一次 id 回收 —— 但 prepare 会拒绝复用已存在的分支并 fallback,不会
+    // 静默混改动。之后水位线就稳了。
+    let high = issues.iter().map(|i| i.id).max().unwrap_or(0);
+    if high > 0 {
+        if let Err(e) = bump_watermark(teamfly_dir, high + 1) {
+            warns.push(format!(
+                "议题 id 水位线写不进去({e});关掉议题后重启可能重发已用过的 id,\
+                 撞上残留分支时那一轮会退回主工作目录"
             ));
         }
     }
@@ -300,6 +359,99 @@ mod tests {
         // 旧格式(无 id 前缀)
         assert_eq!(parse_stem("改登录"), None);
         assert_eq!(parse_stem("not-a-number"), None);
+    }
+
+    /// 关掉议题后,水位线必须保住已发放的最大 id。
+    ///
+    /// 关议题会删 jsonl 但**故意保留分支**。以前 id 计数器只从存活的 jsonl
+    /// 推高,于是关掉 id 最大的那个之后重启,新议题会拿回同一个 id,
+    /// `prepare` 撞上还在的 `teamfly/issue-<id>`。
+    ///
+    /// 这里不测 `Issue::new()` 的返回值 —— `NEXT_ISSUE_ID` 是进程全局的,
+    /// 同一个测试二进制里其他测试已经把它推高了,测绝对值没有意义。
+    /// 改为验证水位线文件的内容:它是跨进程持久化的,才是真正的修复点。
+    #[test]
+    fn watermark_written_after_load() {
+        let dir = std::env::temp_dir().join(format!("tf_ww_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(issues_dir(&dir)).unwrap();
+        for (id, n) in [(1u64, "a"), (5, "b"), (3, "c")] {
+            append_chat(&dir, id, n, &msg("我", "x")).unwrap();
+        }
+        // 加载前水位线不存在
+        assert!(!dir.join("next-issue-id").exists(), "加载前不该有水位线文件");
+
+        let _ = load_all_issues(&dir).unwrap();
+
+        // 加载后水位线必须存在且 >= max_id + 1
+        let wm = read_watermark(&dir);
+        assert!(wm >= 6, "水位线 {wm} 应 >= 6(max id=5, next=6)");
+    }
+
+    /// 关掉 id 最大的议题后,水位线必须保住那个 id。
+    #[test]
+    fn watermark_survives_issue_close() {
+        let dir = std::env::temp_dir().join(format!("tf_ws_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(issues_dir(&dir)).unwrap();
+        for (id, n) in [(1u64, "a"), (2, "b"), (7, "c")] {
+            append_chat(&dir, id, n, &msg("我", "x")).unwrap();
+        }
+        let _ = load_all_issues(&dir).unwrap();
+        let wm_before = read_watermark(&dir);
+        assert!(wm_before >= 8, "初次加载后水位线 {wm_before} 应 >= 8");
+
+        // 关掉 id 最大的那个
+        delete_file(&dir, 7, "c").unwrap();
+
+        // 重启:重新加载
+        let _ = load_all_issues(&dir).unwrap();
+        let wm_after = read_watermark(&dir);
+        assert!(
+            wm_after >= 8,
+            "关掉 id=7 的议题后水位线从 {wm_before} 退到了 {wm_after} ——              重启后新议题会拿回 id 7,而 teamfly/issue-7 还在盘上"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 所有议题都关掉后重启,水位线仍然保住。
+    #[test]
+    fn watermark_survives_empty_issues_dir() {
+        let dir = std::env::temp_dir().join(format!("tf_wm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(issues_dir(&dir)).unwrap();
+        append_chat(&dir, 5, "唯一的议题", &msg("我", "x")).unwrap();
+        let _ = load_all_issues(&dir).unwrap();
+        let wm_before = read_watermark(&dir);
+        assert!(wm_before >= 6);
+
+        delete_file(&dir, 5, "唯一的议题").unwrap();
+        let (empty, _) = load_all_issues(&dir).unwrap();
+        assert!(empty.is_empty());
+
+        let wm_after = read_watermark(&dir);
+        assert!(
+            wm_after >= 6,
+            "issues/ 空了之后水位线从 {wm_before} 退到了 {wm_after}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 水位线文件损坏(半截数字/乱码)不能让 id 退回去,也不能崩。
+    #[test]
+    fn corrupt_watermark_falls_back_to_files() {
+        let dir = std::env::temp_dir().join(format!("tf_wmc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(issues_dir(&dir)).unwrap();
+        append_chat(&dir, 9, "议题", &msg("我", "x")).unwrap();
+        std::fs::write(dir.join("next-issue-id"), "这不是数字\n").unwrap();
+
+        let (issues, _) = load_all_issues(&dir).unwrap();
+        assert_eq!(issues[0].id, 9, "文件名里的 id 该照常读出来");
+        // 损坏时退回按存活文件推高,水位线应被重建
+        let wm = read_watermark(&dir);
+        assert!(wm >= 10, "损坏后水位线应被重建为 >= 10,实际 {wm}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 旧格式迁移**绝不能覆盖**已存在的文件。

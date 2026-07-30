@@ -70,8 +70,7 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Command> {
         }
         Msg::MouseTabClick { col } => {
             // 保守 hit-test:重现 draw_tabs 的 span 布局,算命中
-            handle_tab_click(m, col);
-            vec![]
+            handle_tab_click(m, col)
         }
         Msg::AgentStdout { name, line } => {
             if let Some(i) = m.member_index(&name) {
@@ -204,13 +203,15 @@ fn handle_key(m: &mut Model, k: crossterm::event::KeyEvent) -> Vec<Command> {
                 // 直接建一个新议题,名字自动递增,并切过去
                 let name = next_issue_name(&m.issues);
                 m.issues.push(Issue::new(name.clone()));
+                let next = m.issues[m.issues.len() - 1].id + 1;
                 m.current_issue = m.issues.len() - 1;
                 m.selection = Selection::Chat;
                 m.scroll = 0;
                 m.input.clear();
                 set_hint(m, format!("已建议题:{name}"), 5);
                 m.pending_delete = None;
-                return vec![];
+                // 立刻把水位线落盘:这个 id 已经发出去了,关掉它之后分支还会留着
+                return vec![Command::BumpIssueWatermark { next }];
             }
             KeyCode::Char('w') => {
                 // 关闭当前议题(有内容需二次确认)
@@ -729,11 +730,11 @@ fn handle_slash(m: &mut Model, slash: crate::slash::Slash) -> Vec<Command> {
 }
 
 /// 点击顶部 tab 栏:命中某个议题 tab → 切;命中 [+ 新议题] → 建;命中其它 → 静默。
-fn handle_tab_click(m: &mut Model, col: u16) {
+fn handle_tab_click(m: &mut Model, col: u16) -> Vec<Command> {
     // tab 内容起始列(与 draw_tabs 一致:SIDEBAR_W=20,内容从 area.x 起,即列 20)
     const START: u16 = 20;
     if col < START {
-        return;
+        return vec![];
     }
     // 依样画:窗口逻辑必须和 draw_tabs 一致
     let total = m.issues.len();
@@ -768,7 +769,7 @@ fn handle_tab_click(m: &mut Model, col: u16) {
             m.selection = Selection::Chat;
             m.scroll = 0;
             set_hint(m, format!("切到议题 {}", i + 1), 3);
-            return;
+            return vec![];
         }
         x = x.saturating_add(w + 1); // +1 是 spans 间的空格
     }
@@ -781,11 +782,15 @@ fn handle_tab_click(m: &mut Model, col: u16) {
         // 新建
         let name = next_issue_name(&m.issues);
         m.issues.push(Issue::new(name.clone()));
+        let next = m.issues[m.issues.len() - 1].id + 1;
         m.current_issue = m.issues.len() - 1;
         m.selection = Selection::Chat;
         m.scroll = 0;
         set_hint(m, format!("已建议题:{name}"), 5);
+        // 和 ^N 一样:发出去的 id 立刻落盘
+        return vec![Command::BumpIssueWatermark { next }];
     }
+    vec![]
 }
 
 /// 显示宽度。用 unicode-width,和终端/ratatui 的排版一致 ——
@@ -989,6 +994,13 @@ fn execute(tx: &UnboundedSender<Msg>, model: &Model, cmd: Command) {
             let dir = model.teamfly_dir.clone();
             if let Err(e) = crate::issue::rename_file(&dir, issue_id, &from, &to) {
                 let _ = tx.send(Msg::IoError { detail: format!("{e:#}") });
+            }
+        }
+        Command::BumpIssueWatermark { next } => {
+            // 写失败要让用户看见:水位线丢了的话,关掉议题后重启会重发它的 id,
+            // 而那个议题的分支还在盘上(关议题故意不删分支)。
+            if let Err(e) = crate::issue::bump_watermark(&model.teamfly_dir, next) {
+                let _ = tx.send(Msg::IoError { detail: format!("议题 id 水位线:{e:#}") });
             }
         }
         Command::SpawnAgent {

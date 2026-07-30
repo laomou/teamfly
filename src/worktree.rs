@@ -482,6 +482,39 @@ mod tests {
         String::from_utf8_lossy(&o.stdout).trim().to_string()
     }
 
+    /// 端到端:关掉议题后新建的议题必须拿到**自己的** worktree,不能因为
+    /// id 撞上残留分支而退回主工作目录。
+    ///
+    /// PR #21 让 `prepare` 撞上已存在分支时拒绝并 fallback —— 那避免了静默
+    /// 混改动,但新议题就完全失去隔离了(agent 直接在用户工作树里跑)。
+    /// 修好 id 回收之后,这条路径不该再被走到。
+    #[test]
+    fn new_issue_after_close_gets_own_worktree() {
+        let root = repo("idrc");
+        let tf = root.join(".teamfly");
+
+        // 议题 3 干了活并提交,然后关掉(分支按设计保留)
+        let old = prepare(&root, &tf, 3);
+        assert!(old.branch.is_some());
+        std::fs::write(old.agent_dir.join("上个议题.py"), "x").unwrap();
+        for a in [vec!["add", "."], vec!["commit", "-qm", "上个议题的活"]] {
+            Command::new("git").args(&a).current_dir(&old.agent_dir).output().unwrap();
+        }
+        let (removed, _) = release_issue(&root, &tf, 3);
+        assert!(removed);
+        assert!(branch_exists(&root, &issue_branch(3)), "分支该留着");
+
+        // 水位线修好后,新议题拿到的是 4 而不是 3
+        let fresh = prepare(&root, &tf, 4);
+        assert!(fresh.branch.is_some(), "新议题该有自己的 worktree,而不是 fallback");
+        assert_ne!(fresh.agent_dir, root, "退回主工作目录了,隔离没了");
+        assert!(
+            !fresh.agent_dir.join("上个议题.py").exists(),
+            "新议题继承了上个议题的成果"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `count_stale` 只数真的注册在本仓库的 worktree。
     ///
     /// 以前数目录,空壳目录和非数字目录都会被算进去 —— 报给用户的数字是假的。
