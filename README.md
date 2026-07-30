@@ -29,13 +29,15 @@ cargo build --release
 default/
 ├─ team.md            # 队名 + 全员规矩 + 团队职责 + 任务流转(拼进每个 agent)
 └─ agents/
-   ├─ TPM.md          # frontmatter(name/role/emoji/backend/read_only) + 调度职责
+   ├─ TPM.md          # frontmatter(name/role/emoji/backend/model/read_only) + 调度职责
    ├─ DEV.md          # 实现与测试
    └─ REV.md          # 只做代码评审
 ```
 
 - **agent md** 只写单一职责(我是谁、做什么);**team.md** 写团队职责和任务流转(谁完成后交给谁),改流程只改一处。
 - `backend` 二选一:`claude`(claude CLI,stream-json)/ `codex`(codex CLI,JSONL)。
+- `model` 可选。写了就作为 `--model` 传给该成员的 CLI,**可以给单个成员单独换模型**
+  (比如评审用便宜的、实现用强的);不写则完全不传,由 CLI 自己按它的配置决定。
 - `read_only` 可选(默认 `false` = 可写)。写 `read_only: true` 的成员在**主工作目录**里跑且**真的没有写权限**
   (claude 走 `--permission-mode plan`,codex 走 `--sandbox read-only`),适合评审、调度这类不该改文件的角色。
   内置队里 TPM/REV 是只读,DEV 可写。
@@ -49,13 +51,21 @@ teamfly **不管这些** —— agent 子进程直接继承你 shell 里的环�
 ```bash
 export ANTHROPIC_BASE_URL=https://api.anthropic.com
 export ANTHROPIC_AUTH_TOKEN=...
-export ANTHROPIC_MODEL=claude-opus-4-6      # 模型也走环境变量
 
 export OPENAI_API_KEY=...                   # codex 成员
 ```
 
-中转站、模型选择、鉴权方式想怎么配就怎么配,和你平时直接用 `claude` / `codex`
-命令行时完全一样,teamfly 不在中间插一层。
+中转站、鉴权方式想怎么配就怎么配,和你平时直接用 `claude` / `codex` 命令行时
+完全一样,teamfly 不在中间插一层。
+
+模型有两种指定方式,**按成员** 优先:
+
+| 方式 | 粒度 | 怎么写 |
+|---|---|---|
+| agent md 的 `model:` | 单个成员 | frontmatter 里写,作为 `--model` 传给该成员 |
+| CLI 自己的配置 | 全队 | `ANTHROPIC_MODEL` 环境变量 / codex 的 config |
+
+agent md 里没写 `model:` 时 teamfly 完全不传 `--model`,CLI 就按自己那套来。
 
 ## MCP
 

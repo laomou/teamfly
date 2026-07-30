@@ -243,6 +243,7 @@ mod tests {
             role: "安全".into(),
             emoji: "🛡".into(),
             backend: BackendKind::Claude,
+            model: None,
             read_only: false,
             system_prompt: String::new(),
             state: AgentState::Idle,

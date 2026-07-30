@@ -16,6 +16,8 @@ pub struct RunSpec {
     /// 派活时的团队代号,原样回投给 AgentDone
     pub gen: u64,
     pub backend: BackendKind,
+    /// frontmatter 指定的模型;None = 不传 --model,由 CLI 自己决定。
+    pub model: Option<String>,
     pub system_prompt: String,
     pub user_input: String,
     pub work_dir: PathBuf,
@@ -181,6 +183,10 @@ fn claude_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         "--append-system-prompt".to_string(),
         spec.system_prompt.clone(),
     ];
+    if let Some(m) = &spec.model {
+        args.push("--model".into());
+        args.push(m.clone());
+    }
     // MCP 配置已在 spawn 时从主 work_dir 解析好(worktree 里没有 .teamfly/)
     if let Some(mcp) = &spec.mcp_config {
         args.push("--mcp-config".into());
@@ -225,7 +231,10 @@ fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
     } else {
         args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     }
-
+    if let Some(m) = &spec.model {
+        args.push("--model".to_string());
+        args.push(m.clone());
+    }
     args.push(combined);
     ProcSpec {
         bin: "codex".into(),
@@ -377,12 +386,44 @@ mod tests {
     use super::*;
     use crate::model::BackendKind;
 
+    /// frontmatter 的 `model:` 必须落成 `--model <名>`,而且要在**位置参数之前** ——
+    /// claude 的 prompt / codex 的 combined 都是位置参数,插到它们后面会被当成
+    /// prompt 的一部分,模型静默不生效。
+    #[test]
+    fn model_becomes_model_flag_before_positional() {
+        for backend in [BackendKind::Claude, BackendKind::Codex] {
+            let mut sp = spec(false, backend);
+            sp.model = Some("some-model".into());
+            let p = match backend {
+                BackendKind::Claude => claude_cmd(&sp, "ui"),
+                BackendKind::Codex => codex_cmd(&sp, "ui"),
+            };
+            let i = p.args.iter().position(|a| a == "--model").expect("该有 --model");
+            assert_eq!(p.args[i + 1], "some-model");
+            assert!(i + 2 < p.args.len(), "--model 不能是最后一对,位置参数得在它后面");
+        }
+    }
+
+    /// 不指定就完全不传 —— 交给 CLI 自己按它的配置决定,teamfly 不替它选。
+    #[test]
+    fn no_model_flag_when_unset() {
+        for backend in [BackendKind::Claude, BackendKind::Codex] {
+            let sp = spec(false, backend);
+            let p = match backend {
+                BackendKind::Claude => claude_cmd(&sp, "ui"),
+                BackendKind::Codex => codex_cmd(&sp, "ui"),
+            };
+            assert!(!p.args.iter().any(|a| a == "--model"));
+        }
+    }
+
     fn spec(read_only: bool, backend: BackendKind) -> RunSpec {
         RunSpec {
             name: "X".into(),
             issue: 1,
             gen: 0,
             backend,
+            model: None,
             system_prompt: "sp".into(),
             user_input: "ui".into(),
             work_dir: PathBuf::from("/tmp"),
