@@ -35,6 +35,9 @@ pub struct Member {
     pub role: String,
     pub emoji: String,
     pub backend: BackendKind,
+    /// frontmatter 里指定的模型;None = 交给 CLI 自己决定。
+    /// 有它才能给单个成员单独换模型(比如评审用便宜的、实现用强的)。
+    pub model: Option<String>,
     pub system_prompt: String, // team 公共 + 个人人设 拼装后的最终 prompt
     /// 只读成员:在**主工作目录**里干活且不给写权限(claude plan 模式 /
     /// codex read-only sandbox)。适合评审、调度这类不该改文件的角色。
@@ -266,6 +269,7 @@ pub enum Command {
         /// 派活时的团队代号,原样回投
         gen: u64,
         backend: BackendKind,
+        model: Option<String>,
         system_prompt: String,
         user_input: String, // 增量前情 + 本次指派
         /// 只读成员:主目录 + 无写权限

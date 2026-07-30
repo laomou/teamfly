@@ -14,6 +14,10 @@ struct AgentFront {
     #[serde(default)]
     emoji: Option<String>,
     backend: String,
+    /// 指定模型(可选)。不写则由 backend 的 CLI 自己决定
+    /// (claude 读 ANTHROPIC_MODEL,codex 读它自己的 config)。
+    #[serde(default)]
+    model: Option<String>,
     /// 只读成员(主工作目录 + 无写权限),适合评审/调度。默认 false = 可写。
     #[serde(default)]
     read_only: bool,
@@ -137,6 +141,7 @@ pub fn load_team(dir: &Path) -> Result<Team> {
             role: af.role,
             emoji,
             backend,
+            model: af.model,
             read_only: af.read_only,
             system_prompt: sp,
             state: AgentState::Idle,
