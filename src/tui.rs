@@ -422,8 +422,29 @@ fn draw_timeline(f: &mut Frame, area: Rect, m: &Model, info: &mut DrawInfo) {
 
 fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut DrawInfo) {
     let mem = &m.members[idx];
+    /// raw 流里一行属于哪一类。相邻两行**类别不同**时插一条空行,
+    /// 让「思考 / 工具调用 / 工具结果 / 回复正文」在视觉上分块 ——
+    /// 全挤在一起时扫读根本分不出边界。
+    ///
+    /// 工具结果(📋/❌)算和工具调用(🔧)同一块:结果本来就该紧挨着它的调用,
+    /// 中间插空行反而把这对拆散了。
+    #[derive(PartialEq, Clone, Copy)]
+    enum Blk { Think, Tool, Text, Err }
+    fn blk_of(l: &str) -> Blk {
+        if l.starts_with("💭") {
+            Blk::Think
+        } else if l.starts_with("🔧") || l.starts_with("📋") || l.starts_with("❌") {
+            Blk::Tool
+        } else if l.starts_with("⟨err⟩") {
+            Blk::Err
+        } else {
+            Blk::Text
+        }
+    }
+
     let mut lines: Vec<Line> = Vec::new();
     let mut seen_init = false;
+    let mut prev: Option<Blk> = None;
     for l in &mem.raw {
         // 每轮以 ⟨init⟩ 开头:新一轮前插一条空行 + 分隔,和上一轮拉开
         if l.starts_with("⟨init⟩") {
@@ -435,23 +456,34 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut D
                 format!("── {l} ──"),
                 Style::default().fg(Color::DarkGray),
             ));
+            prev = None;
             continue;
         }
-        let (style, prefix) = if l.starts_with("⟨err⟩") {
-            (Style::default().fg(Color::Red), "  ")
-        } else if l.starts_with("🔧") {
-            (Style::default().fg(Color::Cyan), "  ")
-        } else if l.starts_with("📋") {
+        let kind = blk_of(l);
+        // 空一行的两种情况:
+        //  1. 换块了(思考 → 工具、工具 → 正文…)
+        //  2. 同是工具块但又起了一次**新调用** —— 一串 🔧 连着会糊成一片,
+        //     而 📋/❌ 要紧挨着它自己的 🔧,不能拆
+        let new_block = prev.is_some_and(|p| p != kind);
+        let new_tool_call = kind == Blk::Tool && prev == Some(Blk::Tool) && l.starts_with("🔧");
+        if new_block || new_tool_call {
+            lines.push(Line::raw(""));
+        }
+        prev = Some(kind);
+
+        let (style, prefix) = match kind {
+            Blk::Err => (Style::default().fg(Color::Red), "  "),
+            Blk::Tool if l.starts_with("🔧") => (Style::default().fg(Color::Cyan), "  "),
             // 工具结果:挂在工具调用下面,再缩一层 + 灰色弱化
-            (Style::default().fg(Color::DarkGray), "    ")
-        } else if l.starts_with("❌") {
+            Blk::Tool if l.starts_with("📋") => (Style::default().fg(Color::DarkGray), "    "),
             // 工具执行失败
-            (Style::default().fg(Color::Red), "    ")
-        } else if l.starts_with("💭") {
+            Blk::Tool => (Style::default().fg(Color::Red), "    "),
             // 思考链:黄色 + dim,和回复正文拉开
-            (Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM), "  ")
-        } else {
-            (Style::default().fg(Color::Gray), "  ")
+            Blk::Think => (
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+                "  ",
+            ),
+            Blk::Text => (Style::default().fg(Color::Gray), "  "),
         };
         lines.push(Line::styled(format!("{prefix}{l}"), style));
     }
@@ -753,6 +785,67 @@ mod tests {
             "三行挤在一起了:a在{ra}行 b在{rb}行 c在{rc}行\n{}",
             rows.join("\n")
         );
+    }
+
+    /// raw 视图里「思考 / 工具调用 / 回复正文」之间必须空行分块。
+    ///
+    /// 全紧贴在一起时扫读分不出边界 —— 一屏几十行里哪几行是思考、哪几行是
+    /// 工具调用、agent 最后说了什么,全糊成一片。
+    ///
+    /// 但**工具结果要紧挨着它的调用**(📋/❌ 跟在 🔧 后面),中间插空行反而
+    /// 把这一对拆散了。
+    #[test]
+    fn raw_view_separates_semantic_blocks() {
+        const W: u16 = 70;
+        const H: u16 = 26;
+        let mut m = crate::app::test_support::tiny_model();
+        m.members.push(crate::app::test_support::tiny_member("DEV"));
+        for l in [
+            "⟨init⟩ model=x tools=3",
+            "💭 thinking-one auth.py",
+            "💭 thinking-two decide",
+            "🔧 Read(src/auth.py)",
+            "📋 res-read 42",
+            "🔧 Edit(src/auth.py)",
+            "📋 res-edit ok",
+            "final-reply done",
+        ] {
+            m.members[0].push_raw(l.into());
+        }
+        m.selection = crate::model::Selection::Member(0);
+
+        let mut t =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+        t.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
+        let b = t.backend().buffer().clone();
+        // 只取右区(左栏宽 20),按行取文本
+        let rows: Vec<String> = (0..H)
+            .map(|y| (21..W).map(|x| b[(x, y)].symbol()).collect::<String>())
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        let row_of = |needle: &str| {
+            rows.iter().position(|r| r.contains(needle)).unwrap_or_else(|| {
+                panic!("找不到 {needle}\n{}", rows.join("\n"))
+            })
+        };
+        let blank_between = |a: usize, b: usize| rows[a + 1..b].iter().any(|r| r.is_empty());
+
+        let (t1, t2) = (row_of("thinking-one"), row_of("thinking-two"));
+        let (r1, res1) = (row_of("Read("), row_of("res-read"));
+        let (e1, res2) = (row_of("Edit("), row_of("res-edit"));
+        let txt = row_of("final-reply");
+
+        // 连续两条思考之间不空行
+        assert!(!blank_between(t1, t2), "同类之间不该空行\n{}", rows.join("\n"));
+        // 思考 → 工具:空
+        assert!(blank_between(t2, r1), "思考和工具调用之间该空一行\n{}", rows.join("\n"));
+        // 工具调用和它的结果之间:不空(结果要挂在调用下面)
+        assert!(!blank_between(r1, res1), "工具结果被和它的调用拆开了\n{}", rows.join("\n"));
+        // 两次工具调用之间:空
+        assert!(blank_between(res1, e1), "两次工具调用之间该空一行\n{}", rows.join("\n"));
+        assert!(!blank_between(e1, res2), "工具结果被拆开了");
+        // 工具 → 正文:空
+        assert!(blank_between(res2, txt), "工具块和回复正文之间该空一行\n{}", rows.join("\n"));
     }
 
     /// 折行宽度也得用 unicode-width。这是同一个错误启发式的第三份拷贝
