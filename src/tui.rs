@@ -659,23 +659,38 @@ fn str_cols(s: &str) -> usize {
     s.width()
 }
 
+/// 把一段正文切成「每行一段」,供渲染层逐段加缩进前缀。
+///
+/// 两件事:
+/// 1. **先按 `\n` 断行**。agent 的汇报几乎都是多行的(列表、代码块、分点),
+///    而 ratatui 的 `Line` 不把内容里的 `\n` 当换行 —— 它会被当控制字符渲染成
+///    空白,于是整段汇报在总览里挤成一坨。
+/// 2. 再按宽度折行。这里不能交给 `Paragraph` 的 `Wrap` 做:折出来的续行不会
+///    带上调用方加的两格缩进,气泡会破形。
+///
+/// 宽度用 unicode-width 逐字符算。以前是「码点 > 0x1100 就算 2 列」的启发式,
+/// `…`/`①`/变体选择符全都算错(和 tab 热区、输入行光标那两处同源的 bug)。
 fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
     if width == 0 {
         return vec![s.to_string()];
     }
     let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = if (c as u32) > 0x1100 { 2 } else { 1 };
-        if w + cw > width {
-            out.push(std::mem::take(&mut cur));
-            w = 0;
+    // \r\n 和纯 \r 都当换行:agent 输出里两种都见过
+    for para in s.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
+        let mut cur = String::new();
+        let mut w = 0usize;
+        for c in para.chars() {
+            // 控制字符没有宽度概念,直接跳过(制表符等留给上层的 raw 视图)
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > width && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                w = 0;
+            }
+            cur.push(c);
+            w += cw;
         }
-        cur.push(c);
-        w += cw;
-    }
-    if !cur.is_empty() {
+        // 空段也要推:`\n\n` 中间那个空行是作者故意留的段落间隔
         out.push(cur);
     }
     if out.is_empty() {
@@ -687,6 +702,71 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// agent 汇报里的换行必须在总览里真的换行。
+    ///
+    /// ratatui 的 `Line` 不把内容里的 `\n` 当换行 —— 它被当控制字符渲染成空白,
+    /// 于是多行汇报(列表、分点、代码块)在总览里挤成一坨。agent 的汇报几乎
+    /// 都是多行的,所以这条影响每一次交卷。
+    #[test]
+    fn timeline_renders_newlines_as_line_breaks() {
+        let segs = wrap_text("第一行\n第二行\n\n第四行", 40);
+        assert_eq!(
+            segs,
+            vec!["第一行", "第二行", "", "第四行"],
+            "换行没被切成独立段"
+        );
+        // \r\n 和裸 \r 也算换行
+        assert_eq!(wrap_text("a\r\nb", 40), vec!["a", "b"]);
+        assert_eq!(wrap_text("a\rb", 40), vec!["a", "b"]);
+    }
+
+    /// 端到端:真的画一帧,确认多行汇报在屏幕上占了多行。
+    #[test]
+    fn multiline_report_occupies_multiple_screen_rows() {
+        const W: u16 = 80;
+        const H: u16 = 24;
+        let mut m = crate::app::test_support::tiny_model();
+        m.issues[0].timeline.push(crate::model::ChatMsg {
+            ts: "2026-07-30T10:00:00".into(),
+            author: "DEV".into(),
+            text: "改了三个文件:\n- src/a.rs\n- src/b.rs\n- src/c.rs".into(),
+            is_system: false,
+        });
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+        term.draw(|f| draw(f, &m, &mut DrawInfo::default())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..H)
+            .map(|y| (0..W).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+
+        // 三个文件名必须各占一行,不能挤在同一行
+        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
+        let (ra, rb, rc) = (
+            row_of("src/a.rs").expect("a 没画出来"),
+            row_of("src/b.rs").expect("b 没画出来"),
+            row_of("src/c.rs").expect("c 没画出来"),
+        );
+        assert!(
+            ra < rb && rb < rc,
+            "三行挤在一起了:a在{ra}行 b在{rb}行 c在{rc}行\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// 折行宽度也得用 unicode-width。这是同一个错误启发式的第三份拷贝
+    /// (tab 热区、输入行光标那两处已经修过),`…`/`①` 被算成 2 列的话
+    /// 每行会比实际窄,气泡右边缘参差不齐。
+    #[test]
+    fn wrap_uses_real_width_not_heuristic() {
+        // 40 个 `…`:真实宽度 40 列,刚好一行装满
+        let dots: String = "…".repeat(40);
+        assert_eq!(wrap_text(&dots, 40).len(), 1, "按真实宽度该正好一行");
+        // CJK 确实是 2 列
+        assert_eq!(wrap_text(&"汉".repeat(20), 40).len(), 1, "20 个汉字刚好 40 列");
+        assert_eq!(wrap_text(&"汉".repeat(21), 40).len(), 2, "多一个就该折行");
+    }
 
     /// 输入行光标必须按**终端实际列宽**算,不能用「码点 > 0x1100 就算 2 列」的启发式。
     /// 那个启发式把 `…`/`①` 算成 2 列、把带变体选择符的 emoji 算成 4 列,
