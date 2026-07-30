@@ -29,6 +29,11 @@ pub struct StreamOutcome {
     /// 这一行是否表示 agent 动过工具(读写文件、跑命令)。
     /// 重试前要看它:动过工具说明可能已经改了工作区,不能无脑把同一个 prompt 从头再跑一遍。
     pub tool_used: bool,
+    /// 见到了 thinking 块但**内容是空的**(某些中转站会把正文剥掉只留 signature)。
+    ///
+    /// 由调用方决定要不要提示 —— classify 是按行调用的纯函数,没有跨行状态,
+    /// 在这里直接 push 提示的话一轮里有几个 thinking 块就会刷几条。
+    pub empty_thinking: bool,
 }
 
 /// 按格式分类一行。
@@ -108,13 +113,20 @@ fn classify_claude(line: &str) -> StreamOutcome {
                         // extended thinking 的中间推理:只展示,不进 text_delta
                         //(它不是给队友看的回复正文,混进 full 会污染汇报)
                         Some("thinking") => {
-                            if let Some(t) = blk.get("thinking").and_then(|t| t.as_str()) {
-                                for ln in t.lines() {
-                                    let ln = ln.trim_end();
-                                    if !ln.is_empty() {
-                                        out.display.push(format!("💭 {ln}"));
-                                    }
+                            let t = blk.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                            let mut any = false;
+                            for ln in t.lines() {
+                                let ln = ln.trim_end();
+                                if !ln.is_empty() {
+                                    out.display.push(format!("💭 {ln}"));
+                                    any = true;
                                 }
+                            }
+                            // 有 thinking 块但**内容是空的** —— 实测某些中转站会把
+                            // 正文剥掉只留 signature。这里只置标志,提不提示交给
+                            // 调用方(它有整轮状态,能做到一轮只说一次)。
+                            if !any {
+                                out.empty_thinking = true;
                             }
                         }
                         _ => {}
@@ -353,6 +365,43 @@ mod tests {
     use super::*;
 
     // ---- claude ----
+
+    /// thinking 事件内容完整时,该逐行出 💭。
+    #[test]
+    fn real_thinking_becomes_display_lines() {
+        let line = include_str!("../tests/fixtures/thinking_full.json");
+        let o = classify(StreamFmt::Claude, line.trim());
+        assert!(
+            o.display.iter().filter(|d| d.starts_with("💭")).count() >= 3,
+            "该有多行思考,实际 {:?}",
+            o.display
+        );
+        assert!(!o.empty_thinking, "内容是全的,不该标记为空");
+        // 思考不能混进汇报正文 —— 它不是给队友看的
+        assert!(o.text_delta.is_none(), "思考混进了 text_delta");
+    }
+
+    /// **块在但 thinking 字段是空串** —— 实测有的中转站会这样,
+    /// signature 留着,正文被剥掉。
+    ///
+    /// 以前这种情况完全静默,用户分不清是模型没思考、中转站剥了、还是
+    /// teamfly 坏了,只看到「从来没有 💭」。
+    #[test]
+    fn empty_thinking_is_flagged_not_silent() {
+        let line = include_str!("../tests/fixtures/thinking_empty.json");
+        let o = classify(StreamFmt::Claude, line.trim());
+        assert!(o.display.is_empty(), "空内容不该产出 💭 行");
+        assert!(o.empty_thinking, "该标记出来,否则调用方没法提示用户");
+    }
+
+    /// 没有 thinking 块时不能误报(绝大多数事件都是这种)。
+    #[test]
+    fn no_thinking_block_does_not_flag() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"你好"}]}}"#;
+        let o = classify(StreamFmt::Claude, line);
+        assert!(!o.empty_thinking, "没有 thinking 块却报了空");
+    }
+
 
     #[test]
     fn claude_system_init() {
