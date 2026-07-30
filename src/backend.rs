@@ -193,11 +193,32 @@ fn claude_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
         args.push(mcp.clone());
         args.push("--strict-mcp-config".into());
     }
-    args.push(user_input.to_string());
+    args.push(clamp_argv(user_input));
     ProcSpec {
         bin: "claude".into(),
         args,
     }
+}
+
+/// 单个 argv 的字节上限。`MAX_ARG_STRLEN` 实测正好是 131072 字节
+/// (131071 可以,131072 就 E2BIG),这里留 4 KiB 余量。
+const ARGV_MAX_BYTES: usize = 127 * 1024;
+
+/// 把一个即将成为 argv 的字符串按字节封顶,不切断 UTF-8 字符边界。
+///
+/// 这是 E2BIG 的最后一道防线:超了的话 spawn 直接失败,群聊里只有一句
+/// 「起 codex 失败: Argument list too long」,而且这个议题此后每次派活都会
+/// 失败 —— 前情只会越来越长,自己不会恢复。
+fn clamp_argv(s: &str) -> String {
+    if s.len() <= ARGV_MAX_BYTES {
+        return s.to_string();
+    }
+    // 保**尾部**:最近的消息和本次指派在后面,比更早的前情重要
+    let mut start = s.len() - ARGV_MAX_BYTES;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("(⚠ 前情过长,开头已被截断)\n{}", &s[start..])
 }
 
 /// MCP 配置文件:项目级优先,回退到用户级。都不存在返回 None。
@@ -219,7 +240,11 @@ pub fn resolve_mcp_config(work_dir: &std::path::Path) -> Option<String> {
 
 /// 构造 codex CLI 非交互命令(JSONL 事件流 + 跳过 git/sandbox 检查)。
 fn codex_cmd(spec: &RunSpec, user_input: &str) -> ProcSpec {
-    let combined = format!("{}\n\n{}", spec.system_prompt, user_input);
+    // codex 把 system_prompt 和 user_input 拼进**同一个** argv(claude 是分开传的),
+    // 所以这里是全项目唯一知道最终 argv 到底多大的地方 —— 必须兜底封顶。
+    // 上游 build_prompt_input 已按字节留了余量,但 system_prompt 完全不在它的
+    // 预算里(团队自定义人设可以写得很长),重试时 RETRY_NOTE 还会再往外顶。
+    let combined = clamp_argv(&format!("{}\n\n{}", spec.system_prompt, user_input));
     let mut args = vec![
         "exec".to_string(),
         "--json".to_string(),                // JSONL 事件流
@@ -415,6 +440,48 @@ mod tests {
             };
             assert!(!p.args.iter().any(|a| a == "--model"));
         }
+    }
+
+    /// E2BIG 的最后一道防线:任何一个 argv 都不能超过 MAX_ARG_STRLEN。
+    ///
+    /// 实测阈值正好 131072 字节(131071 可以,131072 就 `Argument list too long`)。
+    /// 这个测试**真的去 spawn** 一个进程来验证 —— 光断言长度小于常量的话,
+    /// 常量本身写错了就测不出来。
+    #[test]
+    fn no_argv_exceeds_e2big_limit() {
+        // 最坏情况:超长 system_prompt(自定义团队) + 超长前情/指派,全中文
+        let big_sp: String = "团队规约".repeat(6_000);   // ~72 KB
+        let big_input: String = "汇报内容".repeat(20_000); // ~240 KB
+        for backend in [BackendKind::Claude, BackendKind::Codex] {
+            let mut sp = spec(false, backend);
+            sp.system_prompt = big_sp.clone();
+            let p = match backend {
+                BackendKind::Claude => claude_cmd(&sp, &big_input),
+                BackendKind::Codex => codex_cmd(&sp, &big_input),
+            };
+            for (i, a) in p.args.iter().enumerate() {
+                assert!(
+                    a.len() < 131_072,
+                    "{backend:?} 的第 {i} 个 argv 有 {} 字节,会 E2BIG",
+                    a.len()
+                );
+            }
+            // 真的 spawn 一次(用 /bin/true,只验证内核收不收这组 argv)
+            let r = std::process::Command::new("/bin/true").args(&p.args).output();
+            assert!(r.is_ok(), "{backend:?} 的 argv 内核拒收: {:?}", r.err());
+        }
+    }
+
+    /// 中文场景下 clamp 必须按字节生效 —— 按字符算的话 3 倍余量全没了。
+    #[test]
+    fn clamp_argv_counts_bytes_not_chars() {
+        let cjk: String = "汉".repeat(60_000); // 60k 字符 = 180 KB
+        assert!(cjk.chars().count() < 131_072, "按字符算会以为没超");
+        assert!(cjk.len() > 131_072, "按字节算确实超了");
+        let out = clamp_argv(&cjk);
+        assert!(out.len() <= ARGV_MAX_BYTES + 64, "clamp 后还是 {} 字节", out.len());
+        // 不能切断 UTF-8:能正常当 String 用就说明边界对了
+        assert!(out.chars().count() > 0);
     }
 
     fn spec(read_only: bool, backend: BackendKind) -> RunSpec {
