@@ -94,7 +94,10 @@ pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> 
     let mut issues = Vec::new();
     // 旧格式(文件名无 <id>- 前缀)按加载顺序补发新 id,并改名到新格式,
     // 这样下次启动就稳定了。
-    let mut legacy: Vec<(PathBuf, String)> = Vec::new();
+    // 记 (旧路径, 新发的 id, 名字):**不能**事后靠名字回查议题 ——
+    // find(|i| i.name == name) 会命中第一个同名的,而那可能是个新格式议题,
+    // 于是把它的文件当成迁移目标覆盖掉。
+    let mut legacy: Vec<(PathBuf, u64, String)> = Vec::new();
     for path in files {
         let stem = path
             .file_stem()
@@ -103,11 +106,7 @@ pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> 
             .to_string();
         let (id, name) = match parse_stem(&stem) {
             Some(v) => v,
-            None => {
-                // 旧格式:先记下来,读完内容后统一迁移
-                legacy.push((path.clone(), stem.clone()));
-                (0, stem.clone())
-            }
+            None => (0, stem.clone()), // 旧格式:下面发个新 id,并登记待迁移
         };
         // 按字节读 + lossy 转换:掉电/被 kill 时 jsonl 尾部常留半截甚至非法字节,
         // 以前 read_to_string 的 ? 会一路冒泡到 main,整个项目再也进不去 TUI,
@@ -126,6 +125,10 @@ pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> 
         } else {
             crate::model::issue_with_id(id, name.clone())
         };
+        if id == 0 {
+            // 记下**这个议题自己**的新 id,读完后迁移。不能事后按名字回查。
+            legacy.push((path.clone(), issue.id, name.clone()));
+        }
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -140,15 +143,25 @@ pub fn load_all_issues(teamfly_dir: &Path) -> Result<(Vec<Issue>, Vec<String>)> 
 
     // 把旧格式文件迁到 <id>-<名字>.jsonl。迁移失败只警告,不影响本次运行
     //(内存里已经读进来了),但下次启动它还是会拿到新 id。
-    for (old_path, name) in legacy {
-        if let Some(issue) = issues.iter().find(|i| i.name == name) {
-            let new_path = issue_path(teamfly_dir, issue.id, &name);
-            if let Err(e) = std::fs::rename(&old_path, &new_path) {
-                warns.push(format!(
-                    "议题文件 {} 迁移到新命名失败({e});重启后 id 可能变",
-                    old_path.display()
-                ));
-            }
+    for (old_path, id, name) in legacy {
+        let new_path = issue_path(teamfly_dir, id, &name);
+        // 目标已存在 → **绝不覆盖**。那是另一个议题的完整历史,而这个旧文件
+        // 只是个同名的孤儿(第一次迁移失败后本次会话又建了新文件,或用户从
+        // 备份恢复了一个旧名字的文件)。rename 会静默把它整个冲掉,warns 里
+        // 一个字都没有。宁可留下孤儿也别丢历史 —— 和 rename_file 一致。
+        if new_path.exists() {
+            warns.push(format!(
+                "{} 已存在,不迁移 {}(旧文件保留待人工处理,以免覆盖另一个议题的历史)",
+                new_path.display(),
+                old_path.display()
+            ));
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&old_path, &new_path) {
+            warns.push(format!(
+                "议题文件 {} 迁移到新命名失败({e});重启后 id 可能变",
+                old_path.display()
+            ));
         }
     }
     Ok((issues, warns))
@@ -287,6 +300,103 @@ mod tests {
         // 旧格式(无 id 前缀)
         assert_eq!(parse_stem("改登录"), None);
         assert_eq!(parse_stem("not-a-number"), None);
+    }
+
+    /// 旧格式迁移**绝不能覆盖**已存在的文件。
+    ///
+    /// 两个 bug 叠在一起才会踩到:
+    /// 1. 迁移目标是按名字回查议题算出来的(`find(|i| i.name == name)`),
+    ///    命中的可能是另一个**同名**议题,于是目标指向它的文件;
+    /// 2. `fs::rename` 没有 `dst.exists()` 保护(`rename_file` 早就有)。
+    ///
+    /// 结果是几十条历史被静默冲成旧文件那一条,warns 里一个字都没有。
+    #[test]
+    fn legacy_migration_never_overwrites_existing_history() {
+        let dir = std::env::temp_dir().join(format!("tf_mig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(issues_dir(&dir)).unwrap();
+
+        // 新格式议题「改登录」,3 条历史
+        for t in ["第一条", "第二条", "第三条"] {
+            append_chat(&dir, 7, "改登录", &msg("我", t)).unwrap();
+        }
+        // 同名的旧格式孤儿文件,只有 1 条
+        std::fs::write(
+            issues_dir(&dir).join("改登录.jsonl"),
+            format!("{}\n", serde_json::to_string(&msg("我", "孤儿那条")).unwrap()),
+        ).unwrap();
+
+        let (issues, _warns) = load_all_issues(&dir).unwrap();
+
+        // 新格式那个议题的历史必须完好 —— 内存里和盘上都是
+        let kept = issues.iter().find(|i| i.id == 7).expect("id=7 的议题没了");
+        assert_eq!(kept.timeline.len(), 3, "新格式议题的历史被旧文件覆盖了");
+        let on_disk =
+            std::fs::read_to_string(issues_dir(&dir).join("7-改登录.jsonl")).unwrap();
+        assert_eq!(
+            on_disk.lines().filter(|l| !l.trim().is_empty()).count(),
+            3,
+            "盘上的历史被覆盖了"
+        );
+        // 孤儿也没丢:它拿到自己的新 id,迁到自己的文件里
+        assert!(
+            issues.iter().any(|i| i.id != 7 && i.timeline.len() == 1),
+            "孤儿文件的那条消息丢了"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 迁移目标真的已存在时(比如上次迁移失败留下的同 id 文件),
+    /// 必须**保留旧文件并告警**,不能静默 rename 覆盖。
+    #[test]
+    fn legacy_migration_warns_instead_of_clobbering() {
+        let dir = std::env::temp_dir().join(format!("tf_mig2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(issues_dir(&dir)).unwrap();
+
+        // 先让一个旧格式文件跑一遍迁移,拿到它的新 id
+        std::fs::write(
+            issues_dir(&dir).join("待迁移.jsonl"),
+            format!("{}\n", serde_json::to_string(&msg("我", "原始那条")).unwrap()),
+        ).unwrap();
+        let (first, _) = load_all_issues(&dir).unwrap();
+        let assigned = first[0].id;
+        assert!(
+            issues_dir(&dir).join(format!("{assigned}-待迁移.jsonl")).exists(),
+            "第一次该迁过去"
+        );
+
+        // 现在人为再放一个同名旧格式文件回去,并让它会算出同一个目标
+        // (模拟:第一次迁移失败后本次会话又建了新文件,或从备份恢复)
+        std::fs::write(
+            issues_dir(&dir).join("待迁移.jsonl"),
+            format!("{}\n", serde_json::to_string(&msg("我", "后来那条")).unwrap()),
+        ).unwrap();
+        // 把新格式文件的 id 改成「下一个会被发出去的 id」,制造真实碰撞
+        let next = assigned + 1;
+        std::fs::rename(
+            issues_dir(&dir).join(format!("{assigned}-待迁移.jsonl")),
+            issues_dir(&dir).join(format!("{next}-待迁移.jsonl")),
+        ).unwrap();
+
+        let before: Vec<String> = std::fs::read_to_string(
+            issues_dir(&dir).join(format!("{next}-待迁移.jsonl")),
+        ).unwrap().lines().map(String::from).collect();
+
+        let (_issues, warns) = load_all_issues(&dir).unwrap();
+
+        let after: Vec<String> = std::fs::read_to_string(
+            issues_dir(&dir).join(format!("{next}-待迁移.jsonl")),
+        ).unwrap().lines().map(String::from).collect();
+        assert_eq!(before, after, "已存在的文件被覆盖了");
+        // 撞了就必须留痕,不能悄悄跳过
+        if issues_dir(&dir).join("待迁移.jsonl").exists() {
+            assert!(
+                warns.iter().any(|w| w.contains("不迁移") || w.contains("已存在")),
+                "旧文件留下了但没告警: {warns:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// id 必须跨重启稳定 —— worktree 目录和分支都按它命名。
