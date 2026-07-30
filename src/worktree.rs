@@ -219,10 +219,31 @@ fn remove_issue(work_dir: &Path, teamfly_dir: &Path, issue_id: u64) -> bool {
 }
 
 /// 统计残留的 worktree 数量（启动时提示用户）。
-pub fn count_stale(teamfly_dir: &Path) -> usize {
-    std::fs::read_dir(teamfly_dir.join("worktrees"))
-        .map(|d| d.flatten().filter(|e| e.path().is_dir()).count())
-        .unwrap_or(0)
+///
+/// 只数**真的注册在本仓库里**的 worktree。以前是数 `worktrees/` 下的目录,
+/// 两个方向都不准:空壳目录、非数字目录、`create_dir_all(parent)` 留下的
+/// 残留都会被算进去(多报),而注册了但目录已被删的一个都数不到(少报)。
+/// 报给用户的那句「有 N 个 agent worktree 留在 .teamfly/worktrees/」
+/// 数字是假的,「对应 teamfly/issue-* 分支」也可能是假的。
+pub fn count_stale(work_dir: &Path, teamfly_dir: &Path) -> usize {
+    let Some(out) = stdout_of(
+        Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(work_dir),
+    ) else {
+        return 0; // 非 git 库 / git 跑不通:没有可信数字,就别瞎报
+    };
+    let root = std::fs::canonicalize(teamfly_dir.join("worktrees")).ok();
+    out.lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .filter(|p| {
+            // 只算在 .teamfly/worktrees/ 下面的(主工作树自己也在这个列表里)
+            match (&root, std::fs::canonicalize(p).ok()) {
+                (Some(r), Some(p)) => p.starts_with(r),
+                _ => false,
+            }
+        })
+        .count()
 }
 
 /// worktree 里一点改动都没有?(既没 commit、也没改工作区、也没新增文件)
@@ -459,6 +480,30 @@ mod tests {
     fn git_in(d: &Path, a: &[&str]) -> String {
         let o = Command::new("git").args(a).current_dir(d).output().unwrap();
         String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    /// `count_stale` 只数真的注册在本仓库的 worktree。
+    ///
+    /// 以前数目录,空壳目录和非数字目录都会被算进去 —— 报给用户的数字是假的。
+    #[test]
+    fn count_stale_ignores_junk_dirs() {
+        let root = repo("cs");
+        let tf = root.join(".teamfly");
+        assert_eq!(count_stale(&root, &tf), 0, "一开始没有 worktree");
+
+        let wt = prepare(&root, &tf, 3);
+        assert!(wt.branch.is_some());
+        assert_eq!(count_stale(&root, &tf), 1, "建了一个该数出 1");
+
+        // 塞进去几个垃圾目录 —— 都不该被算
+        for junk in ["空壳", "99", "tmp.new"] {
+            std::fs::create_dir_all(tf.join("worktrees").join(junk)).unwrap();
+        }
+        assert_eq!(
+            count_stale(&root, &tf), 1,
+            "垃圾目录被算进去了(以前数目录就是这个 bug)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `.gitignore` 写不进去时必须**明确报出来**。
