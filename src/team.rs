@@ -225,6 +225,25 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    /// 内置团队的 md 里写了 `model:`,必须真的被解析出来。
+    /// 这个字段曾被删掉一轮,期间那三行 md 是静默失效的 ——
+    /// serde 对未知字段不报错,配了也白配。
+    #[test]
+    fn builtin_agents_model_is_parsed() {
+        let dir = std::env::temp_dir().join(format!("tf_mdl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::builtin::seed_default(&dir).unwrap();
+        let team = load_team(&dir.join("teams").join(crate::builtin::DEFAULT_TEAM)).unwrap();
+        for m in &team.members {
+            assert!(
+                m.model.is_some(),
+                "{} 的 md 里写了 model: 但没解析出来",
+                m.name
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn split_frontmatter_basic() {
         let c = "---\nname: 老K\nbackend: mock\n---\n你是老K";
