@@ -456,6 +456,10 @@ fn draw_agent_raw(f: &mut Frame, area: Rect, m: &Model, idx: usize, info: &mut D
                 format!("── {l} ──"),
                 Style::default().fg(Color::DarkGray),
             ));
+            // 分隔线本身也是一块:后面第一块内容要和它拉开。
+            // `prev = None` 会让下一行不触发换块判断,于是分隔线和第一条思考
+            // 紧贴 —— 别的块都分开了,只有这里没分反而更突兀。
+            lines.push(Line::raw(""));
             prev = None;
             continue;
         }
@@ -846,6 +850,14 @@ mod tests {
         assert!(!blank_between(e1, res2), "工具结果被拆开了");
         // 工具 → 正文:空
         assert!(blank_between(res2, txt), "工具块和回复正文之间该空一行\n{}", rows.join("\n"));
+        // ⟨init⟩ 分隔线和它后面第一块之间也要空 —— 别的块都分开了,
+        // 只有分隔线贴着后面的内容会更突兀
+        let sep = row_of("⟨init⟩");
+        assert!(
+            blank_between(sep, t1),
+            "⟨init⟩ 分隔线后面该空一行\n{}",
+            rows.join("\n")
+        );
     }
 
     /// 折行宽度也得用 unicode-width。这是同一个错误启发式的第三份拷贝
