@@ -225,22 +225,64 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
-    /// 内置团队的 md 里写了 `model:`,必须真的被解析出来。
-    /// 这个字段曾被删掉一轮,期间那三行 md 是静默失效的 ——
-    /// serde 对未知字段不报错,配了也白配。
+    /// md 里写了 `model:` 就必须真的被解析出来 —— 该字段曾被删掉一轮,
+    /// 期间内置 md 里那几行是**静默失效**的(serde 对未知字段不报错,配了也白配)。
+    ///
+    /// 只校验「写了的能读出来」,不要求每个成员都写:`model` 是可选的,
+    /// 不填就跟随 CLI 自己的默认。断言全员 Some 会把「当前恰好都配了」
+    /// 这个偶然事实变成硬约束,以后想让某个 agent 不指定模型就会误报。
     #[test]
-    fn builtin_agents_model_is_parsed() {
+    fn model_in_md_is_parsed_and_optional() {
         let dir = std::env::temp_dir().join(format!("tf_mdl_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         crate::builtin::seed_default(&dir).unwrap();
-        let team = load_team(&dir.join("teams").join(crate::builtin::DEFAULT_TEAM)).unwrap();
+        let team_dir = dir.join("teams").join(crate::builtin::DEFAULT_TEAM);
+
+        // md 里写了 model: 的成员名 → 期望值,直接从磁盘上的 md 读
+        let mut want: std::collections::HashMap<String, String> = Default::default();
+        for e in std::fs::read_dir(team_dir.join("agents")).unwrap().flatten() {
+            let text = std::fs::read_to_string(e.path()).unwrap();
+            let front: Vec<&str> = text.splitn(3, "---").collect();
+            let Some(fm) = front.get(1) else { continue };
+            let get = |k: &str| {
+                fm.lines()
+                    .find_map(|l| l.trim().strip_prefix(&format!("{k}:")))
+                    .map(|v| v.trim().to_string())
+            };
+            if let (Some(n), Some(mdl)) = (get("name"), get("model")) {
+                want.insert(n, mdl);
+            }
+        }
+        assert!(!want.is_empty(), "内置 md 里一个 model: 都没有,这个测试就白测了");
+
+        let team = load_team(&team_dir).unwrap();
         for m in &team.members {
-            assert!(
-                m.model.is_some(),
-                "{} 的 md 里写了 model: 但没解析出来",
+            assert_eq!(
+                m.model.as_deref(),
+                want.get(&m.name).map(|s| s.as_str()),
+                "{} 的 model 解析结果和 md 里写的不一致",
                 m.name
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 不写 `model:` 的成员解析成 None —— 这是「跟随 CLI 默认」的入口,
+    /// 和写了的成员可以在同一个团队里混用。
+    #[test]
+    fn member_without_model_is_none() {
+        let dir = std::env::temp_dir().join(format!("tf_nomdl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let agents = dir.join("teams").join("t").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(dir.join("teams").join("t").join("team.md"), "name: 测试队\n").unwrap();
+        std::fs::write(agents.join("有.md"), "---\nname: 有\nbackend: claude\nmodel: m-1\n---\n人设\n").unwrap();
+        std::fs::write(agents.join("无.md"), "---\nname: 无\nbackend: claude\n---\n人设\n").unwrap();
+
+        let team = load_team(&dir.join("teams").join("t")).unwrap();
+        let by = |n: &str| team.members.iter().find(|m| m.name == n).expect(n);
+        assert_eq!(by("有").model.as_deref(), Some("m-1"));
+        assert_eq!(by("无").model, None, "没写 model: 的该是 None,不能凭空造一个");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
