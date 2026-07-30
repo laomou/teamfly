@@ -467,6 +467,11 @@ fn handle_agent_done(
                 cmds.push(c);
             }
         }
+        // 这个议题暂停了,但**别的**议题排队的活不该跟着一起卡住。
+        // 交卷的这个成员刚空出来,它 inbox 里可能压着其他议题(完全正常、
+        // 没暂停)的活 —— 漏掉这一步的话那些活会无限期挂着,而界面上全员
+        // 💤摸鱼、tab 上也不显示队列长度,用户完全看不出有活卡在那儿。
+        cmds.extend(drain_after_done(m, &name));
         return cmds;
     }
     m.issues[idx].chain_depth = new_depth;
@@ -806,8 +811,21 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
     }
     let idx = m.current_issue;
     let has_content = !m.issues[idx].timeline.is_empty();
+    let issue_id = m.issues[idx].id;
 
-    if has_content {
+    // 这个议题上有没有 agent 正在干活?
+    //
+    // 必须先问清楚:关议题会把 worktree 目录收掉,而 agent 正拿它当 CWD。
+    // 目录一没,它之后每次写文件都 ENOENT,几分钟的活白干,交卷时议题
+    // 已经不存在、汇报被直接丢弃 —— 用户只看到一行几秒的提示。
+    let running: Vec<String> = m
+        .members
+        .iter()
+        .filter(|x| x.state != AgentState::Idle && x.working_issue == Some(issue_id))
+        .map(|x| x.name.clone())
+        .collect();
+
+    if has_content || !running.is_empty() {
         // 二次确认逻辑
         match m.pending_delete {
             Some((pidx, t0)) if pidx == idx && m.tick.wrapping_sub(t0) < DELETE_CONFIRM_TICKS => {
@@ -829,9 +847,28 @@ fn handle_close_issue(m: &mut Model) -> Vec<Command> {
                     String::new()
                 };
                 let note = m.pending_delete_note.clone();
-                set_hint(m, format!("议题「{name}」有 {n} 条消息{note};再按 ^W 确认删除"), 6);
+                // 有人在跑就把这件事摆在最前面 —— 它比「有几条消息」重要得多
+                let head = if running.is_empty() {
+                    format!("议题「{name}」有 {n} 条消息{note}")
+                } else {
+                    format!("⚠ {} 正在这个议题干活,关掉会中断它{note}", running.join("、"))
+                };
+                set_hint(m, format!("{head};再按 ^W 确认删除"), 6);
                 return vec![];
             }
+        }
+    }
+
+    // 确认要关了:先掐掉这个议题上在跑的 agent,再动它的 worktree。
+    // 顺序不能反 —— 先删目录的话 agent 会带着一串 ENOENT 继续跑到自然结束。
+    if !running.is_empty() {
+        m.cancel.cancel();
+        // 换新 token,否则之后新起的 agent 一生下来就是取消态
+        m.cancel = tokio_util::sync::CancellationToken::new();
+        // 别的议题排队的活不受影响,但**这个**议题的要清掉:议题都没了,
+        // 放出来只会去建一个新 worktree 干一件用户已经放弃的事。
+        for mem in &mut m.members {
+            mem.inbox.retain(|a| a.issue != issue_id);
         }
     }
 
@@ -1179,6 +1216,87 @@ mod e2e {
                 err: None,
             },
         )
+    }
+
+    /// 关掉「还有 agent 在跑」的议题时,必须先警告、确认后必须掐掉它。
+    ///
+    /// 关议题会把 worktree 目录收掉,而 agent 正拿它当 CWD。目录一没,
+    /// 它之后每次写文件都 ENOENT,几分钟的活白干,交卷时议题已经不存在、
+    /// 汇报被直接丢弃 —— 用户只看到一行几秒的提示。
+    #[test]
+    fn closing_issue_warns_and_cancels_running_agent() {
+        let mut m = min_model();
+        m.issues.push(Issue::new("乙"));
+        let id = m.issues[0].id;
+        m.members[0].state = AgentState::Thinking;
+        m.members[0].working_issue = Some(id);
+        // 同成员在 inbox 里还压着这个议题的一条活
+        m.members[0].inbox.push_back(Assignment { issue: id, text: "同议题排队".into() });
+
+        // 第一次 ^W:必须提到是谁在跑,且不能删
+        let n_before = m.issues.len();
+        ctrl(&mut m, 'w');
+        let hint = m.status_hint.clone().unwrap_or_default();
+        assert_eq!(m.issues.len(), n_before, "第一次按就删了");
+        assert!(
+            hint.contains(&m.members[0].name),
+            "提示没说是谁在干活: {hint}"
+        );
+        assert!(!m.cancel.is_cancelled(), "还没确认就取消了");
+
+        // 第二次 ^W:真删,且必须掐掉在跑的 agent
+        let tok = m.cancel.clone();
+        ctrl(&mut m, 'w');
+        assert_eq!(m.issues.len(), n_before - 1, "确认后该删掉");
+        assert!(tok.is_cancelled(), "议题都关了,在跑的 agent 没被取消");
+        assert!(
+            m.members[0].inbox.iter().all(|a| a.issue != id),
+            "已关议题的排队活该清掉,否则会去建一个新 worktree 干用户放弃的事"
+        );
+    }
+
+    /// 空议题、且没人在跑时,^W 仍然一键关(不该因为这个改动多一次确认)。
+    #[test]
+    fn closing_empty_idle_issue_still_one_keypress() {
+        let mut m = min_model();
+        m.issues.push(Issue::new("乙"));
+        m.issues[0].timeline.clear();
+        let n = m.issues.len();
+        ctrl(&mut m, 'w');
+        assert_eq!(m.issues.len(), n - 1, "空议题且无人在跑,该一键关");
+    }
+
+    /// 防乒乓触顶的那一轮也要放行**别的**议题排队的活。
+    ///
+    /// 漏掉的话那些活无限期挂着,而界面上全员💤摸鱼、tab 上不显示队列长度,
+    /// 用户完全看不出有活卡在那儿。
+    #[test]
+    fn chain_cap_still_drains_other_issues() {
+        let mut m = min_model();
+        m.issues.push(Issue::new("乙"));
+        let (a, b) = (m.issues[0].id, m.issues[1].id);
+        m.max_chain_depth = 1;
+        m.issues[0].chain_depth = 1; // 已到上限
+
+        // 老K 在议题 A 干活;阿码 inbox 里压着议题 B(完全正常)的活
+        m.members[0].state = AgentState::Working;
+        m.members[0].working_issue = Some(a);
+        let other = m.members[1].name.clone();
+        m.members[1].inbox.push_back(Assignment { issue: b, text: "B 的活".into() });
+
+        let name_a = m.members[0].name.clone();
+        let cmds = done(&mut m, &name_a, a, "干完了");
+
+        assert!(m.issues[0].paused, "该触顶暂停");
+        let idx = m.member_index(&other).unwrap();
+        assert!(
+            m.members[idx].inbox.iter().all(|x| x.issue != b),
+            "议题 B 没暂停,它的活该被放出来"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SpawnAgent { issue, .. } if *issue == b)),
+            "该为议题 B 起进程"
+        );
     }
 
     fn min_model() -> Model {

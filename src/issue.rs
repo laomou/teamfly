@@ -172,17 +172,21 @@ pub fn build_prompt_input(
     // 前情从**最近的**往前收,收满就停:prompt 是作为单个 argv 传给子进程的,
     // Linux 的 MAX_ARG_STRLEN 是 128KiB,超了直接 spawn 失败(E2BIG),
     // 群聊里只会看到一句「起 claude 失败: Argument list too long」,无从下手。
+    //
+    // 预算按**字节**算,不能按字符 —— 这个项目的主要语言是中文,一个汉字
+    // 3 字节、emoji 4 字节。按字符算的话对英文留了 3-4 倍余量,对中文只留 1 倍,
+    // 正好在最常见的场景下失效。
     let mut kept: Vec<String> = Vec::new();
-    let mut budget = CONTEXT_MAX_CHARS;
+    let mut budget = CONTEXT_MAX_BYTES;
     let mut dropped = 0usize;
     for m in recent.iter().rev() {
         let who = if m.is_system { "系统" } else { &m.author };
         let line = format!("{who}: {}\n", m.text);
-        if line.chars().count() > budget {
+        if line.len() > budget {
             dropped = recent.len() - kept.len();
             break;
         }
-        budget -= line.chars().count();
+        budget -= line.len();
         kept.push(line);
     }
     kept.reverse();
@@ -200,15 +204,19 @@ pub fn build_prompt_input(
     }
     s.push_str("现在轮到你:\n");
     // 指派本身也可能超长(上游把大段文件内容写进了汇报)
-    s.push_str(&clamp_chars(assignment, ASSIGNMENT_MAX_CHARS));
+    s.push_str(&clamp_bytes(assignment, ASSIGNMENT_MAX_BYTES));
     s.push_str(HANDOFF_NOTE);
     s
 }
 
-/// 前情部分最多占多少字符(留足余量给 system prompt 与指派)。
-const CONTEXT_MAX_CHARS: usize = 24_000;
-/// 单条指派最多占多少字符。
-const ASSIGNMENT_MAX_CHARS: usize = 12_000;
+/// 前情部分最多占多少**字节**(留足余量给 system prompt 与指派)。
+///
+/// 单个 argv 的硬上限是 `MAX_ARG_STRLEN` = 128 KiB(实测 131072 字节整)。
+/// codex 后端把 system_prompt 和这段拼进**同一个** argv,所以这两个预算
+/// 加起来还要给 system_prompt 留出空间。
+const CONTEXT_MAX_BYTES: usize = 48_000;
+/// 单条指派最多占多少字节。
+const ASSIGNMENT_MAX_BYTES: usize = 24_000;
 
 /// 每次派活都追加的收尾说明。
 ///
@@ -222,11 +230,17 @@ const HANDOFF_NOTE: &str = "\n\n（干完后,用简短一段话总结你做了�
 改过文件的话,顺手 `git add` + `git commit` 提交到当前分支 —— 接力的队友和你在同一个工作树里,\
 不提交也看得到你的改动,但提交了负责人采纳这个议题时才拿得到完整历史。）";
 
-fn clamp_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+/// 按**字节**截断,但不切断 UTF-8 字符边界(切断了 String 就构造不出来)。
+fn clamp_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max).collect();
+    // 从 max 往前退到最近的字符边界
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
     out.push_str("\n(…本条过长,已截断)");
     out
 }
