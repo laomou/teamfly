@@ -1,127 +1,116 @@
 # teamfly
 
-终端里的 AI 团队协作台 —— **你带一支队,agent 是队员**。在全屏界面里发目标、`@` 圈人,看队员放养式自动干活。
+[中文](README_zh.md)
 
-> 甩一句目标 → 队员全自动开干 → 你在总览/单人视图里看进展、随时可 `@` 插手,但从不被拦。
+An AI team-collaboration console in your terminal — **you lead a team, the agents are your teammates**. In a full-screen UI you set goals, `@`-mention people, and watch teammates work autonomously, hands-off.
 
-## 快速开始
+> Toss out a goal → teammates run with it fully autonomously → you watch progress in the overview / per-member views and can `@` to step in anytime, but you're never blocked.
+
+## Quick start
 
 ```bash
 cargo build --release
 
-# 在工作目录里开干(缺省用内置 default 队:TPM + DEV + REV)
-./target/release/teamfly work [工作目录] [--team <团队名>]
+# Get to work in a directory (defaults to the built-in `default` team: TPM + DEV + REV)
+./target/release/teamfly work [work-dir] [--team <team-name>]
 ```
 
-进入后:
+Once inside:
 
-- 底部输入框打字。**带 `@名字` 才会派活**；默认团队从 `@TPM 加个登录功能` 开始，由 TPM 拆解、调度实现和评审。不带 `@` 只是留言。
-- `↑↓`(或鼠标点左栏)在 `# 总览`(全员时间线)/ 某个成员(看他进程的原始输出流)间切。
-- `?` 帮助 · `^N` 新议题 · `^W` 关议题 · `Alt+1-9` 切议题 · `PgUp`/`PgDn` 翻历史 · `Esc` 回总览。
-- `^P` 解除防乒乓暂停并放出排队的活;`^C` 在有 agent 在跑时先取消它们(再按一次才退出)。
-- 斜杠命令:`/team <名>` 热切团队。注意是**全局**生效(所有议题共用一份花名册),且会取消正在跑的 agent。
+- Type in the bottom input box. **Work is dispatched only with `@name`**; the default team starts from `@TPM add a login feature`, where TPM breaks it down and schedules implementation and review. Without `@` it's just a note.
+- `↑↓` (or click the left column) to switch between `# Overview` (all-hands timeline) and a member (the raw output stream of their process).
+- `?` help · `^N` new topic · `^W` close topic · `Alt+1-9` switch topic · `PgUp`/`PgDn` scroll history · `Esc` back to overview.
+- `^P` lift the anti-ping-pong pause and release queued work; `^C` cancels running agents first (press again to quit).
+- Slash commands: `/team <name>` hot-swaps the team. Note it's **global** (all topics share one roster) and cancels running agents.
 
-## 团队 = 磁盘文件夹
+## A team = a folder on disk
 
-无造队命令,团队就是 `.teamfly/teams/<名>/` 下的一个文件夹,改文件即自定义:
+There's no "create team" command; a team is just a folder under `.teamfly/teams/<name>/`. Edit the files to customize:
 
 ```
 default/
-├─ team.md            # 队名 + 全员规矩 + 团队职责 + 任务流转(拼进每个 agent)
+├─ team.md            # team name + shared rules + team responsibilities + task hand-off (spliced into every agent)
 └─ agents/
-   ├─ TPM.md          # frontmatter(name/role/emoji/backend/model/read_only) + 调度职责
-   ├─ DEV.md          # 实现与测试
-   └─ REV.md          # 只做代码评审
+   ├─ TPM.md          # frontmatter (name/role/emoji/backend/model/read_only) + scheduling duties
+   ├─ DEV.md          # implementation and testing
+   └─ REV.md          # code review only
 ```
 
-- **agent md** 只写单一职责(我是谁、做什么);**team.md** 写团队职责和任务流转(谁完成后交给谁),改流程只改一处。
-- `backend` 二选一:`claude`(claude CLI,stream-json)/ `codex`(codex CLI,JSONL)。
-- `model` 可选。写了就作为 `--model` 传给该成员的 CLI,**可以给单个成员单独换模型**
-  (比如评审用便宜的、实现用强的);不写则完全不传,由 CLI 自己按它的配置决定。
-- `read_only` 可选(默认 `false` = 可写)。写 `read_only: true` 的成员在**主工作目录**里跑且**真的没有写权限**
-  (claude 走 `--permission-mode plan`,codex 走 `--sandbox read-only`),适合评审、调度这类不该改文件的角色。
-  内置队里 TPM/REV 是只读,DEV 可写。
-- 内置 `default` 队(TPM/DEV/REV)首次运行自动播种到工作目录的 `.teamfly/teams/default/`；旧的未修改 `team.md` / `QE.md` 会自动迁移(`DEV.md` 不迁移,想拿新版人设请自行删掉它再启动)。
+- **agent md** states a single responsibility (who I am, what I do); **team.md** states team responsibilities and task hand-off (who passes to whom on completion) — change the flow in one place.
+- `backend` is one of two: `claude` (claude CLI, stream-json) / `codex` (codex CLI, JSONL).
+- `model` is optional. If set, it's passed as `--model` to that member's CLI, so **you can swap the model per member** (e.g. a cheap one for review, a strong one for implementation); if unset, nothing is passed and the CLI decides per its own config.
+- `read_only` is optional (default `false` = writable). A member marked `read_only: true` runs in the **main work dir** with **genuinely no write permission** (claude via `--permission-mode plan`, codex via `--sandbox read-only`), suitable for review/scheduling roles that shouldn't touch files. In the built-in team TPM/REV are read-only, DEV is writable.
+- The built-in `default` team (TPM/DEV/REV) is auto-seeded into the work dir's `.teamfly/teams/default/` on first run; an old unmodified `team.md` / `QE.md` is auto-migrated (`DEV.md` is not migrated — delete it and restart if you want the new persona).
 
-## 凭证与模型
+## Credentials and models
 
-teamfly **不管这些** —— agent 子进程直接继承你 shell 里的环境变量,
-`claude` / `codex` 各自读自己那套配置:
+teamfly **doesn't manage these** — agent subprocesses directly inherit the environment variables from your shell, and `claude` / `codex` each read their own config:
 
 ```bash
 export ANTHROPIC_BASE_URL=https://api.anthropic.com
 export ANTHROPIC_AUTH_TOKEN=...
 
-export OPENAI_API_KEY=...                   # codex 成员
+export OPENAI_API_KEY=...                   # codex members
 ```
 
-中转站、鉴权方式想怎么配就怎么配,和你平时直接用 `claude` / `codex` 命令行时
-完全一样,teamfly 不在中间插一层。
+Configure proxies and auth however you like, exactly as when you use the `claude` / `codex` CLIs directly — teamfly doesn't insert a layer in between.
 
-模型有两种指定方式,**按成员** 优先:
+Models can be specified two ways, **per-member** takes priority:
 
-| 方式 | 粒度 | 怎么写 |
+| Way | Granularity | How |
 |---|---|---|
-| agent md 的 `model:` | 单个成员 | frontmatter 里写,作为 `--model` 传给该成员 |
-| CLI 自己的配置 | 全队 | `ANTHROPIC_MODEL` 环境变量 / codex 的 config |
+| `model:` in agent md | single member | write in frontmatter, passed as `--model` to that member |
+| the CLI's own config | whole team | `ANTHROPIC_MODEL` env var / codex's config |
 
-agent md 里没写 `model:` 时 teamfly 完全不传 `--model`,CLI 就按自己那套来。
+When agent md has no `model:`, teamfly passes no `--model` at all and the CLI uses its own settings.
 
 ## MCP
 
-工作目录下的 `.teamfly/mcp.json` 存在时会作为 `--mcp-config` 传给 agent,
-不存在就不传。
+When `.teamfly/mcp.json` exists in the work dir, it's passed to agents as `--mcp-config`; if absent, nothing is passed.
 
-## 工作机制
+## How it works
 
-- **每轮重起、无状态**:被 `@` 时起一个新子进程,干完输出最终回复就退。
-- **只被 `@` 才干,干完即停**:默认静止,`@` 驱动。无人 `@` 则全体安静。
-- **汇报**:agent 一轮的最终回复(claude/codex 的 result)自动进总览;`@名字` 从中解析,投递给对应成员。
-- **上下文**:总览时间线一物两用——既是 UI,又作为「增量前情」喂给被唤醒的 agent。
-- **议题(tab)**:属于项目,落盘 `.teamfly/issues/<id>-<名>.jsonl`,关掉重开自动恢复。空议题不落盘。
-  文件名带 id 是为了让议题 id 跨重启稳定(worktree 目录和分支都按它命名);旧的无 id 前缀的文件会自动迁移。
-  已发放的 id 记在 `.teamfly/next-issue-id` 里 —— 关议题会删掉它的 jsonl 但**保留分支**,
-  id 要是被回收重发,新议题就会 checkout 到上一个议题的分支上。
-- **忙时被 @ → 排队**,不打断。防乒乓:`@` 连锁过深自动暂停(`^P` 恢复)。
-- **失败自动重试** 3 次(应对中转站 429/5xx),仍失败则作为系统消息掉线提示。
+- **Restarted each round, stateless**: on `@`, a new subprocess starts, does the work, emits a final reply, and exits.
+- **Acts only when `@`-ed, stops when done**: idle by default, `@`-driven. With no `@`, everyone stays quiet.
+- **Reporting**: an agent's final reply for a round (claude/codex's result) goes into the overview automatically; `@name` is parsed from it and delivered to the corresponding member.
+- **Context**: the overview timeline serves double duty — it's both the UI and the "incremental backstory" fed to an awakened agent.
+- **Topics (tabs)**: belong to the project, persisted at `.teamfly/issues/<id>-<name>.jsonl`, auto-restored on reopen. Empty topics aren't persisted. Filenames carry an id so topic ids stay stable across restarts (worktree dirs and branches are named by it); old files without an id prefix are auto-migrated. Issued ids are tracked in `.teamfly/next-issue-id` — closing a topic deletes its jsonl but **keeps the branch**, so if an id gets recycled and reissued, the new topic checks out the previous topic's branch.
+- **@-ed while busy → queued**, not interrupted. Anti-ping-pong: an over-deep `@` chain auto-pauses (`^P` resumes).
+- **Auto-retry on failure** 3 times (for proxy 429/5xx); still failing, surfaces as a system dropped-off message.
 
-## agent 改动隔离(worktree)
+## Agent change isolation (worktree)
 
-工作目录是 git 库时,每个**议题**有自己的 worktree 和分支,agent 的改动不落进你的工作目录:
+When the work dir is a git repo, each **topic** gets its own worktree and branch, so agent changes don't land in your work dir:
 
 ```
-分支  teamfly/issue-<议题id>
-目录  .teamfly/worktrees/<议题id>/
+branch  teamfly/issue-<topic-id>
+dir     .teamfly/worktrees/<topic-id>/
 ```
 
-- 同议题内的接力(TPM → DEV → REV)共享这个工作树,下游直接看得到上游改的文件,不需要合分支。
-- 交卷时汇报里会附一行 `📂 teamfly/issue-3 — 已提交 2 files changed … · 未提交 …`。
-- 这就是仓库里一个普通分支,怎么处理随你:`git push origin teamfly/issue-3` 推上去开 MR/PR、
-  `git merge` 本地合、`git cherry-pick` 只挑一部分、或者 `git diff main..teamfly/issue-3` 先看看。
-- 丢弃:`git branch -D teamfly/issue-3`(或直接不理它)。整个议题一个字都没改过时 worktree 会被自动回收。
-- 关闭议题(`^W`)**不动分支** —— 关掉只是「不看了」,不销毁工作成果;worktree 目录只在没有
-  未提交改动时才收掉,有未提交改动就一并留着并在提示里说明。
-- 启动时若发现 `.teamfly/` 没被 git 忽略,teamfly 会**自动往项目 `.gitignore` 追加一条 `.teamfly/`**
-  并在预检里告知 —— 因为 `.teamfly/` 下有议题历史和 `mcp.json`(可能含鉴权 header),不忽略的话
-  agent 一句 `git add -A` 就把它们提交进去了。你的 `.gitignore` 里已经有 `.teamfly/` 规则(哪怕被 `!.teamfly/` 否定)时不会动它。
-- 工作目录不是 git 库时整套隔离不可用,退回所有 agent 共用工作目录(启动时会警告)。
+- The relay within a topic (TPM → DEV → REV) shares this worktree; downstream sees the files upstream changed directly, no branch merge needed.
+- On handoff the report appends a line `📂 teamfly/issue-3 — committed 2 files changed … · uncommitted …`.
+- It's just an ordinary branch in the repo, handle it however: `git push origin teamfly/issue-3` to open an MR/PR, `git merge` locally, `git cherry-pick` to take only part, or `git diff main..teamfly/issue-3` to look first.
+- Discard: `git branch -D teamfly/issue-3` (or just ignore it). The worktree is auto-reclaimed when the whole topic hasn't changed a single character.
+- Closing a topic (`^W`) **doesn't touch the branch** — closing just means "not looking anymore", it doesn't destroy the work; the worktree dir is only reclaimed when there are no uncommitted changes, otherwise it's kept and noted in the message.
+- On startup, if `.teamfly/` isn't git-ignored, teamfly **auto-appends a `.teamfly/` line to the project `.gitignore`** and reports it in the pre-check — because `.teamfly/` holds topic history and `mcp.json` (which may contain auth headers), and without ignoring, one `git add -A` from an agent would commit them. If your `.gitignore` already has a `.teamfly/` rule (even negated with `!.teamfly/`), it's left untouched.
+- When the work dir isn't a git repo the whole isolation is unavailable, falling back to all agents sharing the work dir (warned on startup).
 
-## 架构
+## Architecture
 
-手写 TEA-like:单一 `Model` + `Msg` 枚举 + 集中 `update` + `view`。tokio 所有并发事件源汇成一条 `mpsc<Msg>`,主循环逐条喂 `update`,无锁无竞态。副作用由 `update` 返回 `Command`、runtime 执行后回投 `Msg`。
+Hand-written TEA-like: a single `Model` + `Msg` enum + centralized `update` + `view`. All tokio concurrent event sources funnel into one `mpsc<Msg>`, the main loop feeds them to `update` one by one — lock-free, race-free. Side effects are returned by `update` as a `Command`, executed by the runtime, then posted back as a `Msg`.
 
-模块:`cli` · `team` · `backend` · `stream` · `router` · `issue` · `builtin` · `slash` · `tui` · `app` · `model`。
+Modules: `cli` · `team` · `backend` · `stream` · `router` · `issue` · `builtin` · `slash` · `tui` · `app` · `model`.
 
-## 测试
+## Tests
 
 ```bash
 cargo test
 ```
 
-纯函数单测(汇报提炼/@ 解析/剥 ANSI/claude+codex 事件解析)+ 键盘操作与议题增删测试。
+Pure-function unit tests (report distillation / @ parsing / ANSI stripping / claude+codex event parsing) plus keyboard-operation and topic add/remove tests.
 
-## 已知边界
+## Known boundaries
 
-- 同一议题内的**可写**成员串行执行(共享一个 worktree,同时改文件会互相踩);跨议题并行。
-- 不做:运行时增删成员、`@all`、同角色多开。
-- 内置团队文件是 UTF-8 无 BOM;用编辑器改 agent md 时保持 UTF-8,别存成 GBK。
+- **Writable** members within the same topic run serially (they share one worktree; changing files simultaneously would clobber each other); across topics they run in parallel.
+- Not done: adding/removing members at runtime, `@all`, multiple instances of the same role.
+- Built-in team files are UTF-8 without BOM; keep UTF-8 when editing agent md, don't save as GBK.
